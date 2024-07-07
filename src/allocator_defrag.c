@@ -95,12 +95,23 @@ static je_usage_latest usage_latest = {NULL, {0}};
  * and go straight to the allocator arena bins.
  * Currently implemented only for jemalloc. Used for online defragmentation. */
 void *defrag_jemalloc_alloc(size_t size) {
-    void *ptr = je_mallocx(size, MALLOCX_TCACHE_NONE);
+    void *ptr = je_mallocx(size, 0);
     return ptr;
 }
+/**
+ * Use separate tcache for freeing memory to defrag. This tcache is only used for free and no allocation will be
+ * done from it. Using this tcache enables us to use normal allocation during defrag reducing the overhead of alloc.
+ * Free is also improved because the access to the arena is amortized.
+ * */
+static __thread int free_tcache_id = -1;
+
+// free ptr, make sure it is freed to arena before reallocated.
 void defrag_jemalloc_free(void *ptr, size_t size) {
     if (ptr == NULL) return;
-    je_sdallocx(ptr, size, MALLOCX_TCACHE_NONE);
+    size_t sz = sizeof(int);
+    // initiliza thread cache in case it's not init already
+    if (free_tcache_id == -1) assert(!je_mallctl("tcache.create", &free_tcache_id, &sz, NULL, 0));
+    je_sdallocx(ptr, size, MALLOCX_TCACHE(free_tcache_id));
 }
 
 /* -----------------------------------------------------------------------------
