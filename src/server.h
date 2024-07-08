@@ -1888,13 +1888,19 @@ struct valkeyServer {
     int active_defrag_cycle_max;             /* maximal effort for defrag in CPU percentage */
     unsigned long active_defrag_max_scan_fields; /* maximum number of fields of set/hash/zset/list to process from
                                                     within the main dict scan */
-    size_t client_max_querybuf_len;              /* Limit for client query buffer length */
-    int dbnum;                                   /* Total number of configured DBs */
-    int supervised;                              /* 1 if supervised, 0 otherwise. */
-    int supervised_mode;                         /* See SUPERVISED_* */
-    int daemonize;                               /* True if running as a daemon */
-    int set_proc_title;                          /* True if change proc title */
-    char *proc_title_template;                   /* Process title template format */
+    int defrag_strategy;
+    int defrag_select_strategy;
+    int defrag_recalc;
+    int defrag_alloc_strategy;
+    int defrag_free_strategy;
+    int select_threshold_factor;
+    size_t client_max_querybuf_len; /* Limit for client query buffer length */
+    int dbnum;                      /* Total number of configured DBs */
+    int supervised;                 /* 1 if supervised, 0 otherwise. */
+    int supervised_mode;            /* See SUPERVISED_* */
+    int daemonize;                  /* True if running as a daemon */
+    int set_proc_title;             /* True if change proc title */
+    char *proc_title_template;      /* Process title template format */
     clientBufferLimitsConfig client_obuf_limits[CLIENT_TYPE_OBUF_COUNT];
     int extended_redis_compat;                 /* True if extended Redis OSS compatibility is enabled */
     int pause_cron;                            /* Don't run cron tasks (debug) */

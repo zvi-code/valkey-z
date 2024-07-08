@@ -37,6 +37,11 @@
 #include <stddef.h>
 
 #ifdef HAVE_DEFRAG
+#include "allocator_defrag.h"
+
+#define defraged_alloc defrag_jemalloc_alloc
+#define defraged_free defrag_jemalloc_free
+#define defrag_should_defrag_multi allocatorDefragHint
 
 typedef struct defragCtx {
     void *privdata;
@@ -49,10 +54,6 @@ typedef struct defragPubSubCtx {
     dict *(*clientPubSubChannels)(client *);
 } defragPubSubCtx;
 
-/* this method was added to jemalloc in order to help us understand which
- * pointers are worthwhile moving and which aren't */
-int je_get_defrag_hint(void *ptr);
-
 /* Defrag helper for generic allocations.
  *
  * returns NULL in case the allocation wasn't moved.
@@ -61,7 +62,9 @@ int je_get_defrag_hint(void *ptr);
 void *activeDefragAlloc(void *ptr) {
     size_t size;
     void *newptr;
-    if (!je_get_defrag_hint(ptr)) {
+    void *ptr_arr = ptr;
+    defrag_should_defrag_multi(&ptr_arr, 1);
+    if (!ptr_arr) {
         server.stat_active_defrag_misses++;
         return NULL;
     }
@@ -69,9 +72,9 @@ void *activeDefragAlloc(void *ptr) {
      * make sure not to use the thread cache. so that we don't get back the same
      * pointers we try to free */
     size = zmalloc_size(ptr);
-    newptr = zmalloc_no_tcache(size);
+    newptr = defraged_alloc(size);
     memcpy(newptr, ptr, size);
-    zfree_no_tcache(ptr);
+    defraged_free(ptr, size);
     server.stat_active_defrag_hits++;
     return newptr;
 }
@@ -754,10 +757,10 @@ void defragScanCallback(void *privdata, const dictEntry *de) {
  * fragmentation ratio in order to decide if a defrag action should be taken
  * or not, a false detection can cause the defragmenter to waste a lot of CPU
  * without the possibility of getting any results. */
-float getAllocatorFragmentation(size_t *out_frag_bytes) {
+float getAllocatorFragmentation(bool new_iter, size_t *out_frag_bytes) {
     size_t resident, active, allocated, frag_smallbins_bytes;
-    zmalloc_get_allocator_info(&allocated, &active, &resident, NULL, NULL, &frag_smallbins_bytes);
-
+    zmalloc_get_allocator_info(&allocated, &active, &resident, NULL, NULL);
+    frag_smallbins_bytes = allocatorGetFragmentationSmallBins(new_iter);
     /* Calculate the fragmentation ratio as the proportion of wasted memory in small
      * bins (which are defraggable) relative to the total allocated memory (including large bins).
      * This is because otherwise, if most of the memory usage is large bins, we may show high percentage,
@@ -915,7 +918,7 @@ int defragLaterStep(serverDb *db, int slot, long long endtime) {
 /* decide if defrag is needed, and at what CPU effort to invest in it */
 void computeDefragCycles(void) {
     size_t frag_bytes;
-    float frag_pct = getAllocatorFragmentation(&frag_bytes);
+    float frag_pct = getAllocatorFragmentation(!server.active_defrag_running, &frag_bytes);
     /* If we're not already running, and below the threshold, exit. */
     if (!server.active_defrag_running) {
         if (frag_pct < server.active_defrag_threshold_lower || frag_bytes < server.active_defrag_ignore_bytes) return;
@@ -1019,7 +1022,7 @@ void activeDefragCycle(void) {
 
                 long long now = ustime();
                 size_t frag_bytes;
-                float frag_pct = getAllocatorFragmentation(&frag_bytes);
+                float frag_pct = getAllocatorFragmentation(false, &frag_bytes);
                 serverLog(LL_VERBOSE, "Active defrag done in %dms, reallocated=%d, frag=%.0f%%, frag_bytes=%zu",
                           (int)((now - start_scan) / 1000), (int)(server.stat_active_defrag_hits - start_stat),
                           frag_pct, frag_bytes);
