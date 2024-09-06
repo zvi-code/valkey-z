@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-2012, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -35,6 +35,7 @@
 
 #include "server.h"
 #include "cluster.h"
+#include "cluster_slot_stats.h"
 
 #include <ctype.h>
 
@@ -261,6 +262,8 @@ void restoreCommand(client *c) {
     if (ttl && !absttl) ttl += commandTimeSnapshot();
     if (ttl && checkAlreadyExpired(ttl)) {
         if (deleted) {
+            /* Here we don't use deleteExpiredKeyFromOverwriteAndPropagate because
+             * strictly speaking, the `delete` is triggered by the `replace`. */
             robj *aux = server.lazyfree_lazy_server_del ? shared.unlink : shared.del;
             rewriteClientCommandVector(c, 2, aux, key);
             signalModifiedKey(c, c->db, key);
@@ -747,7 +750,16 @@ int verifyClusterNodeId(const char *name, int length) {
 }
 
 int isValidAuxChar(int c) {
-    return isalnum(c) || (strchr("!#$%&()*+.:;<>?@[]^{|}~", c) == NULL);
+    /* Return true if the character is alphanumeric */
+    if (isalnum(c)) {
+        return 1;
+    }
+
+    /* List of invalid characters */
+    static const char *invalid_charset = "!#$%&()*+;<>?@[]^{|}~";
+
+    /* Return true if the character is NOT in the invalid charset */
+    return strchr(invalid_charset, c) == NULL;
 }
 
 int isValidAuxString(char *s, unsigned int length) {
@@ -819,6 +831,8 @@ void clusterCommandHelp(client *c) {
         "SLOTS",
         "    Return information about slots range mappings. Each range is made of:",
         "    start, end, primary and replicas IP addresses, ports and ids",
+        "SLOT-STATS",
+        "    Return an array of slot usage statistics for slots assigned to the current node.",
         "SHARDS",
         "    Return information about slot range mappings and the nodes associated with them.",
         NULL};
@@ -1460,4 +1474,13 @@ void readonlyCommand(client *c) {
 void readwriteCommand(client *c) {
     c->flag.readonly = 0;
     addReply(c, shared.ok);
+}
+
+/* Resets transient cluster stats that we expose via INFO or other means that we want
+ * to reset via CONFIG RESETSTAT. The function is also used in order to
+ * initialize these fields in clusterInit() at server startup. */
+void resetClusterStats(void) {
+    if (!server.cluster_enabled) return;
+
+    clusterSlotStatResetAll();
 }

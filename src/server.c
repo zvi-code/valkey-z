@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009-2016, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-2016, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -30,6 +30,7 @@
 #include "server.h"
 #include "monotonic.h"
 #include "cluster.h"
+#include "cluster_slot_stats.h"
 #include "slowlog.h"
 #include "bio.h"
 #include "latency.h"
@@ -40,6 +41,7 @@
 #include "threads_mngr.h"
 #include "fmtargs.h"
 #include "io_threads.h"
+#include "sds.h"
 
 #include <time.h>
 #include <signal.h>
@@ -120,6 +122,9 @@ void serverLogRaw(int level, const char *msg) {
     level &= 0xff; /* clear flags */
     if (level < server.verbosity) return;
 
+    /* We open and close the log file in every call to support log rotation.
+     * This allows external processes to move or truncate the log file without
+     * disrupting logging. */
     fp = log_to_stdout ? stdout : fopen(server.logfile, "a");
     if (!fp) return;
 
@@ -130,10 +135,11 @@ void serverLogRaw(int level, const char *msg) {
         struct timeval tv;
         int role_char;
         pid_t pid = getpid();
+        int daylight_active = atomic_load_explicit(&server.daylight_active, memory_order_relaxed);
 
         gettimeofday(&tv, NULL);
         struct tm tm;
-        nolocks_localtime(&tm, tv.tv_sec, server.timezone, server.daylight_active);
+        nolocks_localtime(&tm, tv.tv_sec, server.timezone, daylight_active);
         off = strftime(buf, sizeof(buf), "%d %b %Y %H:%M:%S.", &tm);
         snprintf(buf + off, sizeof(buf) - off, "%03d", (int)tv.tv_usec / 1000);
         if (server.sentinel_mode) {
@@ -468,36 +474,43 @@ dictType zsetDictType = {
     NULL,              /* allow to expand */
 };
 
-/* Db->dict, keys are sds strings, vals are Objects. */
-dictType dbDictType = {
+/* Kvstore->keys, keys are sds strings, vals are Objects. */
+dictType kvstoreKeysDictType = {
     dictSdsHash,          /* hash function */
     NULL,                 /* key dup */
     dictSdsKeyCompare,    /* key compare */
     NULL,                 /* key is embedded in the dictEntry and freed internally */
     dictObjectDestructor, /* val destructor */
     dictResizeAllowed,    /* allow to resize */
+    kvstoreDictRehashingStarted,
+    kvstoreDictRehashingCompleted,
+    kvstoreDictMetadataSize,
     .embedKey = dictSdsEmbedKey,
     .embedded_entry = 1,
 };
 
-/* Db->expires */
-dictType dbExpiresDictType = {
+/* Kvstore->expires */
+dictType kvstoreExpiresDictType = {
     dictSdsHash,       /* hash function */
     NULL,              /* key dup */
     dictSdsKeyCompare, /* key compare */
     NULL,              /* key destructor */
     NULL,              /* val destructor */
     dictResizeAllowed, /* allow to resize */
+    kvstoreDictRehashingStarted,
+    kvstoreDictRehashingCompleted,
+    kvstoreDictMetadataSize,
 };
 
 /* Command table. sds string -> command struct pointer. */
 dictType commandTableDictType = {
-    dictSdsCaseHash,       /* hash function */
-    NULL,                  /* key dup */
-    dictSdsKeyCaseCompare, /* key compare */
-    dictSdsDestructor,     /* key destructor */
-    NULL,                  /* val destructor */
-    NULL                   /* allow to expand */
+    dictSdsCaseHash,            /* hash function */
+    NULL,                       /* key dup */
+    dictSdsKeyCaseCompare,      /* key compare */
+    dictSdsDestructor,          /* key destructor */
+    NULL,                       /* val destructor */
+    NULL,                       /* allow to expand */
+    .no_incremental_rehash = 1, /* no incremental rehash as the command table may be accessed from IO threads. */
 };
 
 /* Hash type hash table (note that small hashes are represented with listpacks) */
@@ -533,7 +546,7 @@ dictType keylistDictType = {
 };
 
 /* KeyDict hash table type has unencoded Objects as keys and
- * dicts as values. It's used for PUBSUB command to track clients subscribing the channels. */
+ * dicts as values. It's used for PUBSUB command to track clients subscribing the patterns. */
 dictType objToDictDictType = {
     dictObjHash,          /* hash function */
     NULL,                 /* key dup */
@@ -541,6 +554,20 @@ dictType objToDictDictType = {
     dictObjectDestructor, /* key destructor */
     dictDictDestructor,   /* val destructor */
     NULL                  /* allow to expand */
+};
+
+/* Same as objToDictDictType, added some kvstore callbacks, it's used
+ * for PUBSUB command to track clients subscribing the channels. */
+dictType kvstoreChannelDictType = {
+    dictObjHash,          /* hash function */
+    NULL,                 /* key dup */
+    dictObjKeyCompare,    /* key compare */
+    dictObjectDestructor, /* key destructor */
+    dictDictDestructor,   /* val destructor */
+    NULL,                 /* allow to expand */
+    kvstoreDictRehashingStarted,
+    kvstoreDictRehashingCompleted,
+    kvstoreDictMetadataSize,
 };
 
 /* Modules system dictionary type. Keys are module name,
@@ -810,7 +837,7 @@ size_t ClientsPeakMemInput[CLIENTS_PEAK_MEM_USAGE_SLOTS] = {0};
 size_t ClientsPeakMemOutput[CLIENTS_PEAK_MEM_USAGE_SLOTS] = {0};
 
 int clientsCronTrackExpansiveClients(client *c, int time_idx) {
-    size_t qb_size = c->querybuf ? sdsZmallocSize(c->querybuf) : 0;
+    size_t qb_size = c->querybuf ? sdsAllocSize(c->querybuf) : 0;
     size_t argv_size = c->argv ? zmalloc_size(c->argv) : 0;
     size_t in_usage = qb_size + c->argv_len_sum + argv_size;
     size_t out_usage = getClientOutputBufferMemoryUsage(c);
@@ -1089,7 +1116,7 @@ static inline void updateCachedTimeWithUs(int update_daylight_info, const long l
         struct tm tm;
         time_t ut = server.unixtime;
         localtime_r(&ut, &tm);
-        server.daylight_active = tm.tm_isdst;
+        atomic_store_explicit(&server.daylight_active, tm.tm_isdst, memory_order_relaxed);
     }
 }
 
@@ -1328,9 +1355,13 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     /* Show information about connected clients */
     if (!server.sentinel_mode) {
         run_with_period(5000) {
-            serverLog(LL_DEBUG, "%lu clients connected (%lu replicas), %zu bytes in use",
+            char hmem[64];
+            size_t zmalloc_used = zmalloc_used_memory();
+            bytesToHuman(hmem, sizeof(hmem), zmalloc_used);
+
+            serverLog(LL_DEBUG, "Total: %lu clients connected (%lu replicas), %zu (%s) bytes in use",
                       listLength(server.clients) - listLength(server.replicas), listLength(server.replicas),
-                      zmalloc_used_memory());
+                      zmalloc_used, hmem);
         }
     }
 
@@ -1418,8 +1449,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Run the Cluster cron. */
-    run_with_period(100) {
-        if (server.cluster_enabled) clusterCron();
+    if (server.cluster_enabled) {
+        run_with_period(100) clusterCron();
     }
 
     /* Run the Sentinel timer if we are in sentinel mode. */
@@ -1451,8 +1482,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             server.rdb_bgsave_scheduled = 0;
     }
 
-    run_with_period(100) {
-        if (moduleCount()) modulesCron();
+    if (moduleCount()) {
+        run_with_period(100) modulesCron();
     }
 
     /* Fire the cron loop modules event. */
@@ -1564,6 +1595,9 @@ extern int ProcessingEventsWhileBlocked;
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
+    /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
+    trySendPollJobToIOThreads();
+
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
 
@@ -1595,10 +1629,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     connTypeProcessPendingData();
 
-    /* If any connection type(typical TLS) still has pending unread data or if there are clients
-     * with pending IO reads/writes, don't sleep at all. */
-    int dont_sleep = connTypeHasPendingData() || listLength(server.clients_pending_io_read) > 0 ||
-                     listLength(server.clients_pending_io_write) > 0;
+    /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
+    int dont_sleep = connTypeHasPendingData();
 
     /* Call the Cluster before sleep function. Note that this function
      * may change the state of Cluster (from ok to fail or vice versa),
@@ -2045,6 +2077,7 @@ void initServerConfig(void) {
     server.cached_primary = NULL;
     server.primary_initial_offset = -1;
     server.repl_state = REPL_STATE_NONE;
+    server.repl_rdb_channel_state = REPL_DUAL_CHANNEL_STATE_NONE;
     server.repl_transfer_tmpfile = NULL;
     server.repl_transfer_fd = -1;
     server.repl_transfer_s = NULL;
@@ -2052,6 +2085,8 @@ void initServerConfig(void) {
     server.repl_down_since = 0; /* Never connected, repl is down since EVER. */
     server.primary_repl_offset = 0;
     server.fsynced_reploff_pending = 0;
+    server.rdb_client_id = -1;
+    server.loading_process_events_interval_ms = LOADING_PROCESS_EVENTS_INTERVAL_DEFAULT;
 
     /* Replication partial resync backlog */
     server.repl_backlog = NULL;
@@ -2491,6 +2526,8 @@ void resetServerStats(void) {
     server.stat_io_reads_processed = 0;
     server.stat_total_reads_processed = 0;
     server.stat_io_writes_processed = 0;
+    server.stat_io_freed_objects = 0;
+    server.stat_poll_processed_by_io_threads = 0;
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
@@ -2545,16 +2582,19 @@ void initServer(void) {
     server.hz = server.config_hz;
     server.pid = getpid();
     server.in_fork_child = CHILD_TYPE_NONE;
+    server.rdb_pipe_read = -1;
+    server.rdb_child_exit_pipe = -1;
     server.main_thread_id = pthread_self();
     server.current_client = NULL;
     server.errors = raxNew();
-    server.errors_enabled = 1;
     server.execution_nesting = 0;
     server.clients = listCreate();
     server.clients_index = raxNew();
     server.clients_to_close = listCreate();
     server.replicas = listCreate();
     server.monitors = listCreate();
+    server.replicas_waiting_psync = raxNew();
+    server.wait_before_rdb_client_free = DEFAULT_WAIT_BEFORE_RDB_CLIENT_FREE;
     server.clients_pending_write = listCreate();
     server.clients_pending_io_write = listCreate();
     server.clients_pending_io_read = listCreate();
@@ -2606,8 +2646,8 @@ void initServer(void) {
         flags |= KVSTORE_FREE_EMPTY_DICTS;
     }
     for (j = 0; j < server.dbnum; j++) {
-        server.db[j].keys = kvstoreCreate(&dbDictType, slot_count_bits, flags);
-        server.db[j].expires = kvstoreCreate(&dbExpiresDictType, slot_count_bits, flags);
+        server.db[j].keys = kvstoreCreate(&kvstoreKeysDictType, slot_count_bits, flags);
+        server.db[j].expires = kvstoreCreate(&kvstoreExpiresDictType, slot_count_bits, flags);
         server.db[j].expires_cursor = 0;
         server.db[j].blocking_keys = dictCreate(&keylistDictType);
         server.db[j].blocking_keys_unblock_on_nokey = dictCreate(&objectKeyPointerValueDictType);
@@ -2622,10 +2662,10 @@ void initServer(void) {
     /* Note that server.pubsub_channels was chosen to be a kvstore (with only one dict, which
      * seems odd) just to make the code cleaner by making it be the same type as server.pubsubshard_channels
      * (which has to be kvstore), see pubsubtype.serverPubSubChannels */
-    server.pubsub_channels = kvstoreCreate(&objToDictDictType, 0, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    server.pubsub_channels = kvstoreCreate(&kvstoreChannelDictType, 0, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     server.pubsub_patterns = dictCreate(&objToDictDictType);
-    server.pubsubshard_channels =
-        kvstoreCreate(&objToDictDictType, slot_count_bits, KVSTORE_ALLOCATE_DICTS_ON_DEMAND | KVSTORE_FREE_EMPTY_DICTS);
+    server.pubsubshard_channels = kvstoreCreate(&kvstoreChannelDictType, slot_count_bits,
+                                                KVSTORE_ALLOCATE_DICTS_ON_DEMAND | KVSTORE_FREE_EMPTY_DICTS);
     server.pubsub_clients = 0;
     server.watching_clients = 0;
     server.cronloops = 0;
@@ -2775,7 +2815,8 @@ void initListeners(void) {
         listener->bindaddr = &server.unixsocket;
         listener->bindaddr_count = 1;
         listener->ct = connectionByType(CONN_TYPE_UNIX);
-        listener->priv = &server.unixsocketperm; /* Unix socket specified */
+        listener->priv1 = &server.unixsocketperm; /* Unix socket specified */
+        listener->priv2 = server.unixsocketgroup; /* Unix socket group specified */
     }
 
     /* create all the configured listener, and add handler to start to accept */
@@ -3030,7 +3071,6 @@ void resetCommandTableStats(dict *commands) {
 void resetErrorTableStats(void) {
     freeErrorsRadixTreeAsync(server.errors);
     server.errors = raxNew();
-    server.errors_enabled = 1;
 }
 
 /* ========================== OP Array API ============================ */
@@ -3265,6 +3305,13 @@ void slowlogPushCurrentCommand(client *c, struct serverCommand *cmd, ustime_t du
      * arguments. */
     robj **argv = c->original_argv ? c->original_argv : c->argv;
     int argc = c->original_argv ? c->original_argc : c->argc;
+
+    /* If a script is currently running, the client passed in is a
+     * fake client. Or the client passed in is the original client
+     * if this is a EVAL or alike, doesn't matter. In this case,
+     * use the original client to get the client information. */
+    c = scriptIsRunning() ? scriptGetCaller() : c;
+
     slowlogPushEntryIfNeeded(c, argv, argc, duration);
 }
 
@@ -3536,13 +3583,14 @@ void call(client *c, int flags) {
      * If the client is blocked we will handle slowlog when it is unblocked. */
     if (!c->flag.blocked) freeClientOriginalArgv(c);
 
-    /* populate the per-command statistics that we show in INFO commandstats.
-     * If the client is blocked we will handle latency stats and duration when it is unblocked. */
+    /* Populate the per-command and per-slot statistics that we show in INFO commandstats and CLUSTER SLOT-STATS,
+     * respectively. If the client is blocked we will handle latency stats and duration when it is unblocked. */
     if (update_command_stats && !c->flag.blocked) {
         real_cmd->calls++;
         real_cmd->microseconds += c->duration;
         if (server.latency_tracking_enabled && !c->flag.blocked)
             updateCommandLatencyHistogram(&(real_cmd->latency_histogram), c->duration * 1000);
+        clusterSlotStatsAddCpuDuration(c, c->duration);
     }
 
     /* The duration needs to be reset after each call except for a blocked command,
@@ -3683,6 +3731,8 @@ void afterCommand(client *c) {
     /* Flush pending tracking invalidations. */
     trackingHandlePendingKeyInvalidations();
 
+    clusterSlotStatsAddNetworkBytesOutForUserClient(c);
+
     /* Flush other pending push messages. only when we are not in nested call.
      * So the messages are not interleaved with transaction response. */
     if (!server.execution_nesting) listJoin(c->reply, server.pending_push_messages);
@@ -3719,11 +3769,11 @@ int commandCheckExistence(client *c, sds *err) {
 
 /* Check if c->argc is valid for c->cmd, fills `err` with details in case it isn't.
  * Return 1 if valid. */
-int commandCheckArity(client *c, sds *err) {
-    if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) || (c->argc < -c->cmd->arity)) {
+int commandCheckArity(struct serverCommand *cmd, int argc, sds *err) {
+    if ((cmd->arity > 0 && cmd->arity != argc) || (argc < -cmd->arity)) {
         if (err) {
             *err = sdsnew(NULL);
-            *err = sdscatprintf(*err, "wrong number of arguments for '%s' command", c->cmd->fullname);
+            *err = sdscatprintf(*err, "wrong number of arguments for '%s' command", cmd->fullname);
         }
         return 0;
     }
@@ -3794,13 +3844,14 @@ int processCommand(client *c) {
      * In case we are reprocessing a command after it was blocked,
      * we do not have to repeat the same checks */
     if (!client_reprocessing_command) {
-        c->cmd = c->lastcmd = c->realcmd = lookupCommand(c->argv, c->argc);
+        struct serverCommand *cmd = c->io_parsed_cmd ? c->io_parsed_cmd : lookupCommand(c->argv, c->argc);
+        c->cmd = c->lastcmd = c->realcmd = cmd;
         sds err;
         if (!commandCheckExistence(c, &err)) {
             rejectCommandSds(c, err);
             return C_OK;
         }
-        if (!commandCheckArity(c, &err)) {
+        if (!commandCheckArity(c->cmd, c->argc, &err)) {
             rejectCommandSds(c, err);
             return C_OK;
         }
@@ -3890,7 +3941,37 @@ int processCommand(client *c) {
 
     if (!server.cluster_enabled && c->capa & CLIENT_CAPA_REDIRECT && server.primary_host && !mustObeyClient(c) &&
         (is_write_command || (is_read_command && !c->flag.readonly))) {
-        addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d", server.primary_host, server.primary_port));
+        if (server.failover_state == FAILOVER_IN_PROGRESS) {
+            /* During the FAILOVER process, when conditions are met (such as
+             * when the force time is reached or the primary and replica offsets
+             * are consistent), the primary actively becomes the replica and
+             * transitions to the FAILOVER_IN_PROGRESS state.
+             *
+             * After the primary becomes the replica, and after handshaking
+             * and other operations, it will eventually send the PSYNC FAILOVER
+             * command to the replica, then the replica will become the primary.
+             * This means that the upgrade of the replica to the primary is an
+             * asynchronous operation, which implies that during the
+             * FAILOVER_IN_PROGRESS state, there may be a period of time where
+             * both nodes are replicas.
+             *
+             * In this scenario, if a -REDIRECT is returned, the request will be
+             * redirected to the replica and then redirected back, causing back
+             * and forth redirection. To avoid this situation, during the
+             * FAILOVER_IN_PROGRESS state, we temporarily suspend the clients
+             * that need to be redirected until the replica truly becomes the primary,
+             * and then resume the execution. */
+            blockPostponeClient(c);
+        } else {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            c->duration = 0;
+            c->cmd->rejected_calls++;
+            addReplyErrorSds(c, sdscatprintf(sdsempty(), "-REDIRECT %s:%d", server.primary_host, server.primary_port));
+        }
         return C_OK;
     }
 
@@ -3992,6 +4073,12 @@ int processCommand(client *c) {
         return C_OK;
     }
 
+    /* Not allow several UNSUBSCRIBE commands executed under non-pubsub mode */
+    if (!c->flag.pubsub && (c->cmd->proc == unsubscribeCommand || c->cmd->proc == sunsubscribeCommand ||
+                            c->cmd->proc == punsubscribeCommand)) {
+        rejectCommandFormat(c, "-NOSUB '%s' command executed not in subscribed mode", c->cmd->fullname);
+        return C_OK;
+    }
     /* Only allow commands with flag "t", such as INFO, REPLICAOF and so on,
      * when replica-serve-stale-data is no and we are a replica with a broken
      * link with primary. */
@@ -4067,48 +4154,9 @@ int processCommand(client *c) {
 
 /* ====================== Error lookup and execution ===================== */
 
-/* Users who abuse lua error_reply will generate a new error object on each
- * error call, which can make server.errors get bigger and bigger. This will
- * cause the server to block when calling INFO (we also return errorstats by
- * default). To prevent the damage it can cause, when a misuse is detected,
- * we will print the warning log and disable the errorstats to avoid adding
- * more new errors. It can be re-enabled via CONFIG RESETSTAT. */
-#define ERROR_STATS_NUMBER 128
 void incrementErrorCount(const char *fullerr, size_t namelen) {
-    /* errorstats is disabled, return ASAP. */
-    if (!server.errors_enabled) return;
-
     void *result;
     if (!raxFind(server.errors, (unsigned char *)fullerr, namelen, &result)) {
-        if (server.errors->numele >= ERROR_STATS_NUMBER) {
-            sds errors = sdsempty();
-            raxIterator ri;
-            raxStart(&ri, server.errors);
-            raxSeek(&ri, "^", NULL, 0);
-            while (raxNext(&ri)) {
-                char *tmpsafe;
-                errors = sdscatlen(errors, getSafeInfoString((char *)ri.key, ri.key_len, &tmpsafe), ri.key_len);
-                errors = sdscatlen(errors, ", ", 2);
-                if (tmpsafe != NULL) zfree(tmpsafe);
-            }
-            sdsrange(errors, 0, -3); /* Remove final ", ". */
-            raxStop(&ri);
-
-            /* Print the warning log and the contents of server.errors to the log. */
-            serverLog(LL_WARNING, "Errorstats stopped adding new errors because the number of "
-                                  "errors reached the limit, may be misuse of lua error_reply, "
-                                  "please check INFO ERRORSTATS, this can be re-enabled via "
-                                  "CONFIG RESETSTAT.");
-            serverLog(LL_WARNING, "Current errors code list: %s", errors);
-            sdsfree(errors);
-
-            /* Reset the errors and add a single element to indicate that it is disabled. */
-            resetErrorTableStats();
-            incrementErrorCount("ERRORSTATS_DISABLED", 19);
-            server.errors_enabled = 0;
-            return;
-        }
-
         struct serverError *error = zmalloc(sizeof(*error));
         error->count = 1;
         raxInsert(server.errors, (unsigned char *)fullerr, namelen, error, NULL);
@@ -5181,6 +5229,7 @@ const char *replstateToString(int replstate) {
     switch (replstate) {
     case REPLICA_STATE_WAIT_BGSAVE_START:
     case REPLICA_STATE_WAIT_BGSAVE_END: return "wait_bgsave";
+    case REPLICA_STATE_BG_RDB_LOAD: return "bg_transfer";
     case REPLICA_STATE_SEND_BULK: return "send_bulk";
     case REPLICA_STATE_ONLINE: return "online";
     default: return "";
@@ -5700,6 +5749,10 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             "total_writes_processed:%lld\r\n", server.stat_total_writes_processed,
             "io_threaded_reads_processed:%lld\r\n", server.stat_io_reads_processed,
             "io_threaded_writes_processed:%lld\r\n", server.stat_io_writes_processed,
+            "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
+            "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
+            "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
+            "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
             "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
             "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
             "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,
@@ -5740,7 +5793,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "master_last_io_seconds_ago:%d\r\n", server.primary ? ((int)(server.unixtime-server.primary->last_interaction)) : -1,
                 "master_sync_in_progress:%d\r\n", server.repl_state == REPL_STATE_TRANSFER,
                 "slave_read_repl_offset:%lld\r\n", replica_read_repl_offset,
-                "slave_repl_offset:%lld\r\n", replica_repl_offset));
+                "slave_repl_offset:%lld\r\n", replica_repl_offset,
+                "replicas_repl_buffer_size:%zu\r\n", server.pending_repl_data.len,
+                "replicas_repl_buffer_peak:%zu\r\n", server.pending_repl_data.peak));
             /* clang-format on */
 
             if (server.repl_state == REPL_STATE_TRANSFER) {
@@ -5800,14 +5855,18 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
 
                 info = sdscatprintf(info,
                                     "slave%d:ip=%s,port=%d,state=%s,"
-                                    "offset=%lld,lag=%ld\r\n",
+                                    "offset=%lld,lag=%ld,type=%s\r\n",
                                     replica_id, replica_ip, replica->replica_listening_port, state,
-                                    replica->repl_ack_off, lag);
+                                    replica->repl_ack_off, lag,
+                                    replica->flag.repl_rdb_channel                     ? "rdb-channel"
+                                    : replica->repl_state == REPLICA_STATE_BG_RDB_LOAD ? "main-channel"
+                                                                                       : "replica");
                 replica_id++;
             }
         }
         /* clang-format off */
         info = sdscatprintf(info, FMTARGS(
+            "replicas_waiting_psync:%llu\r\n", (unsigned long long)raxSize(server.replicas_waiting_psync),
             "master_failover_state:%s\r\n", getFailoverStateString(),
             "master_replid:%s\r\n", server.replid,
             "master_replid2:%s\r\n", server.replid2,
@@ -6628,7 +6687,6 @@ struct serverTest {
     int failed;
 } serverTests[] = {
     {"quicklist", quicklistTest},
-    {"zipmap", zipmapTest},
     {"dict", dictTest},
     {"listpack", listpackTest},
 };
