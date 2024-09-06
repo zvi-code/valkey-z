@@ -63,6 +63,7 @@
 #include <sys/utsname.h>
 #include <locale.h>
 #include <sys/socket.h>
+#include "allocator_defrag.h"
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -1220,8 +1221,8 @@ void cronUpdateMemoryStats(void) {
          * allocations, and allocator reserved pages that can be pursed (all not actual frag) */
         zmalloc_get_allocator_info(
             &server.cron_malloc_stats.allocator_allocated, &server.cron_malloc_stats.allocator_active,
-            &server.cron_malloc_stats.allocator_resident, NULL, &server.cron_malloc_stats.allocator_muzzy,
-            &server.cron_malloc_stats.allocator_frag_smallbins_bytes);
+            &server.cron_malloc_stats.allocator_resident, NULL, &server.cron_malloc_stats.allocator_muzzy);
+        server.cron_malloc_stats.allocator_frag_smallbins_bytes = allocatorGetFragmentationSmallBins(false);
         /* in case the allocator isn't providing these stats, fake them so that
          * fragmentation info still shows some (inaccurate metrics) */
         if (!server.cron_malloc_stats.allocator_resident) {
@@ -5591,7 +5592,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         /* clang-format on */
         freeMemoryOverheadData(mh);
     }
-
+#if defined(HAVE_DEFRAG) && defined(USE_JEMALLOC)
+    //    if (all_sections || (dictFind(section_dict, "defrag") != NULL)) {
+    //        if (sections++) info = sdscat(info, "\r\n");
+    //        /* clang-format off */
+    //        info = sdscatprintf(info, "# Defrag\r\n");
+    //        info = allocatorGetDefragInfo(info);
+    //    }
+#endif
     /* Persistence */
     if (all_sections || (dictFind(section_dict, "persistence") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
@@ -6791,6 +6799,10 @@ int main(int argc, char **argv) {
     server.exec_argv[argc] = NULL;
     for (j = 0; j < argc; j++) server.exec_argv[j] = zstrdup(argv[j]);
 
+#if defined(USE_JEMALLOC)
+    // we assume jemalloc version in use supports defragmentation api
+    serverAssert(!allocatorDefragInit());
+#endif
     /* We need to init sentinel right now as parsing the configuration file
      * in sentinel mode will have the effect of populating the sentinel
      * data structures with primary nodes to monitor. */

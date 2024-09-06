@@ -32,7 +32,7 @@
 #include "cluster.h"
 #include "connection.h"
 #include "bio.h"
-
+#include "allocator_defrag.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -40,7 +40,7 @@
 #include <string.h>
 #include <locale.h>
 #include <ctype.h>
-
+#include "allocator_defrag.h"
 /*-----------------------------------------------------------------------------
  * Config file name-value maps.
  *----------------------------------------------------------------------------*/
@@ -50,6 +50,30 @@ typedef struct deprecatedConfig {
     const int argc_min;
     const int argc_max;
 } deprecatedConfig;
+
+configEnum defrag_strategy[] = {{"je-hint", DEF_FRAG_JE_HINT},
+                                {"je-ctl", DEF_FRAG_JE_CTL},
+                                {"all", DEF_FRAG_ALL},
+                                {NULL, 0}};
+
+configEnum defrag_select_strategy[] = {{"none", SELECT_NORMAL},
+                                       {"pgs", SELECT_PAGES_LOWER},
+                                       {"rand", SELECT_RANDOM},
+                                       {"progressive", SELECT_PROGRESSIVE},
+                                       {"util-trend", SELECT_UTILIZATION_TREND},
+                                       {NULL, 0}};
+
+configEnum defrag_recalc[] = {{"none", RULE_NONE}, {"full_cycle", RULE_RECALC_ON_FULL_ITER}, {NULL, 0}};
+
+configEnum defrag_alloc_strategy[] = {{"none", RULE_ALLOC_NONE},
+                                      {"tcach", RULE_ALLOC_USE_TCACHE},
+                                      {"ud-tcache", RULE_ALLOC_USE_UD_TCACHE},
+                                      {NULL, 0}};
+
+configEnum defrag_free_strategy[] = {{"none", RULE_FREE_NONE},
+                                     {"tcach", RULE_FREE_USE_TCACHE},
+                                     {"ud-tcache", RULE_FREE_USE_UD_TCACHE},
+                                     {NULL, 0}};
 
 configEnum maxmemory_policy_enum[] = {{"volatile-lru", MAXMEMORY_VOLATILE_LRU},
                                       {"volatile-lfu", MAXMEMORY_VOLATILE_LFU},
@@ -2452,7 +2476,46 @@ static int updatePort(const char **err) {
 
     return 1;
 }
+#if defined(HAVE_DEFRAG) && defined(USE_JEMALLOC)
+static int updateDefragStrategy(const char **err) {
+    UNUSED(err);
+    allocatorSetStrategyConfig(server.defrag_strategy);
+    server.active_defrag_configuration_changed = 1;
+    return 1;
+}
+static int updateDefragSelect(const char **err) {
+    UNUSED(err);
+    allocatorSetSelectConfig(server.defrag_select_strategy);
+    server.active_defrag_configuration_changed = 1;
+    return 1;
+}
+static int updateDefragRecalc(const char **err) {
+    UNUSED(err);
+    allocatorSetRefreshConfig(server.defrag_recalc);
+    server.active_defrag_configuration_changed = 1;
+    return 1;
+}
+static int updateDefragAlloc(const char **err) {
+    UNUSED(err);
+    allocatorSetAllocConfig(server.defrag_alloc_strategy);
+    server.active_defrag_configuration_changed = 1;
+    return 1;
+}
 
+static int updateDefragFree(const char **err) {
+    UNUSED(err);
+    allocatorSetFreeConfig(server.defrag_free_strategy);
+    server.active_defrag_configuration_changed = 1;
+    return 1;
+}
+
+static int updateDefragSelectThreshold(const char **err) {
+    UNUSED(err);
+    allocatorSetThresholdConfig(server.select_threshold_factor);
+    server.active_defrag_configuration_changed = 1;
+    return 1;
+}
+#endif
 static int updateDefragConfiguration(const char **err) {
     UNUSED(err);
     server.active_defrag_configuration_changed = 1;
@@ -3161,7 +3224,14 @@ standardConfig static_configs[] = {
     createEnumConfig("propagation-error-behavior", NULL, MODIFIABLE_CONFIG, propagation_error_behavior_enum, server.propagation_error_behavior, PROPAGATION_ERR_BEHAVIOR_IGNORE, NULL, NULL),
     createEnumConfig("shutdown-on-sigint", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigint, 0, isValidShutdownOnSigFlags, NULL),
     createEnumConfig("shutdown-on-sigterm", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigterm, 0, isValidShutdownOnSigFlags, NULL),
-
+#if defined(HAVE_DEFRAG) && defined(USE_JEMALLOC)
+    createEnumConfig("active-defrag-strategy", NULL, MODIFIABLE_CONFIG , defrag_strategy, server.defrag_strategy, 0, NULL, updateDefragStrategy),
+    createEnumConfig("active-defrag-select", NULL, MODIFIABLE_CONFIG , defrag_select_strategy, server.defrag_select_strategy, 0, NULL, updateDefragSelect),
+    createEnumConfig("active-defrag-recalc", NULL, MODIFIABLE_CONFIG , defrag_recalc, server.defrag_recalc, 0, NULL, updateDefragRecalc),
+    createEnumConfig("active-defrag-alloc", NULL, MODIFIABLE_CONFIG , defrag_alloc_strategy, server.defrag_alloc_strategy, 0, NULL, updateDefragAlloc),
+    createEnumConfig("active-defrag-free", NULL, MODIFIABLE_CONFIG , defrag_free_strategy, server.defrag_free_strategy, 0, NULL, updateDefragFree),
+    createIntConfig("active-defrag-nonfull-factor", NULL, MODIFIABLE_CONFIG, 0, 3000, server.select_threshold_factor, 125, INTEGER_CONFIG, NULL, updateDefragSelectThreshold), /* Default: 12.5% CPU min (at lower threshold) */
+#endif
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort), /* TCP port. */
