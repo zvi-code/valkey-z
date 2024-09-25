@@ -95,6 +95,9 @@ static struct config {
     int datasize;
     int randomkeys;
     int randomkeys_keyspacelen;
+    int randomkeys_offset;
+    long long randomfields_offset; // New field for HASH/SET field offset
+    long long randomfields_len;    // New field for HASH/SET field length
     int keepalive;
     int pipeline;
     long long start;
@@ -387,7 +390,11 @@ static void randomizeClientKey(client c) {
     for (i = 0; i < c->randlen; i++) {
         char *p = c->randptr[i] + 11;
         size_t r = 0;
-        if (config.randomkeys_keyspacelen != 0) r = random() % config.randomkeys_keyspacelen;
+        if (config.randomkeys_keyspacelen != 0) {
+            r = random() % config.randomkeys_keyspacelen;
+            // Apply offset
+            r += config.randomkeys_offset;
+        }
         size_t j;
 
         for (j = 0; j < 12; j++) {
@@ -395,6 +402,16 @@ static void randomizeClientKey(client c) {
             r /= 10;
             p--;
         }
+    }
+}
+
+static void randomizeFieldName(char *field, long long r) {
+    char *p = field + 11; // Assuming 12-digit field names
+    size_t j;
+    for (j = 0; j < 12; j++) {
+        *p = '0' + r % 10;
+        r /= 10;
+        p--;
     }
 }
 
@@ -565,7 +582,7 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
             return;
         }
 
-        /* Really initialize: randomize keys and set start time. */
+        /* Really initialize: randomize keys and set start time. writeHandler*/
         if (config.randomkeys) randomizeClientKey(c);
         if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
@@ -1409,13 +1426,31 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "-r")) {
             if (lastarg) goto invalid;
             const char *next = argv[++i], *p = next;
-            if (*p == '-') {
-                p++;
-                if (*p < '0' || *p > '9') goto invalid;
-            }
+            char *end;
             config.randomkeys = 1;
-            config.randomkeys_keyspacelen = atoi(next);
-            if (config.randomkeys_keyspacelen < 0) config.randomkeys_keyspacelen = 0;
+            if (strchr(p, ':') == NULL) {
+                // Old format: just length
+                config.randomkeys_offset = 0;
+                config.randomkeys_keyspacelen = strtoll(p, &end, 10);
+                if (*end != '\0' || config.randomkeys_keyspacelen <= 0) goto invalid;
+            } else {
+                // New format: offset:length
+                config.randomkeys_offset = strtoll(p, &end, 10);
+                if (*end != ':') goto invalid;
+                p = end + 1;
+                config.randomkeys_keyspacelen = strtoll(p, &end, 10);
+                if (*end != '\0' || config.randomkeys_offset < 0 || config.randomkeys_keyspacelen <= 0) goto invalid;
+            }
+        } else if (!strcmp(argv[i], "-e")) {
+            if (lastarg) goto invalid;
+            const char *next = argv[++i], *p = next;
+            char *end;
+
+            config.randomfields_offset = strtoll(p, &end, 10);
+            if (*end != ':') goto invalid;
+            p = end + 1;
+            config.randomfields_len = strtoll(p, &end, 10);
+            if (*end != '\0' || config.randomfields_offset < 0 || config.randomfields_len <= 0) goto invalid;
         } else if (!strcmp(argv[i], "-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i], "--csv")) {
@@ -1424,9 +1459,6 @@ int parseOptions(int argc, char **argv) {
             config.loop = 1;
         } else if (!strcmp(argv[i], "-I")) {
             config.idlemode = 1;
-        } else if (!strcmp(argv[i], "-e")) {
-            fprintf(stderr, "WARNING: -e option has no effect. "
-                            "We now immediately exit on error to avoid false results.\n");
         } else if (!strcmp(argv[i], "--seed")) {
             if (lastarg) goto invalid;
             int rand_seed = atoi(argv[++i]);
@@ -1561,16 +1593,19 @@ usage:
         "                    command will not be sent to the right cluster node.\n"
         " --enable-tracking  Send CLIENT TRACKING on before starting benchmark.\n"
         " -k <boolean>       1=keep alive 0=reconnect (default 1)\n"
-        " -r <keyspacelen>   Use random keys for SET/GET/INCR, random values for SADD,\n"
+        " -r <offset>:<len>   Use random keys for SET/GET/INCR, random values for SADD,\n"
         "                    random members and scores for ZADD.\n"
-        "                    Using this option the benchmark will expand the string\n"
-        "                    __rand_int__ inside an argument with a 12 digits number in\n"
-        "                    the specified range from 0 to keyspacelen-1. The\n"
-        "                    substitution changes every time a command is executed.\n"
-        "                    Default tests use this to hit random keys in the specified\n"
-        "                    range.\n"
+        "                    The <offset> specifies the start of the keyspace, and\n"
+        "                    <len> specifies the number of keys in the keyspace.\n"
+        "                    The benchmark will use keys in the range\n"
+        "                    [offset, offset+len-1].\n"
         "                    Note: If -r is omitted, all commands in a benchmark will\n"
         "                    use the same key.\n"
+        " -e <offset>:<len>   For HASH and SET operations, use random fields\n"
+        "                    within each key. The <offset> specifies the start\n"
+        "                    of the field space, and <len> specifies the number\n"
+        "                    of fields. Fields will be in the range\n"
+        "                    [offset, offset+len-1].\n"
         " -P <numreq>        Pipeline <numreq> requests. Default 1 (no pipeline).\n"
         " -q                 Quiet. Just show query/sec values\n"
         " --precision        Number of decimal places to display in latency output (default 0)\n"
@@ -1684,6 +1719,7 @@ int main(int argc, char **argv) {
     config.pipeline = 1;
     config.randomkeys = 0;
     config.randomkeys_keyspacelen = 0;
+    config.randomkeys_offset = 0;
     config.quiet = 0;
     config.csv = 0;
     config.loop = 0;
@@ -1858,7 +1894,11 @@ int main(int argc, char **argv) {
             benchmark("SET", cmd, len);
             free(cmd);
         }
-
+        if (test_is_selected("del")) {
+            len = redisFormatCommand(&cmd, "DEL key%s:__rand_int__", tag);
+            benchmark("DEL", cmd, len);
+            free(cmd);
+        }
         if (test_is_selected("get")) {
             len = redisFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
             benchmark("GET", cmd, len);
@@ -1872,43 +1912,64 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("lpush")) {
-            len = redisFormatCommand(&cmd, "LPUSH mylist%s %s", tag, data);
+            len = redisFormatCommand(&cmd, "LPUSH mylist%s:__rand_int__ %s", tag, data);
             benchmark("LPUSH", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("rpush")) {
-            len = redisFormatCommand(&cmd, "RPUSH mylist%s %s", tag, data);
+            len = redisFormatCommand(&cmd, "RPUSH mylist%s:__rand_int__ %s", tag, data);
             benchmark("RPUSH", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("lpop")) {
-            len = redisFormatCommand(&cmd, "LPOP mylist%s", tag);
+            len = redisFormatCommand(&cmd, "LPOP mylist%s:__rand_int__", tag);
             benchmark("LPOP", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("rpop")) {
-            len = redisFormatCommand(&cmd, "RPOP mylist%s", tag);
+            len = redisFormatCommand(&cmd, "RPOP mylist%s:__rand_int__", tag);
             benchmark("RPOP", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("sadd")) {
-            len = redisFormatCommand(&cmd, "SADD myset%s element:__rand_int__", tag);
+            ((long long *)data)[0] = config.randomfields_offset + (random() % config.randomfields_len);
+
+            len = redisFormatCommand(&cmd, "SADD myset%s:__rand_int__ element:%s", tag, data);
             benchmark("SADD", cmd, len);
             free(cmd);
         }
 
+        if (test_is_selected("dels")) {
+            len = redisFormatCommand(&cmd, "DEL myset%s:__rand_int__", tag);
+            benchmark("DEL", cmd, len);
+            free(cmd);
+        }
+
         if (test_is_selected("hset")) {
-            len = redisFormatCommand(&cmd, "HSET myhash%s element:__rand_int__ %s", tag, data);
+            long long field_num;
+            char field[64];
+            ((long long *)data)[0] = config.randomfields_offset + (random() % config.randomfields_len);
+            field_num = config.randomfields_offset + (random() % config.randomfields_len);
+
+            randomizeFieldName(field, field_num);
+
+            len = redisFormatCommand(&cmd, "HSET myhash%s:__rand_int__ field:%s %s", tag, field, data);
             benchmark("HSET", cmd, len);
             free(cmd);
         }
 
+        if (test_is_selected("delh")) {
+            len = redisFormatCommand(&cmd, "DEL myhash%s:__rand_int__", tag);
+            benchmark("DEL", cmd, len);
+            free(cmd);
+        }
+
         if (test_is_selected("spop")) {
-            len = redisFormatCommand(&cmd, "SPOP myset%s", tag);
+            len = redisFormatCommand(&cmd, "SPOP myset%s:__rand_int__", tag);
             benchmark("SPOP", cmd, len);
             free(cmd);
         }
@@ -1916,44 +1977,44 @@ int main(int argc, char **argv) {
         if (test_is_selected("zadd")) {
             char *score = "0";
             if (config.randomkeys) score = "__rand_int__";
-            len = redisFormatCommand(&cmd, "ZADD myzset%s %s element:__rand_int__", tag, score);
+            len = redisFormatCommand(&cmd, "ZADD myzset%s:__rand_int__ %s element:__rand_int__", tag, score);
             benchmark("ZADD", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("zpopmin")) {
-            len = redisFormatCommand(&cmd, "ZPOPMIN myzset%s", tag);
+            len = redisFormatCommand(&cmd, "ZPOPMIN myzset%s:__rand_int__", tag);
             benchmark("ZPOPMIN", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_100") || test_is_selected("lrange_300") ||
             test_is_selected("lrange_500") || test_is_selected("lrange_600")) {
-            len = redisFormatCommand(&cmd, "LPUSH mylist%s %s", tag, data);
+            len = redisFormatCommand(&cmd, "LPUSH mylist%s:__rand_int__ %s", tag, data);
             benchmark("LPUSH (needed to benchmark LRANGE)", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_100")) {
-            len = redisFormatCommand(&cmd, "LRANGE mylist%s 0 99", tag);
+            len = redisFormatCommand(&cmd, "LRANGE mylist%s:__rand_int__ 0 99", tag);
             benchmark("LRANGE_100 (first 100 elements)", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_300")) {
-            len = redisFormatCommand(&cmd, "LRANGE mylist%s 0 299", tag);
+            len = redisFormatCommand(&cmd, "LRANGE mylist%s:__rand_int__ 0 299", tag);
             benchmark("LRANGE_300 (first 300 elements)", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_500")) {
-            len = redisFormatCommand(&cmd, "LRANGE mylist%s 0 499", tag);
+            len = redisFormatCommand(&cmd, "LRANGE mylist%s:__rand_int__ 0 499", tag);
             benchmark("LRANGE_500 (first 500 elements)", cmd, len);
             free(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_600")) {
-            len = redisFormatCommand(&cmd, "LRANGE mylist%s 0 599", tag);
+            len = redisFormatCommand(&cmd, "LRANGE mylist%s:__rand_int__ 0 599", tag);
             benchmark("LRANGE_600 (first 600 elements)", cmd, len);
             free(cmd);
         }
@@ -1973,7 +2034,7 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("xadd")) {
-            len = redisFormatCommand(&cmd, "XADD mystream%s * myfield %s", tag, data);
+            len = redisFormatCommand(&cmd, "XADD mystream%s:__rand_int__ * myfield %s", tag, data);
             benchmark("XADD", cmd, len);
             free(cmd);
         }
