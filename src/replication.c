@@ -2180,11 +2180,6 @@ void readSyncBulkPayload(connection *conn) {
         temp_functions_lib_ctx = functionsLibCtxCreate();
 
         moduleFireServerEvent(VALKEYMODULE_EVENT_REPL_ASYNC_LOAD, VALKEYMODULE_SUBEVENT_REPL_ASYNC_LOAD_STARTED, NULL);
-    } else {
-        replicationAttachToNewPrimary();
-
-        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Flushing old data");
-        emptyData(-1, empty_db_flags, replicationEmptyDbCallback);
     }
 
     /* Before loading the DB into memory we need to delete the readable
@@ -2193,7 +2188,6 @@ void readSyncBulkPayload(connection *conn) {
      * time for non blocking loading. */
     connSetReadHandler(conn, NULL);
 
-    serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Loading DB in memory");
     rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
     if (use_diskless_load) {
         rio rdb;
@@ -2213,6 +2207,14 @@ void readSyncBulkPayload(connection *conn) {
             dbarray = diskless_load_tempDb;
             functions_lib_ctx = temp_functions_lib_ctx;
         } else {
+            /* We will soon start loading the RDB from socket, the replication history is changed,
+             * we must discard the cached primary structure and force resync of sub-replicas. */
+            replicationAttachToNewPrimary();
+
+            /* Even though we are on-empty-db and the database is empty, we still call emptyData. */
+            serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Flushing old data");
+            emptyData(-1, empty_db_flags, replicationEmptyDbCallback);
+
             dbarray = server.db;
             functions_lib_ctx = functionsLibCtxGetCurrent();
             functionsLibCtxClear(functions_lib_ctx);
@@ -2224,6 +2226,8 @@ void readSyncBulkPayload(connection *conn) {
          * We'll restore it when the RDB is received. */
         connBlock(conn);
         connRecvTimeout(conn, server.repl_timeout * 1000);
+
+        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Loading DB in memory");
         startLoading(server.repl_transfer_size, RDBFLAGS_REPLICATION, asyncLoading);
 
         int loadingFailed = 0;
@@ -2256,6 +2260,7 @@ void readSyncBulkPayload(connection *conn) {
                 serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Discarding temporary DB in background");
             } else {
                 /* Remove the half-loaded data in case we started with an empty replica. */
+                serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Discarding the half-loaded data");
                 emptyData(-1, empty_db_flags, replicationEmptyDbCallback);
             }
 
@@ -2332,6 +2337,17 @@ void readSyncBulkPayload(connection *conn) {
             return;
         }
 
+        /* We will soon start loading the RDB from disk, the replication history is changed,
+         * we must discard the cached primary structure and force resync of sub-replicas. */
+        replicationAttachToNewPrimary();
+
+        /* Empty the databases only after the RDB file is ok, that is, before the RDB file
+         * is actually loaded, in case we encounter an error and drop the replication stream
+         * and leave an empty database. */
+        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Flushing old data");
+        emptyData(-1, empty_db_flags, replicationEmptyDbCallback);
+
+        serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Loading DB in memory");
         if (rdbLoad(server.rdb_filename, &rsi, RDBFLAGS_REPLICATION) != RDB_OK) {
             serverLog(LL_WARNING, "Failed trying to load the PRIMARY synchronization "
                                   "DB from disk, check server logs.");
@@ -2344,6 +2360,7 @@ void readSyncBulkPayload(connection *conn) {
             }
 
             /* If disk-based RDB loading fails, remove the half-loaded dataset. */
+            serverLog(LL_NOTICE, "PRIMARY <-> REPLICA sync: Discarding the half-loaded data");
             emptyData(-1, empty_db_flags, replicationEmptyDbCallback);
 
             /* Note that there's no point in restarting the AOF on sync failure,
@@ -2805,7 +2822,8 @@ void bufferReplData(connection *conn) {
             remaining_bytes = readIntoReplDataBlock(conn, tail, remaining_bytes);
         }
         if (readlen && remaining_bytes == 0) {
-            if (server.pending_repl_data.len > server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes) {
+            if (server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes &&
+                server.pending_repl_data.len > server.client_obuf_limits[CLIENT_TYPE_REPLICA].hard_limit_bytes) {
                 serverLog(LL_NOTICE, "Replication buffer limit reached, stopping buffering.");
                 /* Stop accumulating primary commands. */
                 connSetReadHandler(conn, NULL);
@@ -3739,6 +3757,12 @@ void replicationSetPrimary(char *ip, int port, int full_sync_required) {
     sdsfree(server.primary_host);
     server.primary_host = NULL;
     if (server.primary) {
+        /* When joining 'myself' to a new primary, set the dont_cache_primary flag
+         * if a full sync is required. This happens when 'myself' was previously
+         * part of a different shard from the new primary. Since 'myself' does not
+         * have the replication history of the shard it is joining, clearing the
+         * cached primary is necessary to ensure proper replication behavior. */
+        server.primary->flag.dont_cache_primary = full_sync_required;
         freeClient(server.primary);
     }
     disconnectAllBlockedClients(); /* Clients blocked in primary, now replica. */
@@ -3765,14 +3789,6 @@ void replicationSetPrimary(char *ip, int port, int full_sync_required) {
     if (was_primary && !full_sync_required) {
         replicationDiscardCachedPrimary();
         replicationCachePrimaryUsingMyself();
-    }
-
-    /* If full sync is required, drop the cached primary. Doing so increases
-     * this replica node's election rank (delay) and reduces its chance of
-     * winning the election. If a replica requiring a full sync wins the
-     * election, it will flush valid data in the shard, causing data loss. */
-    if (full_sync_required) {
-        replicationDiscardCachedPrimary();
     }
 
     /* Fire the role change modules event. */
@@ -4207,9 +4223,9 @@ void refreshGoodReplicasCount(void) {
 
 /* return true if status of good replicas is OK. otherwise false */
 int checkGoodReplicasStatus(void) {
-    return server.primary_host ||                /* not a primary status should be OK */
-           !server.repl_min_replicas_max_lag ||  /* Min replica max lag not configured */
-           !server.repl_min_replicas_to_write || /* Min replica to write not configured */
+    return server.primary_host ||                                                /* not a primary status should be OK */
+           !server.repl_min_replicas_max_lag ||                                  /* Min replica max lag not configured */
+           !server.repl_min_replicas_to_write ||                                 /* Min replica to write not configured */
            server.repl_good_replicas_count >= server.repl_min_replicas_to_write; /* check if we have enough replicas */
 }
 
