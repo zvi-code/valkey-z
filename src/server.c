@@ -1312,7 +1312,7 @@ void cronUpdateMemoryStats(void) {
         zmalloc_get_allocator_info(
             &server.cron_malloc_stats.allocator_allocated, &server.cron_malloc_stats.allocator_active,
             &server.cron_malloc_stats.allocator_resident, NULL, &server.cron_malloc_stats.allocator_muzzy);
-        server.cron_malloc_stats.allocator_frag_smallbins_bytes = defrag_jemalloc_get_frag_smallbins();
+        server.cron_malloc_stats.allocator_frag_smallbins_bytes = allocatorDefragGetFragSmallbins();
         /* in case the allocator isn't providing these stats, fake them so that
          * fragmentation info still shows some (inaccurate metrics) */
         if (!server.cron_malloc_stats.allocator_resident) {
@@ -5710,9 +5710,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     }
     if (all_sections || (dictFind(section_dict, "defrag") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
-        /* clang-format off */
         info = sdscatprintf(info, "# Defrag\r\n");
-        info = defrag_jemalloc_get_fragmentation_info(info);
+        info = allocatorDefragCatFragmentationInfo(info);
     }
 
     /* Persistence */
@@ -6873,9 +6872,9 @@ __attribute__((weak)) int main(int argc, char **argv) {
 #endif
     tzset(); /* Populates 'timezone' global. */
     zmalloc_set_oom_handler(serverOutOfMemoryHandler);
-#if defined(USE_JEMALLOC)
+#if defined(HAVE_DEFRAG)
     // we assume jemalloc version in use supports defragmentation api
-    serverAssert(!defrag_jemalloc_init());
+    serverAssert(!allocatorDefragInit());
 #endif
     /* To achieve entropy, in case of containers, their time() and getpid() can
      * be the same. But value of tv_usec is fast enough to make the difference */
