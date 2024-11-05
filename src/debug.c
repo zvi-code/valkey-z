@@ -221,21 +221,22 @@ void xorObjectDigest(serverDb *db, robj *keyobj, unsigned char *digest, robj *o)
             serverPanic("Unknown sorted set encoding");
         }
     } else if (o->type == OBJ_HASH) {
-        hashTypeIterator *hi = hashTypeInitIterator(o);
-        while (hashTypeNext(hi) != C_ERR) {
+        hashTypeIterator hi;
+        hashTypeInitIterator(o, &hi);
+        while (hashTypeNext(&hi) != C_ERR) {
             unsigned char eledigest[20];
             sds sdsele;
 
             memset(eledigest, 0, 20);
-            sdsele = hashTypeCurrentObjectNewSds(hi, OBJ_HASH_KEY);
+            sdsele = hashTypeCurrentObjectNewSds(&hi, OBJ_HASH_KEY);
             mixDigest(eledigest, sdsele, sdslen(sdsele));
             sdsfree(sdsele);
-            sdsele = hashTypeCurrentObjectNewSds(hi, OBJ_HASH_VALUE);
+            sdsele = hashTypeCurrentObjectNewSds(&hi, OBJ_HASH_VALUE);
             mixDigest(eledigest, sdsele, sdslen(sdsele));
             sdsfree(sdsele);
             xorDigest(digest, eledigest, 20);
         }
-        hashTypeReleaseIterator(hi);
+        hashTypeResetIterator(&hi);
     } else if (o->type == OBJ_STREAM) {
         streamIterator si;
         streamIteratorStart(&si, o->ptr, NULL, NULL, 0);
@@ -431,7 +432,7 @@ void debugCommand(client *c) {
             "    Some fields of the default behavior may be time consuming to fetch,",
             "    and `fast` can be passed to avoid fetching them.",
             "DROP-CLUSTER-PACKET-FILTER <packet-type>",
-            "    Drop all packets that match the filtered type. Set to -1 allow all packets.",
+            "    Drop all packets that match the filtered type. Set to -1 allow all packets or -2 to drop all packets.",
             "CLOSE-CLUSTER-LINK-ON-PACKET-DROP <0|1>",
             "    This is valid only when DROP-CLUSTER-PACKET-FILTER is set to a valid packet type.",
             "    When set to 1, the cluster link is closed after dropping a packet based on the filter.",
@@ -1022,7 +1023,7 @@ void debugCommand(client *c) {
 
 /* =========================== Crash handling  ============================== */
 
-__attribute__((noinline)) void _serverAssert(const char *estr, const char *file, int line) {
+__attribute__((noinline, weak)) void _serverAssert(const char *estr, const char *file, int line) {
     int new_report = bugReportStart();
     serverLog(LL_WARNING, "=== %sASSERTION FAILED ===", new_report ? "" : "RECURSIVE ");
     serverLog(LL_WARNING, "==> %s:%d '%s' is not true", file, line, estr);

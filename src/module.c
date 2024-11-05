@@ -652,6 +652,7 @@ client *moduleAllocTempClient(void) {
     } else {
         c = createClient(NULL);
         c->flag.module = 1;
+        c->flag.fake = 1;
         c->user = NULL; /* Root user */
     }
     return c;
@@ -890,8 +891,10 @@ void moduleCreateContext(ValkeyModuleCtx *out_ctx, ValkeyModule *module, int ctx
     out_ctx->flags = ctx_flags;
     if (ctx_flags & VALKEYMODULE_CTX_TEMP_CLIENT)
         out_ctx->client = moduleAllocTempClient();
-    else if (ctx_flags & VALKEYMODULE_CTX_NEW_CLIENT)
+    else if (ctx_flags & VALKEYMODULE_CTX_NEW_CLIENT) {
         out_ctx->client = createClient(NULL);
+        out_ctx->client->flag.fake = 1;
+    }
 
     /* Calculate the initial yield time for long blocked contexts.
      * in loading we depend on the server hz, but in other cases we also wait
@@ -9110,7 +9113,7 @@ typedef struct ValkeyModuleTimer {
 
 /* This is the timer handler that is called by the main event loop. We schedule
  * this timer to be called when the nearest of our module timers will expire. */
-int moduleTimerHandler(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+long long moduleTimerHandler(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
     UNUSED(clientData);
@@ -10837,10 +10840,8 @@ size_t VM_MallocSizeString(ValkeyModuleString *str) {
  * it does not include the allocation size of the keys and values.
  */
 size_t VM_MallocSizeDict(ValkeyModuleDict *dict) {
-    size_t size = sizeof(ValkeyModuleDict) + sizeof(rax);
-    size += dict->rax->numnodes * sizeof(raxNode);
-    /* For more info about this weird line, see streamRadixTreeMemoryUsage */
-    size += dict->rax->numnodes * sizeof(long) * 30;
+    size_t size = sizeof(ValkeyModuleDict);
+    size += raxAllocSize(dict->rax);
     return size;
 }
 
@@ -12193,11 +12194,15 @@ int moduleLoad(const char *path, void **module_argv, int module_argc, int is_loa
     ValkeyModuleCtx ctx;
     moduleCreateContext(&ctx, NULL, VALKEYMODULE_CTX_TEMP_CLIENT); /* We pass NULL since we don't have a module yet. */
     if (onload((void *)&ctx, module_argv, module_argc) == VALKEYMODULE_ERR) {
-        serverLog(LL_WARNING, "Module %s initialization failed. Module not loaded", path);
         if (ctx.module) {
+            serverLog(LL_WARNING, "Module %s initialization failed. Module not loaded.", path);
             moduleUnregisterCleanup(ctx.module);
             moduleRemoveCateogires(ctx.module);
             moduleFreeModuleStructure(ctx.module);
+        } else {
+            /* If there is no ctx.module, this means that our ValkeyModule_Init call failed,
+             * and currently init will only fail on busy name. */
+            serverLog(LL_WARNING, "Module %s initialization failed. Module name is busy.", path);
         }
         moduleFreeContext(&ctx);
         dlclose(handle);

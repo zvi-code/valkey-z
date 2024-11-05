@@ -110,6 +110,7 @@ struct hdr_histogram;
 /* Error codes */
 #define C_OK 0
 #define C_ERR -1
+#define C_RETRY -2
 
 /* Static server configuration */
 #define CONFIG_DEFAULT_HZ 10 /* Time interrupt calls/sec. */
@@ -140,9 +141,8 @@ struct hdr_histogram;
 #define CONFIG_BINDADDR_MAX 16
 #define CONFIG_MIN_RESERVED_FDS 32
 #define CONFIG_DEFAULT_PROC_TITLE_TEMPLATE "{title} {listen-addr} {server-mode}"
-#define DEFAULT_WAIT_BEFORE_RDB_CLIENT_FREE 60 /* Grace period in seconds for replica main \
-                                                  channel to establish psync. */
-#define INCREMENTAL_REHASHING_THRESHOLD_US 1000
+#define DEFAULT_WAIT_BEFORE_RDB_CLIENT_FREE 60      /* Grace period in seconds for replica main \
+                                                     * channel to establish psync. */
 #define LOADING_PROCESS_EVENTS_INTERVAL_DEFAULT 100 /* Default: 0.1 seconds */
 
 /* Bucket sizes for client eviction pools. Each bucket stores clients with
@@ -490,6 +490,7 @@ typedef enum {
 #define REPL_DISKLESS_LOAD_DISABLED 0
 #define REPL_DISKLESS_LOAD_WHEN_DB_EMPTY 1
 #define REPL_DISKLESS_LOAD_SWAPDB 2
+#define REPL_DISKLESS_LOAD_FLUSH_BEFORE_LOAD 3
 
 /* TLS Client Authentication */
 #define TLS_CLIENT_AUTH_NO 0
@@ -565,6 +566,15 @@ typedef enum {
 #define PAUSE_ACTION_EXPIRE (1 << 2)
 #define PAUSE_ACTION_EVICT (1 << 3)
 #define PAUSE_ACTION_REPLICA (1 << 4) /* pause replica traffic */
+
+/* Sets log format */
+typedef enum { LOG_FORMAT_LEGACY = 0,
+               LOG_FORMAT_LOGFMT } log_format_type;
+
+/* Sets log timestamp format */
+typedef enum { LOG_TIMESTAMP_LEGACY = 0,
+               LOG_TIMESTAMP_ISO8601,
+               LOG_TIMESTAMP_MILLISECONDS } log_timestamp_type;
 
 /* common sets of actions to pause/unpause */
 #define PAUSE_ACTIONS_CLIENT_WRITE_SET \
@@ -1222,7 +1232,8 @@ typedef struct ClientFlags {
     uint64_t dont_cache_primary : 1;       /* In some cases we don't want to cache the primary. For example, the replica
                                             * knows that it does not need the cache and required a full sync. With this
                                             * flag, we won't cache the primary in freeClient. */
-    uint64_t reserved : 6;                 /* Reserved for future use */
+    uint64_t fake : 1;                     /* This is a fake client without a real connection. */
+    uint64_t reserved : 5;                 /* Reserved for future use */
 } ClientFlags;
 
 typedef struct client {
@@ -1377,7 +1388,7 @@ typedef struct client {
  * skip certain types of initialization. This type is used to indicate a client that has been initialized
  * and can be used with addWritePreparedReply* functions. A client can be cast into this type with
  * prepareClientForFutureWrites(client *c). */
-typedef client writePreparedClient;
+typedef struct writePreparedClient writePreparedClient;
 
 /* ACL information */
 typedef struct aclInfo {
@@ -1592,6 +1603,15 @@ typedef struct serverTLSContextConfig {
 } serverTLSContextConfig;
 
 /*-----------------------------------------------------------------------------
+ * Unix Context Configuration
+ *----------------------------------------------------------------------------*/
+
+typedef struct serverUnixContextConfig {
+    char *group;       /* UNIX socket group */
+    unsigned int perm; /* UNIX socket permission (see mode_t) */
+} serverUnixContextConfig;
+
+/*-----------------------------------------------------------------------------
  * AOF manifest definition
  *----------------------------------------------------------------------------*/
 typedef enum {
@@ -1702,8 +1722,6 @@ struct valkeyServer {
     int bindaddr_count;                    /* Number of addresses in server.bindaddr[] */
     char *bind_source_addr;                /* Source address to bind on for outgoing connections */
     char *unixsocket;                      /* UNIX socket path */
-    char *unixsocketgroup;                 /* UNIX socket group */
-    unsigned int unixsocketperm;           /* UNIX socket permission (see mode_t) */
     connListener listeners[CONN_TYPE_MAX]; /* TCP/Unix/TLS even more types */
     uint32_t socket_mark_id;               /* ID for listen socket marking */
     connListener clistener;                /* Cluster bus listener */
@@ -1743,7 +1761,6 @@ struct valkeyServer {
     _Atomic uint64_t next_client_id;          /* Next client unique ID. Incremental. */
     int protected_mode;                       /* Don't accept external connections. */
     int io_threads_num;                       /* Number of IO threads to use. */
-    int io_threads_do_reads;                  /* Read and parse from IO threads? */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int events_per_io_thread;                 /* Number of events on the event loop to trigger IO threads activation. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
@@ -1970,17 +1987,19 @@ struct valkeyServer {
     serverOpArray also_propagate; /* Additional command to propagate. */
     int replication_allowed;      /* Are we allowed to replicate? */
     /* Logging */
-    char *logfile;         /* Path of log file */
-    int syslog_enabled;    /* Is syslog enabled? */
-    char *syslog_ident;    /* Syslog ident */
-    int syslog_facility;   /* Syslog facility */
-    int crashlog_enabled;  /* Enable signal handler for crashlog.
-                            * disable for clean core dumps. */
-    int crashed;           /* True if the server has crashed, used in catClientInfoString
-                            * to indicate that no wait for IO threads is needed. */
-    int memcheck_enabled;  /* Enable memory check on crash. */
-    int use_exit_on_panic; /* Use exit() on panic and assert rather than
-                            * abort(). useful for Valgrind. */
+    char *logfile;            /* Path of log file */
+    int syslog_enabled;       /* Is syslog enabled? */
+    char *syslog_ident;       /* Syslog ident */
+    int syslog_facility;      /* Syslog facility */
+    int crashlog_enabled;     /* Enable signal handler for crashlog.
+                               * disable for clean core dumps. */
+    int crashed;              /* True if the server has crashed, used in catClientInfoString
+                               * to indicate that no wait for IO threads is needed. */
+    int memcheck_enabled;     /* Enable memory check on crash. */
+    int use_exit_on_panic;    /* Use exit() on panic and assert rather than
+                               * abort(). useful for Valgrind. */
+    int log_format;           /* Print log in specific format */
+    int log_timestamp_format; /* Timestamp format in log */
     /* Shutdown */
     int shutdown_timeout;    /* Graceful shutdown time limit in seconds. */
     int shutdown_on_sigint;  /* Shutdown flags configured for SIGINT. */
@@ -2201,6 +2220,7 @@ struct valkeyServer {
     int tls_replication;
     int tls_auth_clients;
     serverTLSContextConfig tls_ctx_config;
+    serverUnixContextConfig unix_ctx_config;
     /* cpu affinity */
     char *server_cpulist;      /* cpu affinity list of server main/io thread. */
     char *bio_cpulist;         /* cpu affinity list of bio thread. */
@@ -2602,7 +2622,7 @@ typedef struct {
 
     unsigned char *fptr, *vptr;
 
-    dictIterator *di;
+    dictIterator di;
     dictEntry *de;
 } hashTypeIterator;
 
@@ -2788,6 +2808,7 @@ void addReply(client *c, robj *obj);
 void addReplyStatusLength(client *c, const char *s, size_t len);
 void addReplySds(client *c, sds s);
 void addReplyBulkSds(client *c, sds s);
+void addWritePreparedReplyBulkSds(writePreparedClient *c, sds s);
 void setDeferredReplyBulkSds(client *c, void *node, sds s);
 void addReplyErrorObject(client *c, robj *err);
 void addReplyOrErrorObject(client *c, robj *reply);
@@ -2807,6 +2828,7 @@ void addReplyLongLong(client *c, long long ll);
 void addReplyArrayLen(client *c, long length);
 void addWritePreparedReplyArrayLen(writePreparedClient *c, long length);
 void addReplyMapLen(client *c, long length);
+void addWritePreparedReplyMapLen(writePreparedClient *c, long length);
 void addReplySetLen(client *c, long length);
 void addReplyAttributeLen(client *c, long length);
 void addReplyPushLen(client *c, long length);
@@ -3369,8 +3391,8 @@ void hashTypeTryConversion(robj *subject, robj **argv, int start, int end);
 int hashTypeExists(robj *o, sds key);
 int hashTypeDelete(robj *o, sds key);
 unsigned long hashTypeLength(const robj *o);
-hashTypeIterator *hashTypeInitIterator(robj *subject);
-void hashTypeReleaseIterator(hashTypeIterator *hi);
+void hashTypeInitIterator(robj *subject, hashTypeIterator *hi);
+void hashTypeResetIterator(hashTypeIterator *hi);
 int hashTypeNext(hashTypeIterator *hi);
 void hashTypeCurrentFromListpack(hashTypeIterator *hi,
                                  int what,

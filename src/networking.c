@@ -232,6 +232,8 @@ client *createClient(connection *conn) {
     c->net_output_bytes = 0;
     c->net_output_bytes_curr_cmd = 0;
     c->commands_processed = 0;
+    c->io_last_reply_block = NULL;
+    c->io_last_bufpos = 0;
     return c;
 }
 
@@ -350,6 +352,7 @@ client *createCachedResponseClient(int resp) {
     /* Allocating the `conn` allows to prepare the caching client before adding
      * data to the clients output buffer by `prepareClientToWrite`. */
     recording_client->conn = zcalloc(sizeof(connection));
+    recording_client->flag.fake = 1;
     return recording_client;
 }
 
@@ -885,8 +888,11 @@ void setDeferredAggregateLen(client *c, void *node, long length, char prefix) {
     }
 
     char lenstr[128];
-    size_t lenstr_len = snprintf(lenstr, sizeof(lenstr), "%c%ld\r\n", prefix, length);
-    setDeferredReply(c, node, lenstr, lenstr_len);
+    lenstr[0] = prefix;
+    size_t lenstr_len = ll2string(lenstr + 1, sizeof(lenstr) - 1, length);
+    lenstr[lenstr_len + 1] = '\r';
+    lenstr[lenstr_len + 2] = '\n';
+    setDeferredReply(c, node, lenstr, lenstr_len + 3);
 }
 
 void setDeferredArrayLen(client *c, void *node, long length) {
@@ -1040,7 +1046,8 @@ void addReplyArrayLen(client *c, long length) {
     addReplyAggregateLen(c, length, '*');
 }
 
-void addWritePreparedReplyArrayLen(writePreparedClient *c, long length) {
+void addWritePreparedReplyArrayLen(writePreparedClient *wpc, long length) {
+    client *c = (client *)wpc;
     serverAssert(length >= 0);
     _addReplyLongLongWithPrefix(c, length, '*');
 }
@@ -1049,6 +1056,13 @@ void addReplyMapLen(client *c, long length) {
     int prefix = c->resp == 2 ? '*' : '%';
     if (c->resp == 2) length *= 2;
     addReplyAggregateLen(c, length, prefix);
+}
+
+void addWritePreparedReplyMapLen(writePreparedClient *wpc, long length) {
+    client *c = (client *)wpc;
+    int prefix = c->resp == 2 ? '*' : '%';
+    if (c->resp == 2) length *= 2;
+    _addReplyLongLongWithPrefix(c, length, prefix);
 }
 
 void addReplySetLen(client *c, long length) {
@@ -1117,7 +1131,8 @@ void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
     _addReplyToBufferOrList(c, "\r\n", 2);
 }
 
-void addWritePreparedReplyBulkCBuffer(writePreparedClient *c, const void *p, size_t len) {
+void addWritePreparedReplyBulkCBuffer(writePreparedClient *wpc, const void *p, size_t len) {
+    client *c = (client *)wpc;
     _addReplyLongLongWithPrefix(c, len, '$');
     _addReplyToBufferOrList(c, p, len);
     _addReplyToBufferOrList(c, "\r\n", 2);
@@ -1129,6 +1144,14 @@ void addReplyBulkSds(client *c, sds s) {
         sdsfree(s);
         return;
     }
+    _addReplyLongLongWithPrefix(c, sdslen(s), '$');
+    _addReplyToBufferOrList(c, s, sdslen(s));
+    sdsfree(s);
+    _addReplyToBufferOrList(c, "\r\n", 2);
+}
+
+void addWritePreparedReplyBulkSds(writePreparedClient *wpc, sds s) {
+    client *c = (client *)wpc;
     _addReplyLongLongWithPrefix(c, sdslen(s), '$');
     _addReplyToBufferOrList(c, s, sdslen(s));
     sdsfree(s);
@@ -1161,12 +1184,12 @@ void addReplyBulkLongLong(client *c, long long ll) {
     addReplyBulkCBuffer(c, buf, len);
 }
 
-void addWritePreparedReplyBulkLongLong(writePreparedClient *c, long long ll) {
+void addWritePreparedReplyBulkLongLong(writePreparedClient *wpc, long long ll) {
     char buf[64];
     int len;
 
     len = ll2string(buf, 64, ll);
-    addWritePreparedReplyBulkCBuffer(c, buf, len);
+    addWritePreparedReplyBulkCBuffer(wpc, buf, len);
 }
 
 /* Reply with a verbatim type having the specified extension.
@@ -2649,6 +2672,8 @@ void processInlineBuffer(client *c) {
 
     /* Create an Object for all arguments. */
     for (c->argc = 0, j = 0; j < argc; j++) {
+        /* Strings returned from sdssplitargs() may have unused capacity that we can trim. */
+        argv[j] = sdsRemoveFreeSpace(argv[j], 1);
         c->argv[c->argc] = createObject(OBJ_STRING, argv[j]);
         c->argc++;
         c->argv_len_sum += sdslen(argv[j]);
@@ -3250,8 +3275,10 @@ char *getClientSockname(client *c) {
 int isClientConnIpV6(client *c) {
     /* The cached client peer id is on the form "[IPv6]:port" for IPv6
      * addresses, so we just check for '[' here. */
-    if (c->conn->type == NULL && server.current_client) {
-        /* Fake client? Use current client instead. */
+    if (c->flag.fake && server.current_client) {
+        /* Fake client? Use current client instead.
+         * Noted that in here we are assuming server.current_client is set
+         * and real (aof has already violated this in loadSingleAppendOnlyFil). */
         c = server.current_client;
     }
     return getClientPeerId(c)[0] == '[';
