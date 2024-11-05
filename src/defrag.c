@@ -39,9 +39,9 @@
 #ifdef HAVE_DEFRAG
 #include "allocator_defrag.h"
 
-#define defraged_alloc defrag_jemalloc_alloc
-#define defraged_free defrag_jemalloc_free
-#define defrag_should_defrag_multi defrag_jemalloc_should_defrag_multi
+#define defraged_alloc allocatorDefragAlloc
+#define defraged_free allocatorDefragFree
+#define shouldDefragMulti allocatorDefragShouldDefragMulti
 
 typedef struct defragCtx {
     void *privdata;
@@ -63,7 +63,7 @@ void *activeDefragAlloc(void *ptr) {
     size_t size;
     void *newptr;
     void *ptr_arr = ptr;
-    defrag_should_defrag_multi(&ptr_arr, 1);
+    shouldDefragMulti(&ptr_arr, 1);
     if (!ptr_arr) {
         server.stat_active_defrag_misses++;
         return NULL;
@@ -760,7 +760,7 @@ void defragScanCallback(void *privdata, const dictEntry *de) {
 float getAllocatorFragmentation(size_t *out_frag_bytes) {
     size_t resident, active, allocated, frag_smallbins_bytes;
     zmalloc_get_allocator_info(&allocated, &active, &resident, NULL, NULL);
-    frag_smallbins_bytes = defrag_jemalloc_get_frag_smallbins();
+    frag_smallbins_bytes = allocatorDefragGetFragSmallbins();
     /* Calculate the fragmentation ratio as the proportion of wasted memory in small
      * bins (which are defraggable) relative to the total allocated memory (including large bins).
      * This is because otherwise, if most of the memory usage is large bins, we may show high percentage,
