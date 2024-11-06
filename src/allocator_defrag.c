@@ -1,7 +1,7 @@
 /* Copyright 2024- Valkey contributors
-* All rights reserved.
-* SPDX-License-Identifier: BSD-3-Clause
-*/
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
 #include <stdio.h>
 #include "zmalloc.h"
 #include "serverassert.h"
@@ -37,16 +37,16 @@ typedef struct jeBinInfoKeys {
 
 /*  Struct representing bin information. */
 typedef struct jeBinInfo {
-    unsigned long reg_size;     /* < Size of each region in the bin. */
-    unsigned long nregs;        /* < Total number of regions in the bin. */
-    unsigned long len;          /* < Length or size of the bin (unused in this implementation). */
+    unsigned long reg_size;  /* < Size of each region in the bin. */
+    unsigned long nregs;     /* < Total number of regions in the bin. */
+    unsigned long len;       /* < Length or size of the bin (unused in this implementation). */
     jeBinInfoKeys info_keys; /* < Helper struct containing MIB information for bin queries. */
 } jeBinInfo;
 
 /*  Struct representing the configuration for jemalloc bins. */
 typedef struct jeBinsConf {
     unsigned long nbins; /* < Number of bins in the configuration. */
-    jeBinInfo *bin_info;  /* < Array of bin information structs. */
+    jeBinInfo *bin_info; /* < Array of bin information structs. */
     size_t util_batch_query_key[3];
     size_t util_batch_query_key_len;
     size_t util_query_key[3];
@@ -55,8 +55,8 @@ typedef struct jeBinsConf {
 
 /*  Struct representing defragmentation statistics for a bin. */
 typedef struct jeDefragBinStats {
-    unsigned long hits;    /* < Number of hits (regions that should be defragmented). */
-    unsigned long misses;  /* < Number of misses (regions that should not be defragmented). */
+    unsigned long hits;     /* < Number of hits (regions that should be defragmented). */
+    unsigned long misses;   /* < Number of misses (regions that should not be defragmented). */
     unsigned long nmalloc;  /* < Number of malloc operations (unused in this implementation). */
     unsigned long ndealloc; /* < Number of dealloc operations (unused in this implementation). */
 } jeDefragBinStats;
@@ -83,7 +83,7 @@ typedef struct jeBusage {
 /*  Struct representing the latest usage information across all bins. */
 typedef struct jeUsageLatest {
     jeBusage *bins_usage; /* < Array of bin usage information structs. */
-    jeDefragStats stats; /* < Overall defragmentation statistics. */
+    jeDefragStats stats;  /* < Overall defragmentation statistics. */
 } jeUsageLatest;
 
 static int defrag_supported = 0;
@@ -116,8 +116,8 @@ void allocatorDefragFree(void *ptr, size_t size) {
 #define LG_QUANTOM_OFFSET_3 ((64 >> LG_QUANTOM_8_FIRST_POW2) - 1)
 #define LG_QUANTOM_OFFSET_4 (64 >> 4)
 
-#define getBinindNormal(_sz, _offset, _last_sz_pow2)                                                                 \
-    ((SIZE_CLASS_GROUP_SZ - (((1 << (_last_sz_pow2)) - (_sz)) >> ((_last_sz_pow2) - LG_QUANTOM_8_FIRST_POW2))) +       \
+#define getBinindNormal(_sz, _offset, _last_sz_pow2)                                                             \
+    ((SIZE_CLASS_GROUP_SZ - (((1 << (_last_sz_pow2)) - (_sz)) >> ((_last_sz_pow2) - LG_QUANTOM_8_FIRST_POW2))) + \
      (((_last_sz_pow2) - (LG_QUANTOM_8_FIRST_POW2 + 3)) - 1) * SIZE_CLASS_GROUP_SZ + (_offset))
 /* Get the bin index in bin array from the reg_size.
  *
@@ -169,7 +169,7 @@ sds allocatorDefragCatFragmentationInfo(sds info) {
                             "defrag_check_num_ptrs:%lu\r\n",
                             (int)jemalloc_quantum,
                             (usage_latest.stats.hits + usage_latest.stats.misses)
-                                ?  (float)usage_latest.stats.hits / (float)(usage_latest.stats.hits + usage_latest.stats.misses)
+                                ? (float)usage_latest.stats.hits / (float)(usage_latest.stats.hits + usage_latest.stats.misses)
                                 : 0,
                             usage_latest.stats.hits, usage_latest.stats.misses, usage_latest.stats.hit_bytes,
                             usage_latest.stats.miss_bytes, usage_latest.stats.ncalls, usage_latest.stats.nptrs);
@@ -381,11 +381,11 @@ inline int shouldDefrag(jeBinInfo *binfo, jeBusage *busage, unsigned long nalloc
  * If defragmentation should NOT be performed, it sets the corresponding pointer in the ptrs array to NULL.
  * */
 static void handleResponses(jeBinsConf *conf,
-                    jeUsageLatest *usage,
-                    size_t *results,
-                    void **ptrs,
-                    size_t num,
-                    size_t quantum) {
+                            jeUsageLatest *usage,
+                            size_t *results,
+                            void **ptrs,
+                            size_t num,
+                            size_t quantum) {
     for (unsigned i = 0; i < num; i++) {
         unsigned long num_regs = SLAB_NUM_REGS(results, i);
         unsigned long slablen = SLAB_LEN(results, i);
