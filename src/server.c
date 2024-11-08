@@ -7148,5 +7148,4 @@ __attribute__((weak)) int main(int argc, char **argv) {
     aeDeleteEventLoop(server.el);
     return 0;
 }
-
 /* The End */
