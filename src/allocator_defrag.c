@@ -238,12 +238,12 @@ int allocatorDefragInit(void) {
         sz = sizeof(size_t);
         binfo->info_keys.curr_regs_key_len = sizeof(binfo->info_keys.curr_regs_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.curr_regs_key, &binfo->info_keys.curr_regs_key_len));
-        
+
         /* Mib of fetch number of current slabs in the bin */
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.curslabs", j);
         binfo->info_keys.curr_slabs_key_len = sizeof(binfo->info_keys.curr_slabs_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.curr_slabs_key, &binfo->info_keys.curr_slabs_key_len));
-        
+
         /* Mib of fetch nonfull slabs */
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.nonfull_slabs", j);
         binfo->info_keys.nonfull_slabs_key_len = sizeof(binfo->info_keys.nonfull_slabs_key) / sizeof(size_t);
@@ -253,7 +253,7 @@ int allocatorDefragInit(void) {
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.nmalloc", j);
         binfo->info_keys.nmalloc_key_len = sizeof(binfo->info_keys.nmalloc_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.nmalloc_key, &binfo->info_keys.nmalloc_key_len));
-        
+
         /* Mib of fetch num of dealloc op */
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.ndalloc", j);
         binfo->info_keys.ndealloc_key_len = sizeof(binfo->info_keys.ndealloc_key) / sizeof(size_t);
