@@ -283,8 +283,6 @@ int allocatorDefragInit(void) {
 /* Total size of consumed meomry in unused regs in small bins (AKA external fragmentation). */
 unsigned long allocatorDefragGetFragSmallbins(void) {
     unsigned long frag = 0;
-    // todo for frag calculation, should we consider sizes above page size?
-    // especially in case of single reg in slab
     for (unsigned j = 0; j < arena_bin_conf.nbins; j++) {
         size_t sz;
         jeBinInfo *binfo = &arena_bin_conf.bin_info[j];
