@@ -353,7 +353,7 @@ unsigned long allocatorDefragGetFragSmallbins(void) {
  * 3. If slab utilization < 'avg utilization'*1.125 [code 1.125 == (1000+UTILIZATION_THRESHOLD_FACTOR_MILI)/1000]
  *    than we should defrag. This is aligned with previous je_defrag_hint implementation.
  */
-inline int shouldDefrag(jeBinInfo *binfo, jeBusage *busage, unsigned long nalloced, void *ptr) {
+static inline int shouldDefrag(jeBinInfo *binfo, jeBusage *busage, unsigned long nalloced, void *ptr) {
     UNUSED(ptr);
     /** we do not want to defrag if:
      * 1. nregs == nalloced. In this case moving is guaranteed to not change the frag ratio
