@@ -242,6 +242,7 @@ int allocatorDefragInit(void) {
         sz = sizeof(uint32_t);
         assert(!je_mallctl(buf, &binfo->nregs, &sz, NULL, 0));
         binfo->len = binfo->reg_size * binfo->nregs;
+
         /* Mib of fetch number of used regions in the bin */
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.curregs", j);
         sz = sizeof(size_t);
