@@ -349,7 +349,7 @@ unsigned long allocatorDefragGetFragSmallbins(void) {
  *    defragmentation is not necessary as moving regions is guaranteed not to change the fragmentation ratio.
  * 2. If the number of non-full slabs (busage->curr_nonfull_slabs) is less than 2, defragmentation is not performed
  *    because there is no other slab to move regions to.
- * 3. If slab utilization < 'avg usilization'*1.125 [code 1.125 == (1000+UTILIZATION_THRESHOLD_FACTOR_MILI)/1000]
+ * 3. If slab utilization < 'avg utilization'*1.125 [code 1.125 == (1000+UTILIZATION_THRESHOLD_FACTOR_MILI)/1000]
  *    than we should defrag. This is aligned with previous je_defrag_hint implementation.
  */
 inline int shouldDefrag(jeBinInfo *binfo, jeBusage *busage, unsigned long nalloced, void *ptr) {
