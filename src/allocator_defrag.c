@@ -264,7 +264,7 @@ int allocatorDefragInit(void) {
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.ndalloc", j);
         binfo->info_keys.ndealloc_key_len = sizeof(binfo->info_keys.ndealloc_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.ndealloc_key, &binfo->info_keys.ndealloc_key_len));
-        // verify the reverse map of reg_size to bin index
+        /* verify the reverse map of reg_size to bin index */
         if (jemalloc_quantum == 8) {
             assert(jeSize2BinIndexLgQ3(binfo->reg_size) == j);
         } else {
