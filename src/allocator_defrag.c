@@ -136,16 +136,6 @@ inline unsigned jeSize2BinIndexLgQ3(size_t sz) {
     return getBinindNormal(sz, LG_QUANTOM_OFFSET_3, last_sz_in_group_pow2);
 }
 
-inline unsigned jeSize2BinIndexLgQ4(size_t sz) {
-    if (sz <= (1 << (LG_QUANTOM_8_FIRST_POW2 + 3))) {
-        // for sizes: 8, 16, 32, 48, 64
-        return (sz >> 4);
-    }
-    // following groups have SIZE_CLASS_GROUP_SZ size-class that are
-    uint64_t last_sz_in_group_pow2 = 64 - __builtin_clzll(sz - 1);
-    return getBinindNormal(sz, LG_QUANTOM_OFFSET_4, last_sz_in_group_pow2);
-}
-
 /* -----------------------------------------------------------------------------
  * Get INFO string about the defrag.
  * -------------------------------------------------------------------------- */
@@ -223,8 +213,8 @@ int allocatorDefragInit(void) {
 
     size_t len = sizeof(jemalloc_quantum);
     je_mallctl("arenas.quantum", &jemalloc_quantum, &len, NULL, 0);
-    // lg-quantum can be 3 or 4
-    assert((jemalloc_quantum == 8) || (jemalloc_quantum == 16));
+    // lg-quantum should be 3
+    assert(jemalloc_quantum == 8);
 
     unsigned nbins;
     sz = sizeof(nbins);
@@ -248,10 +238,12 @@ int allocatorDefragInit(void) {
         sz = sizeof(size_t);
         binfo->info_keys.curr_regs_key_len = sizeof(binfo->info_keys.curr_regs_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.curr_regs_key, &binfo->info_keys.curr_regs_key_len));
+        
         /* Mib of fetch number of current slabs in the bin */
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.curslabs", j);
         binfo->info_keys.curr_slabs_key_len = sizeof(binfo->info_keys.curr_slabs_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.curr_slabs_key, &binfo->info_keys.curr_slabs_key_len));
+        
         /* Mib of fetch nonfull slabs */
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.nonfull_slabs", j);
         binfo->info_keys.nonfull_slabs_key_len = sizeof(binfo->info_keys.nonfull_slabs_key) / sizeof(size_t);
@@ -261,16 +253,13 @@ int allocatorDefragInit(void) {
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.nmalloc", j);
         binfo->info_keys.nmalloc_key_len = sizeof(binfo->info_keys.nmalloc_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.nmalloc_key, &binfo->info_keys.nmalloc_key_len));
+        
         /* Mib of fetch num of dealloc op */
         snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.ndalloc", j);
         binfo->info_keys.ndealloc_key_len = sizeof(binfo->info_keys.ndealloc_key) / sizeof(size_t);
         assert(!je_mallctlnametomib(buf, binfo->info_keys.ndealloc_key, &binfo->info_keys.ndealloc_key_len));
         /* verify the reverse map of reg_size to bin index */
-        if (jemalloc_quantum == 8) {
-            assert(jeSize2BinIndexLgQ3(binfo->reg_size) == j);
-        } else {
-            assert(jeSize2BinIndexLgQ4(binfo->reg_size) == j);
-        }
+        assert(jeSize2BinIndexLgQ3(binfo->reg_size) == j);
     }
     arena_bin_conf.nbins = nbins;
     usage_latest.bins_usage = zcalloc(sizeof(jeBusage) * nbins);
@@ -336,12 +325,11 @@ unsigned long allocatorDefragGetFragSmallbins(void) {
 }
 
 /**
- * Determines whether defragmentation should be performed for a given allocation.
+ * Determines whether defragmentation should be performed on a pointer based on jemalloc information.
  *
  * binfo Pointer to the bin information structure.
  * busage Pointer to the bin usage structure.
  * nalloced Number of allocated regions in the bin.
- * ptr Pointer to the allocated memory region (unused in this implementation).
  *
  * return 1 if defragmentation should be performed, 0 otherwise.
  *
@@ -353,13 +341,7 @@ unsigned long allocatorDefragGetFragSmallbins(void) {
  * 3. If slab utilization < 'avg utilization'*1.125 [code 1.125 == (1000+UTILIZATION_THRESHOLD_FACTOR_MILI)/1000]
  *    than we should defrag. This is aligned with previous je_defrag_hint implementation.
  */
-static inline int shouldDefrag(jeBinInfo *binfo, jeBusage *busage, unsigned long nalloced, void *ptr) {
-    UNUSED(ptr);
-    /** we do not want to defrag if:
-     * 1. nregs == nalloced. In this case moving is guaranteed to not change the frag ratio
-     * 2. number of nonfull slabs is < 2. If we ignore the currslab we don't have anything to move
-     * 3. keep the original algorithm as in je_hint.
-     * */
+static inline int makeDefragDecision(jeBinInfo *binfo, jeBusage *busage, unsigned long nalloced) {
     size_t allocated_nonfull = busage->curr_regs - busage->curr_full_slabs * binfo->nregs;
     if (binfo->nregs == nalloced || busage->curr_nonfull_slabs < 2 ||
         1000 * nalloced * busage->curr_nonfull_slabs > (1000 + UTILIZATION_THRESHOLD_FACTOR_MILI) * allocated_nonfull) {
@@ -371,22 +353,20 @@ static inline int shouldDefrag(jeBinInfo *binfo, jeBusage *busage, unsigned long
 /*
  * Handles the results of the defragmentation analysis for multiple memory regions.
  *
- * conf Pointer to the configuration structure for the jemalloc arenas and bins.
- * usage Pointer to the usage statistics structure for the jemalloc arenas and bins.
- * results Array of results for each memory region to be analyzed.
- * ptrs Array of pointers to the memory regions to be analyzed.
- * num Number of memory regions in the ptrs array.
- * jemalloc_quantum lg-quantum of the jemalloc allocator [8 or 16].
+ * conf - Pointer to the configuration structure for the jemalloc arenas and bins.
+ * usage - Pointer to the usage statistics structure for the jemalloc arenas and bins.
+ * results - Array of results for each memory region to be analyzed.
+ * ptrs - Array of pointers to the memory regions to be analyzed.
+ * num - Number of memory regions in the ptrs array.
  *
- * For each result it checks if defragmentation should be performed based on shouldDefrag function.
+ * For each result it checks if defragmentation should be performed based on makeDefragDecision function.
  * If defragmentation should NOT be performed, it sets the corresponding pointer in the ptrs array to NULL.
  * */
 static void handleResponses(jeBinsConf *conf,
                             jeUsageLatest *usage,
                             size_t *results,
                             void **ptrs,
-                            size_t num,
-                            size_t quantum) {
+                            size_t num) {
     for (unsigned i = 0; i < num; i++) {
         unsigned long num_regs = SLAB_NUM_REGS(results, i);
         unsigned long slablen = SLAB_LEN(results, i);
@@ -400,21 +380,15 @@ static void handleResponses(jeBinsConf *conf,
             ptrs[i] = NULL;
             continue;
         }
-        unsigned binind = 0;
-        // get the index depending on quantum used
-        if (quantum == 8) {
-            binind = jeSize2BinIndexLgQ3(bsz);
-        } else {
-            assert(quantum == 16);
-            binind = jeSize2BinIndexLgQ4(bsz);
-        }
+        // get the index based on quantum used
+        unsigned binind = jeSize2BinIndexLgQ3(bsz);
         // make sure binind is in range and reverse map is correct
         assert(binind < conf->nbins && bsz == conf->bin_info[binind].reg_size);
 
         jeBinInfo *binfo = &conf->bin_info[binind];
         jeBusage *busage = &usage->bins_usage[binind];
 
-        if (!shouldDefrag(binfo, busage, binfo->nregs - nfree, ptrs[i])) {
+        if (!makeDefragDecision(binfo, busage, binfo->nregs - nfree)) {
             // MISS: utilization level is higher than threshold then set the ptr to NULL and caller will not defrag it
             ptrs[i] = NULL;
             // update miss statistics
@@ -433,18 +407,21 @@ static void handleResponses(jeBinsConf *conf,
 /**
  * Performs defragmentation analysis for multiple memory regions.
  *
- * ptrs Array of pointers to memory regions to be analyzed.
- * num Number of memory regions in the ptrs array.
+ * ptrs - Array of pointers to memory regions to be analyzed.
+ * num - Number of memory regions in the ptrs array.
  *
  * This function analyzes the provided memory regions and determines whether defragmentation should be performed
  * for each region based on the utilization and fragmentation levels. It updates the statistics for hits and misses
  * based on the defragmentation decision.
  *
+ * Ptrs that should not be defragged are set by the function to NULL.
+ * The ptrs that should be defragged are not modified.
+ *
  *  */
 void allocatorDefragShouldDefragMulti(void **ptrs, unsigned long num) {
     assert(defrag_supported);
-    assert(num < 100);
-    static __thread size_t out[3 * 100] = {0};
+    assert(num == 1);
+    static __thread size_t out[3] = {0};
     size_t out_sz = sizeof(size_t) * num * 3;
     size_t in_sz = sizeof(const void *) * num;
     jeBinsConf *conf = &arena_bin_conf;
@@ -455,7 +432,7 @@ void allocatorDefragShouldDefragMulti(void **ptrs, unsigned long num) {
     je_mallctlbymib(arena_bin_conf.util_batch_query_key, arena_bin_conf.util_batch_query_key_len, out, &out_sz, ptrs,
                     in_sz);
     // handle results with appropriate quantum value
-    handleResponses(conf, usage, out, ptrs, num, jemalloc_quantum);
+    handleResponses(conf, usage, out, ptrs, num);
     // update overall stats, regardless of hits or misses
     usage->stats.ncalls++;
     usage->stats.nptrs += num;
