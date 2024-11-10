@@ -41,7 +41,7 @@
 
 #define defraged_alloc allocatorDefragAlloc
 #define defraged_free allocatorDefragFree
-#define shouldDefragMulti allocatorDefragShouldDefragMulti
+#define shouldDefragMulti allocatorDefragCheckMulti
 
 typedef struct defragCtx {
     void *privdata;
