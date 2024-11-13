@@ -69,7 +69,7 @@ typedef struct jeDefragStats {
     unsigned long nptrs;      /* < Total number of pointers analyzed for defragmentation. */
 } jeDefragStats;
 
-/*  Struct representing the latest usage information for a bin. */
+/* Struct representing the latest usage information for a bin. */
 typedef struct jeBusage {
     unsigned long curr_slabs;         /* < Current number of slabs in the bin. */
     unsigned long curr_nonfull_slabs; /* < Current number of non-full slabs in the bin. */
