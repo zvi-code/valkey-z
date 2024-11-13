@@ -166,7 +166,7 @@ sds allocatorDefragCatFragmentationInfo(sds info) {
             bin_usage = &usage_latest.bins_usage[j];
             info = sdscatprintf(info,
                                 "binstats[bin_size=%lu]:"
-                                "num_regs=%lu,num_slabs:%lu,num_nonfull_slabs=%lu,"
+                                "num_regs=%lu,num_slabs=%lu,num_nonfull_slabs=%lu,"
                                 "hit_rate=%.2f,hits=%lu,miss=%lu,num_malloc_calls=%lu,num_dealloc_calls=%lu\r\n",
                                 bin_info->reg_size, bin_usage->curr_regs, bin_usage->curr_slabs, bin_usage->curr_nonfull_slabs,
                                 (bin_usage->stat.hits + bin_usage->stat.misses)
