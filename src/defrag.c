@@ -39,10 +39,6 @@
 #ifdef HAVE_DEFRAG
 #include "allocator_defrag.h"
 
-#define defraged_alloc allocatorDefragAlloc
-#define defraged_free allocatorDefragFree
-#define shouldDefragMulti allocatorDefragCheckMulti
-
 typedef struct defragCtx {
     void *privdata;
     int slot;
@@ -62,9 +58,7 @@ typedef struct defragPubSubCtx {
 void *activeDefragAlloc(void *ptr) {
     size_t size;
     void *newptr;
-    void *ptr_arr = ptr;
-    shouldDefragMulti(&ptr_arr, 1);
-    if (!ptr_arr) {
+    if (!allocatorShouldDefrag(ptr)) {
         server.stat_active_defrag_misses++;
         return NULL;
     }
@@ -72,9 +66,9 @@ void *activeDefragAlloc(void *ptr) {
      * make sure not to use the thread cache. so that we don't get back the same
      * pointers we try to free */
     size = zmalloc_size(ptr);
-    newptr = defraged_alloc(size);
+    newptr = allocatorDefragAlloc(size);
     memcpy(newptr, ptr, size);
-    defraged_free(ptr, size);
+    allocatorDefragFree(ptr, size);
     server.stat_active_defrag_hits++;
     return newptr;
 }

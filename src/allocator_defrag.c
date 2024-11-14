@@ -21,81 +21,87 @@
 
 #define UTILIZATION_THRESHOLD_FACTOR_MILI (125) // 12.5% additional utilization
 
+/*
+ * Represents a precomputed key for querying jemalloc statistics.
+ *
+ * The `jeMallctlKey` structure stores a key corresponding to a specific jemalloc
+ * statistics field name. This key is used with the `je_mallctlbymib` interface
+ * to query statistics more efficiently, bypassing the need for runtime string
+ * lookup and translation performed by `je_mallctl`.
+ *
+ * - `je_mallctlnametomib` is called once for each statistics field to precompute
+ *   and store the key corresponding to the field name.
+ * - Subsequent queries use `je_mallctlbymib` with the stored key, avoiding the
+ *   overhead of repeated string-based lookups.
+ *
+ */
 typedef struct jeMallctlKey {
-    size_t key[6];
-    size_t keylen;
+    size_t key[6]; // The precomputed key used to query jemalloc statistics.
+    size_t keylen; // The length of the key array.
 } jeMallctlKey;
 
-/*  Helper struct to store MIB (Management Information Base) information for jemalloc bin queries. */
+/* Stores MIB (Management Information Base) keys for jemalloc bin queries.
+ *
+ * This struct holds precomputed `jeMallctlKey` values for querying various
+ * jemalloc bin-related statistics efficiently.
+ */
 typedef struct jeBinInfoKeys {
-    jeMallctlKey curr_slabs;
-    jeMallctlKey nonfull_slabs;
-    jeMallctlKey curr_regs;
-    jeMallctlKey nmalloc;
-    jeMallctlKey ndealloc;
+    jeMallctlKey curr_slabs;    /* Key to query the current number of slabs in the bin. */
+    jeMallctlKey nonfull_slabs; /* Key to query the number of non-full slabs in the bin. */
+    jeMallctlKey curr_regs;     /* Key to query the current number of regions in the bin. */
 } jeBinInfoKeys;
 
-/*  Struct representing bin information. */
+/* Represents detailed information about a jemalloc bin.
+ *
+ * This struct provides metadata about a jemalloc bin, including the size of
+ * its regions, total number of regions, and related MIB keys for efficient
+ * queries.
+ */
 typedef struct jeBinInfo {
-    unsigned long reg_size;  /* < Size of each region in the bin. */
-    unsigned long nregs;     /* < Total number of regions in the bin. */
-    unsigned long len;       /* < Length or size of the bin (unused in this implementation). */
-    jeBinInfoKeys info_keys; /* < Helper struct containing MIB information for bin queries. */
+    unsigned long reg_size;  /* Size of each region in the bin. */
+    unsigned long nregs;     /* Total number of regions in the bin. */
+    jeBinInfoKeys info_keys; /* Precomputed MIB keys for querying bin statistics. */
 } jeBinInfo;
 
-/*  Struct representing the configuration for jemalloc bins. */
+/* Represents the configuration for jemalloc bins.
+ *
+ * This struct contains information about the number of bins and metadata for
+ * each bin, as well as precomputed keys for batch utility queries and epoch updates.
+ */
 typedef struct jeBinsConf {
-    unsigned long nbins; /* < Number of bins in the configuration. */
-    jeBinInfo *bin_info; /* < Array of bin information structs. */
-    jeMallctlKey util_batch_query;
-    jeMallctlKey epoch;
+    unsigned long nbins;           /* Number of bins in the jemalloc configuration. */
+    jeBinInfo *bin_info;           /* Array of `jeBinInfo` structs, one for each bin. */
+    jeMallctlKey util_batch_query; /* Key to query batch utilization information. */
+    jeMallctlKey epoch;            /* Key to trigger statistics sync between threads. */
 } jeBinsConf;
 
-/*  Struct representing defragmentation statistics for a bin. */
-typedef struct jeDefragBinStats {
-    unsigned long hits;     /* < Number of hits (regions that should be defragmented). */
-    unsigned long misses;   /* < Number of misses (regions that should not be defragmented). */
-    unsigned long nmalloc;  /* < Number of malloc operations (unused in this implementation). */
-    unsigned long ndealloc; /* < Number of dealloc operations (unused in this implementation). */
-} jeDefragBinStats;
-
-/*  Struct representing overall defragmentation statistics. */
-typedef struct jeDefragStats {
-    unsigned long hits;       /* < Total number of hits (regions that should be defragmented). */
-    unsigned long misses;     /* < Total number of misses (regions that should not be defragmented). */
-    unsigned long hit_bytes;  /* < Total number of bytes that should be defragmented. */
-    unsigned long miss_bytes; /* < Total number of bytes that should not be defragmented. */
-    unsigned long ncalls;     /* < Number of calls to the defragmentation function. */
-    unsigned long nptrs;      /* < Total number of pointers analyzed for defragmentation. */
-} jeDefragStats;
-
-/* Struct representing the latest usage information for a bin. */
+/* Represents the latest usage statistics for a jemalloc bin.
+ *
+ * This struct tracks the current usage of a bin, including the number of slabs
+ * and regions, and calculates the number of full slabs from other fields.
+ */
 typedef struct jeBusage {
-    unsigned long curr_slabs;         /* < Current number of slabs in the bin. */
-    unsigned long curr_nonfull_slabs; /* < Current number of non-full slabs in the bin. */
-    unsigned long curr_full_slabs;    /* < Current number of full slabs in the bin (calculated from other fields). */
-    unsigned long curr_regs;          /* < Current number of regions in the bin. */
-    jeDefragBinStats stat;            /* < Defragmentation statistics for the bin. */
+    unsigned long curr_slabs;         /* Current number of slabs in the bin. */
+    unsigned long curr_nonfull_slabs; /* Current number of non-full slabs in the bin. */
+    unsigned long curr_full_slabs;    /* Current number of full slabs in the bin (calculated from other fields). */
+    unsigned long curr_regs;          /* Current number of regions in the bin. */
 } jeBusage;
 
-/*  Struct representing the latest usage information across all bins. */
-typedef struct jeUsageLatest {
-    jeBusage *bins_usage; /* < Array of bin usage information structs. */
-    jeDefragStats stats;  /* < Overall defragmentation statistics. */
-} jeUsageLatest;
 
 static int defrag_supported = 0;
 static size_t jemalloc_quantum = 0;
 static jeBinsConf arena_bin_conf = {0, NULL, {{0}, 0}, {{0}, 0}};
-static jeUsageLatest usage_latest = {NULL, {0}};
+static jeBusage *curr_usage = NULL;
 
 
 /* -----------------------------------------------------------------------------
  * Alloc/Free API that are cooperative with defrag
  * -------------------------------------------------------------------------- */
+
 /* Allocation and free functions that bypass the thread cache
  * and go straight to the allocator arena bins.
- * Currently implemented only for jemalloc. Used for online defragmentation. */
+ * Currently implemented only for jemalloc. Used for online defragmentation.
+ */
 void *allocatorDefragAlloc(size_t size) {
     void *ptr = je_mallocx(size, MALLOCX_TCACHE_NONE);
     return ptr;
@@ -112,18 +118,19 @@ void allocatorDefragFree(void *ptr, size_t size) {
 #define SIZE_CLASS_GROUP_SZ 4
 
 #define LG_QUANTOM_OFFSET_3 ((64 >> LG_QUANTOM_8_FIRST_POW2) - 1)
-#define LG_QUANTOM_OFFSET_4 (64 >> 4)
 
 #define getBinindNormal(_sz, _offset, _last_sz_pow2)                                                             \
     ((SIZE_CLASS_GROUP_SZ - (((1 << (_last_sz_pow2)) - (_sz)) >> ((_last_sz_pow2) - LG_QUANTOM_8_FIRST_POW2))) + \
      (((_last_sz_pow2) - (LG_QUANTOM_8_FIRST_POW2 + 3)) - 1) * SIZE_CLASS_GROUP_SZ + (_offset))
+
 /* Get the bin index in bin array from the reg_size.
  *
  * these are reverse engineered mapping of reg_size -> binind. We need this information because the utilization query
  * returns the size of the buffer and not the bin index, and we need the bin index to access it's usage information
  *
  * Note: In case future PR will return the binind (that is better API anyway) we can get rid of
- * these conversion functions*/
+ * these conversion functions
+ */
 inline unsigned jeSize2BinIndexLgQ3(size_t sz) {
     if (sz <= (1 << (LG_QUANTOM_8_FIRST_POW2 + 3))) {
         // for sizes: 8, 16, 24, 32, 40, 48, 56, 64
@@ -132,50 +139,6 @@ inline unsigned jeSize2BinIndexLgQ3(size_t sz) {
     // following groups have SIZE_CLASS_GROUP_SZ size-class that are
     uint64_t last_sz_in_group_pow2 = 64 - __builtin_clzll(sz - 1);
     return getBinindNormal(sz, LG_QUANTOM_OFFSET_3, last_sz_in_group_pow2);
-}
-
-/* -----------------------------------------------------------------------------
- * Get INFO string about the defrag.
- * -------------------------------------------------------------------------- */
-/*
- * add defrag info string into info
- */
-sds allocatorDefragCatFragmentationInfo(sds info) {
-    if (!defrag_supported) return info;
-    jeBinInfo *bin_info;
-    jeBusage *bin_usage;
-    unsigned nbins = arena_bin_conf.nbins;
-    if (nbins > 0) {
-        info = sdscatprintf(info,
-                            "jemalloc_quantum:%d\r\n"
-                            "defrag_hit_ratio:%.2f\r\n"
-                            "defrag_hits:%lu\r\n"
-                            "defrag_misses:%lu\r\n"
-                            "defrag_hit_bytes:%lu\r\n"
-                            "defrag_miss_bytes:%lu\r\n"
-                            "defrag_check_num_calls:%lu\r\n"
-                            "defrag_check_num_ptrs:%lu\r\n",
-                            (int)jemalloc_quantum,
-                            (usage_latest.stats.hits + usage_latest.stats.misses)
-                                ? (float)usage_latest.stats.hits / (float)(usage_latest.stats.hits + usage_latest.stats.misses)
-                                : 0,
-                            usage_latest.stats.hits, usage_latest.stats.misses, usage_latest.stats.hit_bytes,
-                            usage_latest.stats.miss_bytes, usage_latest.stats.ncalls, usage_latest.stats.nptrs);
-        for (unsigned j = 0; j < nbins; j++) {
-            bin_info = &arena_bin_conf.bin_info[j];
-            bin_usage = &usage_latest.bins_usage[j];
-            info = sdscatprintf(info,
-                                "binstats[bin_size=%lu]:"
-                                "num_regs=%lu,num_slabs=%lu,num_nonfull_slabs=%lu,"
-                                "hit_rate=%.2f,hits=%lu,miss=%lu,num_malloc_calls=%lu,num_dealloc_calls=%lu\r\n",
-                                bin_info->reg_size, bin_usage->curr_regs, bin_usage->curr_slabs, bin_usage->curr_nonfull_slabs,
-                                (bin_usage->stat.hits + bin_usage->stat.misses)
-                                    ? (float)bin_usage->stat.hits / (float)(bin_usage->stat.hits + bin_usage->stat.misses)
-                                    : 0,
-                                bin_usage->stat.hits, bin_usage->stat.misses, bin_usage->stat.nmalloc, bin_usage->stat.ndealloc);
-        }
-    }
-    return info;
 }
 
 /* -----------------------------------------------------------------------------
@@ -215,18 +178,11 @@ static int binQueryHelperInitialization(jeBinInfoKeys *helper, unsigned bin_inde
     /* Mib of fetch nonfull slabs */
     snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.nonfull_slabs", bin_index);
     if (jeQueryKeyInit(buf, &helper->nonfull_slabs) != 0) return -1;
-    /* Mib of fetch num of alloc op */
-    snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.nmalloc", bin_index);
-    if (jeQueryKeyInit(buf, &helper->nmalloc) != 0) return -1;
-    /* Mib of fetch num of dealloc op */
-    snprintf(buf, sizeof(buf), "stats.arenas." STRINGIFY(ARENA_TO_QUERY) ".bins.%d.ndalloc", bin_index);
-    if (jeQueryKeyInit(buf, &helper->ndealloc) != 0) return -1;
 
     return 0;
 }
 
-/**
- * Initializes the defragmentation system for the jemalloc memory allocator.
+/* Initializes the defragmentation system for the jemalloc memory allocator.
  *
  * This function performs the necessary setup and initialization steps for the defragmentation system.
  * It retrieves the configuration information for the jemalloc arenas and bins, and initializes the usage
@@ -243,7 +199,7 @@ static int binQueryHelperInitialization(jeBinInfoKeys *helper, unsigned bin_inde
  * Note: This function must be called before using any other defragmentation-related functionality.
  * It should be called during the initialization phase of the code that uses the
  * defragmentation feature.
- *  */
+ */
 int allocatorDefragInit(void) {
     char buf[100];
     jeBinInfo *bin_info;
@@ -272,8 +228,8 @@ int allocatorDefragInit(void) {
 
     arena_bin_conf.bin_info = zcalloc(sizeof(jeBinInfo) * nbins);
     assert(arena_bin_conf.bin_info != NULL);
-    usage_latest.bins_usage = zcalloc(sizeof(jeBusage) * nbins);
-    assert(usage_latest.bins_usage != NULL);
+    curr_usage = zcalloc(sizeof(jeBusage) * nbins);
+    assert(curr_usage != NULL);
 
     for (unsigned j = 0; j < nbins; j++) {
         bin_info = &arena_bin_conf.bin_info[j];
@@ -288,8 +244,6 @@ int allocatorDefragInit(void) {
         je_res = je_mallctl(buf, &bin_info->nregs, &sz, NULL, 0);
         assert(je_res == 0);
 
-        bin_info->len = bin_info->reg_size * bin_info->nregs;
-
         // init bin specific fast query keys
         je_res = binQueryHelperInitialization(&bin_info->info_keys, j);
         assert(je_res == 0);
@@ -303,12 +257,11 @@ int allocatorDefragInit(void) {
     return 0;
 }
 
-/**
- * Total size of consumed meomry in unused regs in small bins (AKA external fragmentation).
+/* Total size of consumed meomry in unused regs in small bins (AKA external fragmentation).
  * The function will refresh the epoch.
  *
  * return total fragmentation bytes
- *  */
+ */
 unsigned long allocatorDefragGetFragSmallbins(void) {
     assert(defrag_supported);
     unsigned long frag = 0;
@@ -316,7 +269,7 @@ unsigned long allocatorDefragGetFragSmallbins(void) {
     for (unsigned j = 0; j < arena_bin_conf.nbins; j++) {
         size_t sz;
         jeBinInfo *bin_info = &arena_bin_conf.bin_info[j];
-        jeBusage *bin_usage = &usage_latest.bins_usage[j];
+        jeBusage *bin_usage = &curr_usage[j];
 
         /* Number of used regions in the bin */
         sz = sizeof(size_t);
@@ -326,10 +279,6 @@ unsigned long allocatorDefragGetFragSmallbins(void) {
         jeQueryCtlInterface(&bin_info->info_keys.curr_slabs, &bin_usage->curr_slabs, &sz);
         /* Number of non full slabs in the bin */
         jeQueryCtlInterface(&bin_info->info_keys.nonfull_slabs, &bin_usage->curr_nonfull_slabs, &sz);
-        /* Num alloc op */
-        jeQueryCtlInterface(&bin_info->info_keys.nmalloc, &bin_usage->stat.nmalloc, &sz);
-        /* Num dealloc op */
-        jeQueryCtlInterface(&bin_info->info_keys.ndealloc, &bin_usage->stat.ndealloc, &sz);
 
         bin_usage->curr_full_slabs = bin_usage->curr_slabs - bin_usage->curr_nonfull_slabs;
         /* Calculate the fragmentation bytes for the current bin and add it to the total. */
@@ -338,8 +287,7 @@ unsigned long allocatorDefragGetFragSmallbins(void) {
     return frag;
 }
 
-/*
- * Determines whether defragmentation should be performed on a pointer based on jemalloc information.
+/* Determines whether defragmentation should be performed on a pointer based on jemalloc information.
  *
  * bin_info Pointer to the bin information structure.
  * bin_usage Pointer to the bin usage structure.
@@ -365,93 +313,50 @@ static inline int makeDefragDecision(jeBinInfo *bin_info, jeBusage *bin_usage, u
 }
 
 /*
- * Handles the results of the defragmentation analysis for multiple memory regions.
- *
- * conf - Pointer to the configuration structure for the jemalloc arenas and bins.
- * usage - Pointer to the usage statistics structure for the jemalloc arenas and bins.
- * results - Array of results for each memory region to be analyzed.
- * ptrs - Array of pointers to the memory regions to be analyzed.
- * num - Number of memory regions in the ptrs array.
- *
- * For each result it checks if defragmentation should be performed based on makeDefragDecision function.
- * If defragmentation should NOT be performed, it sets the corresponding pointer in the ptrs array to NULL.
- * */
-static void handleResponses(jeBinsConf *conf,
-                            jeUsageLatest *usage,
-                            size_t *results,
-                            void **ptrs,
-                            size_t num) {
-    for (unsigned i = 0; i < num; i++) {
-        unsigned long num_regs = SLAB_NUM_REGS(results, i);
-        unsigned long slablen = SLAB_LEN(results, i);
-        unsigned long nfree = SLAB_NFREE(results, i);
-        assert(num_regs > 0);
-        assert(slablen > 0);
-        assert(nfree != (unsigned long)-1);
-        unsigned bsz = slablen / num_regs;
-        // check that the allocation is not too large
-        if (bsz > conf->bin_info[conf->nbins - 1].reg_size) {
-            ptrs[i] = NULL;
-            continue;
-        }
-        // get the index based on quantum used
-        unsigned binind = jeSize2BinIndexLgQ3(bsz);
-        // make sure binind is in range and reverse map is correct
-        assert(binind < conf->nbins && bsz == conf->bin_info[binind].reg_size);
-
-        jeBinInfo *bin_info = &conf->bin_info[binind];
-        jeBusage *bin_usage = &usage->bins_usage[binind];
-
-        if (!makeDefragDecision(bin_info, bin_usage, bin_info->nregs - nfree)) {
-            // MISS: utilization level is higher than threshold then set the ptr to NULL and caller will not defrag it
-            ptrs[i] = NULL;
-            // update miss statistics
-            bin_usage->stat.misses++;
-            usage->stats.misses++;
-            usage->stats.miss_bytes += bsz;
-        } else { // HIT
-            // update hit statistics
-            bin_usage->stat.hits++;
-            usage->stats.hits++;
-            usage->stats.hit_bytes += bsz;
-        }
-    }
-}
-
-/**
  * Performs defragmentation analysis for multiple memory regions.
  *
- * ptrs - Array of pointers to memory regions to be analyzed.
- * num - Number of memory regions in the ptrs array.
+ * ptr - ptr to memory regions to be analyzed.
  *
- * This function analyzes the provided memory regions and determines whether defragmentation should be performed
- * for each region based on the utilization and fragmentation levels. It updates the statistics for hits and misses
- * based on the defragmentation decision.
+ * This function analyzes the provided memory region and determines whether defragmentation should be performed
+ * based on the utilization and fragmentation levels.
  *
- * Sets to NULL any ptr that should not be defragged.
- * Ptrs that should not be defragged are not modified.
- *
- *  */
-void allocatorDefragCheckMulti(void **ptrs, unsigned long num) {
+ */
+int allocatorShouldDefrag(void *ptr) {
     assert(defrag_supported);
-    assert(num == 1);
-    static __thread size_t out[BATCH_QUERY_ARGS_OUT] = {0};
-    size_t out_sz = sizeof(size_t) * num * BATCH_QUERY_ARGS_OUT;
-    size_t in_sz = sizeof(const void *) * num;
-    jeBinsConf *conf = &arena_bin_conf;
-    jeUsageLatest *usage = &usage_latest;
-    for (unsigned j = 0; j < num * BATCH_QUERY_ARGS_OUT; j++) {
+    size_t out[BATCH_QUERY_ARGS_OUT];
+    size_t out_sz = sizeof(size_t) * BATCH_QUERY_ARGS_OUT;
+    size_t in_sz = sizeof(const void *);
+    for (unsigned j = 0; j < BATCH_QUERY_ARGS_OUT; j++) {
         out[j] = -1;
     }
-    je_mallctlbymib(arena_bin_conf.util_batch_query.key, arena_bin_conf.util_batch_query.keylen, out, &out_sz, ptrs,
-                    in_sz);
+    je_mallctlbymib(arena_bin_conf.util_batch_query.key,
+                    arena_bin_conf.util_batch_query.keylen,
+                    out, &out_sz,
+                    &ptr, in_sz);
     // handle results with appropriate quantum value
-    handleResponses(conf, usage, out, ptrs, num);
-    // update overall stats, regardless of hits or misses
-    usage->stats.ncalls++;
-    usage->stats.nptrs += num;
+    unsigned long num_regs = SLAB_NUM_REGS(out, 0);
+    unsigned long slablen = SLAB_LEN(out, 0);
+    unsigned long nfree = SLAB_NFREE(out, 0);
+    assert(num_regs > 0);
+    assert(slablen > 0);
+    assert(nfree != (unsigned long)-1);
+    unsigned bsz = slablen / num_regs;
+    // check that the allocation is not too large
+    if (bsz > arena_bin_conf.bin_info[arena_bin_conf.nbins - 1].reg_size) {
+        return 0;
+    }
+    // get the index based on quantum used
+    unsigned binind = jeSize2BinIndexLgQ3(bsz);
+    // make sure binind is in range and reverse map is correct
+    assert(binind < arena_bin_conf.nbins && bsz == arena_bin_conf.bin_info[binind].reg_size);
+
+    return makeDefragDecision(&arena_bin_conf.bin_info[binind],
+                              &curr_usage[binind],
+                              arena_bin_conf.bin_info[binind].nregs - nfree);
 }
+
 #else
+
 int allocatorDefragInit(void) {
     return -1;
 }
@@ -466,11 +371,9 @@ __attribute__((malloc)) void *allocatorDefragAlloc(size_t size) {
 unsigned long allocatorDefragGetFragSmallbins(void) {
     return 0;
 }
-sds allocatorDefragCatFragmentationInfo(sds info) {
-    return info;
-}
-void allocatorDefragCheckMulti(void **ptrs, unsigned long num) {
-    UNUSED(ptrs);
-    UNUSED(num);
+
+int allocatorShouldDefrag(void *ptr) {
+    UNUSED(ptr);
+    return 0;
 }
 #endif

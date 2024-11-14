@@ -5701,11 +5701,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
         freeMemoryOverheadData(mh);
     }
-    if (all_sections || (dictFind(section_dict, "defrag") != NULL)) {
-        if (sections++) info = sdscat(info, "\r\n");
-        info = sdscatprintf(info, "# Defrag\r\n");
-        info = allocatorDefragCatFragmentationInfo(info);
-    }
 
     /* Persistence */
     if (all_sections || (dictFind(section_dict, "persistence") != NULL)) {
