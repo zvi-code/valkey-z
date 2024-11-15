@@ -1741,6 +1741,8 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
             struct valkey_stat buf;
 
             if (bgsaveerr != C_OK) {
+                /* If bgsaveerr is error, there is no need to protect the rdb channel. */
+                replica->flag.protected_rdb_channel = 0;
                 freeClientAsync(replica);
                 serverLog(LL_WARNING, "SYNC failed. BGSAVE child returned an error");
                 continue;
