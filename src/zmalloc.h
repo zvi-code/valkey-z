@@ -100,15 +100,6 @@
 #include <malloc.h>
 #endif
 
-/* We can enable the server defrag capabilities only if we are using Jemalloc
- * and the version that has the experimental.utilization namespace in mallctl . */
-#if defined(JEMALLOC_VERSION_MAJOR) &&                              \
-    (JEMALLOC_VERSION_MAJOR > 5 ||                                  \
-     (JEMALLOC_VERSION_MAJOR == 5 && JEMALLOC_VERSION_MINOR > 2) || \
-     (JEMALLOC_VERSION_MAJOR == 5 && JEMALLOC_VERSION_MINOR == 2 && JEMALLOC_VERSION_BUGFIX >= 1))
-#define HAVE_DEFRAG
-#endif
-
 /* The zcalloc symbol is a symbol name already used by zlib, which is defining
  * other names using the "z" prefix specific to zlib. In practice, linking
  * valkey with a static openssl, which itself might depend on a static libz

@@ -84,7 +84,6 @@ void zlibc_free(void *ptr) {
 #define calloc(count, size) je_calloc(count, size)
 #define realloc(ptr, size) je_realloc(ptr, size)
 #define free(ptr) je_free(ptr)
-#define dallocx(ptr, flags) je_dallocx(ptr, flags)
 #endif
 
 #define thread_local _Thread_local

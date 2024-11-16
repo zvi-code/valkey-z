@@ -6862,7 +6862,8 @@ __attribute__((weak)) int main(int argc, char **argv) {
     zmalloc_set_oom_handler(serverOutOfMemoryHandler);
 #if defined(HAVE_DEFRAG)
     // we assume jemalloc version in use supports defragmentation api
-    serverAssert(!allocatorDefragInit());
+    int res = allocatorDefragInit();
+    serverAssert(res == 0);
 #endif
     /* To achieve entropy, in case of containers, their time() and getpid() can
      * be the same. But value of tv_usec is fast enough to make the difference */

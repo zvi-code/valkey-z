@@ -37,7 +37,6 @@
 #include <stddef.h>
 
 #ifdef HAVE_DEFRAG
-#include "allocator_defrag.h"
 
 typedef struct defragCtx {
     void *privdata;
