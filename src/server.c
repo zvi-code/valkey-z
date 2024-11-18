@@ -63,7 +63,6 @@
 #include <sys/utsname.h>
 #include <locale.h>
 #include <sys/socket.h>
-#include "allocator_defrag.h"
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -6861,7 +6860,6 @@ __attribute__((weak)) int main(int argc, char **argv) {
     tzset(); /* Populates 'timezone' global. */
     zmalloc_set_oom_handler(serverOutOfMemoryHandler);
 #if defined(HAVE_DEFRAG)
-    // we assume jemalloc version in use supports defragmentation api
     int res = allocatorDefragInit();
     serverAssert(res == 0);
 #endif

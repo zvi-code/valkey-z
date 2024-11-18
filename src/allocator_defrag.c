@@ -2,6 +2,47 @@
  * All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  */
+
+/*
+ * This file implements allocator-specific defragmentation logic used
+ * within the Valkey engine. Below is the relationship between various
+ * components involved in allocation and defragmentation:
+ *
+ *                  Application code
+ *                     /       \
+ *         allocation /         \ defrag
+ *                   /           \
+ *              zmalloc    allocator_defrag
+ *               /  |   \       /     \
+ *              /   |    \     /       \
+ *             /    |     \   /         \
+ *        libc  tcmalloc  jemalloc     other
+ *
+ * Explanation:
+ * - **Application code**: High-level application logic that uses memory
+ *   allocation and may trigger defragmentation.
+ * - **zmalloc**: An abstraction layer over the memory allocator, providing
+ *   a uniform allocation interface to the application code. It can delegate
+ *   to various underlying allocators (e.g., libc, tcmalloc, jemalloc, or others).
+ *   It is not dependant on defrag implementation logic and it's possible to use jemalloc
+ *   version that does not support defrag.
+ * - **allocator_defrag**: This file contains allocator-specific logic for
+ *   defragmentation, invoked from `defrag.c` when memory defragmentation is needed.
+ *   currently jemalloc is the only allocator with implemented defrag logic. It is possible that
+ *   future implementation will include non-allocator defragmentation (think of data-structure
+ *   compaction for example).
+ * - **Underlying allocators**: These are the actual memory allocators, such as
+ *   libc, tcmalloc, jemalloc, or other custom allocators. The defragmentation
+ *   logic in `allocator_defrag` interacts with these allocators to reorganize
+ *   memory and reduce fragmentation.
+ *
+ * The `defrag.c` file acts as the central entry point for defragmentation,
+ * invoking allocator-specific implementations provided here in `allocator_defrag.c`.
+ *
+ * Note: Developers working on `zmalloc` or `allocator_defrag` should refer to
+ * the other component to ensure both are using the same allocator configuration.
+ */
+
 #include <stdio.h>
 #include "serverassert.h"
 #include "allocator_defrag.h"
@@ -217,7 +258,7 @@ int allocatorDefragInit(void) {
     char mallctl_name[100];
     jeBinInfo *bin_info;
     size_t sz;
-    int je_res = 0;
+    int je_res;
 
     /* the init should be called only once, fail if unexpected call */
     assert(!defrag_supported);
