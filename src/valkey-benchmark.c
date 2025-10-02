@@ -399,6 +399,347 @@ static uint64_t dictSdsHash(const void *key);
 static int dictSdsKeyCompare(const void *key1, const void *key2);
 
 
+
+/* Type definitions for callback functions */
+typedef int (*matcherCallBack)(const char *line, const char *field_name);
+typedef long long (*parseCallBack)(const char *value);
+typedef void (*clusterAggregationCallBack)(void **opaque, long long node_value, int node_idx, int is_last_node);
+typedef void (*displayCallBack)(const char *field_name, void *opaque, int node_count);
+
+typedef struct infoFieldType {
+    int type_id;
+    sds prefix_match;                    /* Field name to match */
+    matcherCallBack match;               /* Check if line matches field */
+    parseCallBack parse;                 /* Parse value from line */
+    clusterAggregationCallBack agg;      /* Aggregate across cluster */
+    displayCallBack disp;                /* Display final result */
+} infoFieldType;
+
+/* Common matcher - exact field name match */
+static int exact_field_matcher(const char *line, const char *field_name) {
+    if (!line || !field_name) return 0;
+    
+    /* Skip comment lines */
+    if (line[0] == '#' || line[0] == '\0') return 0;
+    
+    const char *colon = strchr(line, ':');
+    if (!colon) return 0;
+    
+    size_t field_len = colon - line;
+    return (strlen(field_name) == field_len && 
+            strncmp(line, field_name, field_len) == 0);
+}
+
+/* Common parser - parse integer value after colon */
+static long long parse_integer_value(const char *value) {
+    if (!value) return 0;
+    return atoll(value);
+}
+
+/* Common parser - parse float value as integer (multiplied by 1000000 for precision) */
+static long long parse_float_as_fixed(const char *value) {
+    if (!value) return 0;
+    return (long long)(atof(value) * 1000000);
+}
+
+/* Aggregation: Sum values across nodes */
+static void aggregate_sum(void **opaque, long long node_value, int node_idx, int is_last_node) {
+    UNUSED(node_idx);
+    UNUSED(is_last_node);
+    
+    if (!*opaque) {
+        *opaque = zmalloc(sizeof(long long));
+        **(long long **)opaque = 0;
+    }
+    **(long long **)opaque += node_value;
+}
+
+/* Aggregation: Average values across nodes */
+typedef struct {
+    long long sum;
+    int count;
+} avg_state_t;
+
+static void aggregate_average(void **opaque, long long node_value, int node_idx, int is_last_node) {
+    UNUSED(node_idx);
+    
+    if (!*opaque) {
+        *opaque = zmalloc(sizeof(avg_state_t));
+        ((avg_state_t *)*opaque)->sum = 0;
+        ((avg_state_t *)*opaque)->count = 0;
+    }
+    
+    avg_state_t *state = (avg_state_t *)*opaque;
+    state->sum += node_value;
+    state->count++;
+    
+    if (is_last_node && state->count > 0) {
+        /* Convert to average for final display */
+        long long avg = state->sum / state->count;
+        zfree(*opaque);
+        *opaque = zmalloc(sizeof(long long));
+        **(long long **)opaque = avg;
+    }
+}
+
+/* Aggregation: Track min/max across nodes */
+typedef struct {
+    long long min;
+    long long max;
+    long long sum;
+    int count;
+    int initialized;
+} minmax_state_t;
+
+static void aggregate_minmax(void **opaque, long long node_value, int node_idx, int is_last_node) {
+    UNUSED(node_idx);
+    UNUSED(is_last_node);
+    
+    if (!*opaque) {
+        *opaque = zmalloc(sizeof(minmax_state_t));
+        ((minmax_state_t *)*opaque)->initialized = 0;
+    }
+    
+    minmax_state_t *state = (minmax_state_t *)*opaque;
+    if (!state->initialized) {
+        state->min = node_value;
+        state->max = node_value;
+        state->sum = node_value;
+        state->count = 1;
+        state->initialized = 1;
+    } else {
+        if (node_value < state->min) state->min = node_value;
+        if (node_value > state->max) state->max = node_value;
+        state->sum += node_value;
+        state->count++;
+    }
+}
+
+/* Display: Simple integer value */
+static void display_integer(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) {
+        printf("  %s: 0\n", field_name);
+        return;
+    }
+    long long value = *(long long *)opaque;
+    printf("  %s: %lld\n", field_name, value);
+}
+
+/* Display: Memory in MB */
+static void display_memory_mb(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) {
+        printf("  %s: 0 MB\n", field_name);
+        return;
+    }
+    long long bytes = *(long long *)opaque;
+    printf("  %s: %lld MB\n", field_name, bytes / (1024 * 1024));
+}
+
+/* Display: Percentage */
+static void display_percentage(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) {
+        printf("  %s: 0.00%%\n", field_name);
+        return;
+    }
+    long long fixed_point = *(long long *)opaque;
+    double percentage = (double)fixed_point / 1000000.0;
+    printf("  %s: %.2f%%\n", field_name, percentage * 100.0);
+}
+
+/* Display: Min/Max/Avg statistics */
+static void display_minmax(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) {
+        printf("  %s: No data\n", field_name);
+        return;
+    }
+    minmax_state_t *state = (minmax_state_t *)opaque;
+    if (state->count > 0) {
+        long long avg = state->sum / state->count;
+        printf("  %s: min=%lld, max=%lld, avg=%lld\n", 
+               field_name, state->min, state->max, avg);
+    }
+}
+
+/* Main aggregation function */
+void getAggregatedClusterStats(const char *info_command, int num_fields, infoFieldType *fields) {
+    if (!config.cluster_mode || !config.cluster_primary_nodes || 
+        config.cluster_primary_node_count == 0) {
+        fprintf(stderr, "Cluster mode not enabled or no primary nodes available.\n");
+        return;
+    }
+    
+    /* Allocate opaque storage for each field */
+    void **field_opaques = zcalloc(num_fields * sizeof(void *));
+    int *field_node_counts = zcalloc(num_fields * sizeof(int));
+    
+    printf("\n========================================\n");
+    printf("Cluster Statistics: %s\n", info_command);
+    printf("========================================\n");
+    printf("Querying %d primary nodes...\n\n", config.cluster_primary_node_count);
+    
+    int successful_nodes = 0;
+    
+    /* Query each primary node */
+    for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
+        clusterNode *node = config.cluster_primary_nodes[node_idx];
+        if (!node) continue;
+        
+        valkeyContext *ctx = getValkeyContext(config.ct, node->ip, node->port);
+        if (!ctx) {
+            fprintf(stderr, "WARNING: Failed to connect to node %s:%d\n", 
+                    node->ip, node->port);
+            continue;
+        }
+        valkeyReply *reply = valkeyCommand(ctx, info_command);
+        // if (strcmp("INFO MEMORY", info_command) == 0) {
+        //     reply = valkeyCommand(ctx, info_command);
+        // } else {
+        //     reply = valkeyCommand(ctx, "INFO SEARCH");
+        // }
+        // valkeyReply *r;
+        // r = valkeyCommand(ctx, "INFO MEMORY");
+        // valkeyReply *reply = valkeyCommand(ctx, "%b", info_command);
+        if (!reply || reply->type != VALKEY_REPLY_STRING) {
+            if (reply && reply->type == VALKEY_REPLY_ERROR) {
+                fprintf(stderr, "WARNING: Node %s:%d - Error: %s\n", 
+                        node->ip, node->port, reply->str);
+            }
+            if (reply) freeReplyObject(reply);
+            valkeyFree(ctx);
+            continue;
+        }
+        
+        successful_nodes++;
+        
+        /* Parse response for each field */
+        char *info = strdup(reply->str);
+        if (!info) {
+            freeReplyObject(reply);
+            valkeyFree(ctx);
+            continue;
+        }
+        
+        /* Per-node statistics */
+        printf("Node %s:%d:\n", node->ip, node->port);
+        
+        /* Process each line */
+        char *saveptr;
+        char *line = strtok_r(info, "\r\n", &saveptr);
+        
+        while (line != NULL) {
+            /* Check each field against this line */
+            for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+                infoFieldType *field = &fields[field_idx];
+                
+                if (field->match(line, field->prefix_match)) {
+                    /* Extract value after colon */
+                    char *colon = strchr(line, ':');
+                    if (colon) {
+                        char *value = colon + 1;
+                        long long parsed_value = field->parse(value);
+                        
+                        /* Print per-node value */
+                        printf("  %s: %lld\n", field->prefix_match, parsed_value);
+                        
+                        /* Aggregate */
+                        int is_last_node = (node_idx == config.cluster_primary_node_count - 1);
+                        field->agg(&field_opaques[field_idx], parsed_value, 
+                                  node_idx, is_last_node);
+                        field_node_counts[field_idx]++;
+                    }
+                    break; /* Line can only match one field */
+                }
+            }
+            
+            line = strtok_r(NULL, "\r\n", &saveptr);
+        }
+        
+        free(info);
+        freeReplyObject(reply);
+        valkeyFree(ctx);
+    }
+    
+    /* Display aggregated results */
+    printf("\n========================================\n");
+    printf("Cluster Aggregate:\n");
+    printf("========================================\n");
+    printf("Successfully queried %d/%d nodes\n\n", 
+           successful_nodes, config.cluster_primary_node_count);
+    
+    for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+        infoFieldType *field = &fields[field_idx];
+        
+        if (field_node_counts[field_idx] > 0) {
+            /* Ensure aggregation is finalized for averaging functions */
+            if (field->agg == aggregate_average && field_opaques[field_idx]) {
+                field->agg(&field_opaques[field_idx], 0, 
+                          config.cluster_primary_node_count - 1, 1);
+            }
+            
+            field->disp(field->prefix_match, field_opaques[field_idx], 
+                       field_node_counts[field_idx]);
+        } else {
+            printf("  %s: No data available\n", field->prefix_match);
+        }
+        
+        /* Cleanup opaque data */
+        if (field_opaques[field_idx]) {
+            zfree(field_opaques[field_idx]);
+        }
+    }
+    
+    zfree(field_opaques);
+    zfree(field_node_counts);
+    
+    printf("========================================\n\n");
+}
+
+/* Example usage for search stats */
+void getSearchInfoClusterGeneric(void) {
+    infoFieldType search_fields[] = {
+        {1, sdsnew("search_used_memory_bytes"), exact_field_matcher, 
+         parse_integer_value, aggregate_sum, display_memory_mb},
+        {2, sdsnew("search_index_reclaimable_memory"), exact_field_matcher, 
+         parse_integer_value, aggregate_sum, display_memory_mb},
+        {3, sdsnew("search_total_indexed_documents"), exact_field_matcher, 
+         parse_integer_value, aggregate_sum, display_integer},
+        {4, sdsnew("search_ingest_field_vector"), exact_field_matcher, 
+         parse_integer_value, aggregate_sum, display_integer},
+        {5, sdsnew("search_background_indexing_status"), exact_field_matcher, 
+         parse_integer_value, aggregate_sum, display_integer},
+    };
+    
+    getAggregatedClusterStats("INFO SEARCH", 5, search_fields);
+    
+    /* Cleanup field names */
+    for (int i = 0; i < 5; i++) {
+        sdsfree(search_fields[i].prefix_match);
+    }
+}
+
+/* Example usage for memory stats with min/max tracking */
+void getMemoryInfoClusterGeneric(void) {
+    infoFieldType memory_fields[] = {
+        {1, sdsnew("used_memory"), exact_field_matcher, 
+         parse_integer_value, aggregate_sum, display_memory_mb},
+        {2, sdsnew("used_memory_rss"), exact_field_matcher, 
+         parse_integer_value, aggregate_minmax, display_minmax},
+        {3, sdsnew("mem_fragmentation_ratio"), exact_field_matcher, 
+         parse_float_as_fixed, aggregate_average, display_percentage},
+    };
+    
+    getAggregatedClusterStats("INFO MEMORY", 3, memory_fields);
+    
+    /* Cleanup field names */
+    for (int i = 0; i < 3; i++) {
+        sdsfree(memory_fields[i].prefix_match);
+    }
+}
+
 /* Fast unique vector generation using key-based deterministic randomization */
 static sds createVectorTemplate(uint64_t key_idx) {
     int dim = config.search.vector_dim - VECTOR_NUM_RAND_DIM;
@@ -876,7 +1217,8 @@ static int getSearchIndexInfoCluster(sds index_name, searchIndex *index) {
     if (stats.distance_metric) free(stats.distance_metric);
     if (stats.data_type) free(stats.data_type);
     if (stats.default_score) free(stats.default_score);
-    
+    getMemoryInfoClusterGeneric();
+    getSearchInfoClusterGeneric();
     return (stats.nodes_with_index > 0) ? 0 : -1;
 }
 
@@ -1394,59 +1736,7 @@ static int getSearchIndexInfo(sds index_name, searchIndex *index) {
     return 0; // Success
 }
 
-// static void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
-//                           long long *search_total_docs, long long *search_ingest_field_vector, 
-//                           long long *search_background_indexing_status) {
-//     if (!config.use_search) return;
-//     valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
-//     if (ctx == NULL) {
-//         fprintf(stderr, "Failed to connect to Valkey server for search info.\n");
-//         return;
-//     }
-    
-//     valkeyReply *reply = valkeyCommand(ctx, "INFO SEARCH");
-//     if (reply == NULL || reply->type != VALKEY_REPLY_STRING) {
-//         fprintf(stderr, "Failed to get search index info\n");
-//         if (reply) freeReplyObject(reply);
-//         valkeyFree(ctx);
-//         return;
-//     }
-    
-//     printf("Search index info:\n");
-    
-//     char *info = strdup(reply->str);
-//     char *line = strtok(info, "\r\n");
-    
-//     while (line != NULL) {
-//         if (*line && *line != '#') {
-//             char *colon = strchr(line, ':');
-//             if (colon) {
-//                 *colon = '\0';
-//                 char *key = line;
-//                 char *value = colon + 1;
-//                 if (strcmp(key, "search_used_memory_bytes") == 0) {
-//                     *search_memory = atoll(value);
-//                 } else if (strcmp(key, "search_index_reclaimable_memory") == 0) {
-//                     *search_reclaimable = atoll(value);
-//                 } else if (strcmp(key, "search_total_indexed_documents") == 0) {
-//                     *search_total_docs = atoll(value);
-//                 } else if (strcmp(key, "search_ingest_field_vector") == 0) {
-//                     *search_ingest_field_vector = atoll(value);
-//                 } else if (strcmp(key, "search_background_indexing_status") == 0) {
-//                     *search_background_indexing_status = atoll(value);
-//                 }
-//             }
-//         }
-//         line = strtok(NULL, "\r\n");
-//     }
-
-//     free(info);
-//     freeReplyObject(reply);
-//     valkeyFree(ctx);
-//     getSearchIndexInfo(config.search.name, NULL); /* Fetch index info after getting search info */
-// }
-
-static void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+static void getSearchInfoCluster(long long *search_memory, long long *search_reclaimable, 
                                  long long *search_total_docs, long long *search_ingest_field_vector, 
                                  long long *search_background_indexing_status) {
     if (!config.use_search) return;
@@ -1595,6 +1885,269 @@ static void getSearchInfo(long long *search_memory, long long *search_reclaimabl
     /* Call the index info function */
     getSearchIndexInfo(config.search.name, NULL);
 }
+
+/* Updated getSearchInfo to delegate to cluster version when needed */
+static void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+                          long long *search_total_docs, long long *search_ingest_field_vector, 
+                          long long *search_background_indexing_status) {
+    if (!config.use_search) return;
+    
+    if (config.cluster_mode) {
+        getSearchInfoCluster(search_memory, search_reclaimable, search_total_docs, 
+                            search_ingest_field_vector, search_background_indexing_status);
+        return;
+    }
+    
+    /* Non-cluster mode: original implementation */
+    valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+    if (ctx == NULL) {
+        fprintf(stderr, "Failed to connect to Valkey server for search info.\n");
+        return;
+    }
+    
+    valkeyReply *reply = valkeyCommand(ctx, "INFO SEARCH");
+    if (reply == NULL || reply->type != VALKEY_REPLY_STRING) {
+        fprintf(stderr, "Failed to get search index info\n");
+        if (reply) freeReplyObject(reply);
+        valkeyFree(ctx);
+        return;
+    }
+    
+    printf("Search index info:\n");
+    
+    char *info = strdup(reply->str);
+    char *line = strtok(info, "\r\n");
+    
+    while (line != NULL) {
+        if (*line && *line != '#') {
+            char *colon = strchr(line, ':');
+            if (colon) {
+                *colon = '\0';
+                char *key = line;
+                char *value = colon + 1;
+                if (strcmp(key, "search_used_memory_bytes") == 0) {
+                    *search_memory = atoll(value);
+                } else if (strcmp(key, "search_index_reclaimable_memory") == 0) {
+                    *search_reclaimable = atoll(value);
+                } else if (strcmp(key, "search_total_indexed_documents") == 0) {
+                    *search_total_docs = atoll(value);
+                } else if (strcmp(key, "search_ingest_field_vector") == 0) {
+                    *search_ingest_field_vector = atoll(value);
+                } else if (strcmp(key, "search_background_indexing_status") == 0) {
+                    *search_background_indexing_status = atoll(value);
+                }
+            }
+        }
+        line = strtok(NULL, "\r\n");
+    }
+
+    free(info);
+    freeReplyObject(reply);
+    valkeyFree(ctx);
+    getSearchIndexInfo(config.search.name, NULL);
+}
+
+// static void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+//                           long long *search_total_docs, long long *search_ingest_field_vector, 
+//                           long long *search_background_indexing_status) {
+//     if (!config.use_search) return;
+//     valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+//     if (ctx == NULL) {
+//         fprintf(stderr, "Failed to connect to Valkey server for search info.\n");
+//         return;
+//     }
+    
+//     valkeyReply *reply = valkeyCommand(ctx, "INFO SEARCH");
+//     if (reply == NULL || reply->type != VALKEY_REPLY_STRING) {
+//         fprintf(stderr, "Failed to get search index info\n");
+//         if (reply) freeReplyObject(reply);
+//         valkeyFree(ctx);
+//         return;
+//     }
+    
+//     printf("Search index info:\n");
+    
+//     char *info = strdup(reply->str);
+//     char *line = strtok(info, "\r\n");
+    
+//     while (line != NULL) {
+//         if (*line && *line != '#') {
+//             char *colon = strchr(line, ':');
+//             if (colon) {
+//                 *colon = '\0';
+//                 char *key = line;
+//                 char *value = colon + 1;
+//                 if (strcmp(key, "search_used_memory_bytes") == 0) {
+//                     *search_memory = atoll(value);
+//                 } else if (strcmp(key, "search_index_reclaimable_memory") == 0) {
+//                     *search_reclaimable = atoll(value);
+//                 } else if (strcmp(key, "search_total_indexed_documents") == 0) {
+//                     *search_total_docs = atoll(value);
+//                 } else if (strcmp(key, "search_ingest_field_vector") == 0) {
+//                     *search_ingest_field_vector = atoll(value);
+//                 } else if (strcmp(key, "search_background_indexing_status") == 0) {
+//                     *search_background_indexing_status = atoll(value);
+//                 }
+//             }
+//         }
+//         line = strtok(NULL, "\r\n");
+//     }
+
+//     free(info);
+//     freeReplyObject(reply);
+//     valkeyFree(ctx);
+//     getSearchIndexInfo(config.search.name, NULL); /* Fetch index info after getting search info */
+// }
+
+// static void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+//                                  long long *search_total_docs, long long *search_ingest_field_vector, 
+//                                  long long *search_background_indexing_status) {
+//     if (!config.use_search) return;
+    
+//     if (!config.cluster_primary_nodes || config.cluster_primary_node_count == 0) {
+//         fprintf(stderr, "No primary nodes available for cluster search info.\n");
+//         return;
+//     }
+    
+//     /* Initialize aggregated values */
+//     *search_memory = 0;
+//     *search_reclaimable = 0;
+//     *search_total_docs = 0;
+//     *search_ingest_field_vector = 0;
+//     *search_background_indexing_status = 0;
+    
+//     printf("Search index info (cluster-wide):\n");
+//     printf("========================================\n");
+    
+//     int nodes_with_search = 0;
+//     int nodes_unreachable = 0;
+    
+//     /* Query each primary node */
+//     for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
+//         clusterNode *node = config.cluster_primary_nodes[node_idx];
+//         if (!node) {
+//             nodes_unreachable++;
+//             continue;
+//         }
+        
+//         valkeyContext *ctx = getValkeyContext(config.ct, node->ip, node->port);
+//         if (!ctx) {
+//             fprintf(stderr, "WARNING: Failed to connect to node %s:%d for search info.\n", 
+//                     node->ip, node->port);
+//             nodes_unreachable++;
+//             continue;
+//         }
+        
+//         valkeyReply *reply = valkeyCommand(ctx, "INFO SEARCH");
+//         if (!reply || reply->type != VALKEY_REPLY_STRING) {
+//             if (reply && reply->type == VALKEY_REPLY_ERROR) {
+//                 fprintf(stderr, "WARNING: Node %s:%d - Error: %s\n", 
+//                         node->ip, node->port, reply->str);
+//             } else {
+//                 fprintf(stderr, "WARNING: Failed to get search info from node %s:%d\n", 
+//                         node->ip, node->port);
+//             }
+//             if (reply) freeReplyObject(reply);
+//             valkeyFree(ctx);
+//             nodes_unreachable++;
+//             continue;
+//         }
+        
+//         /* Parse per-node INFO SEARCH response */
+//         long long node_memory = 0;
+//         long long node_reclaimable = 0;
+//         long long node_total_docs = 0;
+//         long long node_ingest_field_vector = 0;
+//         long long node_background_indexing = 0;
+        
+//         char *info = strdup(reply->str);
+//         if (!info) {
+//             freeReplyObject(reply);
+//             valkeyFree(ctx);
+//             continue;
+//         }
+        
+//         char *line = strtok(info, "\r\n");
+//         while (line != NULL) {
+//             if (*line && *line != '#') {
+//                 char *colon = strchr(line, ':');
+//                 if (colon) {
+//                     *colon = '\0';
+//                     char *key = line;
+//                     char *value = colon + 1;
+                    
+//                     if (strcmp(key, "search_used_memory_bytes") == 0) {
+//                         node_memory = atoll(value);
+//                         *search_memory += node_memory;
+//                     } else if (strcmp(key, "search_index_reclaimable_memory") == 0) {
+//                         node_reclaimable = atoll(value);
+//                         *search_reclaimable += node_reclaimable;
+//                     } else if (strcmp(key, "search_total_indexed_documents") == 0) {
+//                         node_total_docs = atoll(value);
+//                         *search_total_docs += node_total_docs;
+//                     } else if (strcmp(key, "search_ingest_field_vector") == 0) {
+//                         node_ingest_field_vector = atoll(value);
+//                         *search_ingest_field_vector += node_ingest_field_vector;
+//                     } else if (strcmp(key, "search_background_indexing_status") == 0) {
+//                         node_background_indexing = atoll(value);
+//                         *search_background_indexing_status += node_background_indexing;
+//                     }
+//                 }
+//             }
+//             line = strtok(NULL, "\r\n");
+//         }
+        
+//         nodes_with_search++;
+        
+//         /* Print per-node statistics */
+//         printf("Node %s:%d:\n", node->ip, node->port);
+//         printf("  Memory: %lld MB, Reclaimable: %lld MB\n", 
+//                node_memory / (1024 * 1024), node_reclaimable / (1024 * 1024));
+//         printf("  Documents: %lld, Ingest vectors: %lld\n", 
+//                node_total_docs, node_ingest_field_vector);
+//         if (node_background_indexing > 0) {
+//             printf("  Background indexing: %lld\n", node_background_indexing);
+//         }
+        
+//         free(info);
+//         freeReplyObject(reply);
+//         valkeyFree(ctx);
+//     }
+    
+//     /* Print aggregated statistics */
+//     printf("\n========================================\n");
+//     printf("Cluster Aggregate Search Statistics:\n");
+//     printf("========================================\n");
+//     printf("Nodes with search info: %d/%d\n", 
+//            nodes_with_search, config.cluster_primary_node_count);
+//     if (nodes_unreachable > 0) {
+//         printf("Unreachable nodes: %d\n", nodes_unreachable);
+//     }
+    
+//     if (nodes_with_search > 0) {
+//         printf("\nTotal across cluster:\n");
+//         printf("  Search memory: %lld MB\n", *search_memory / (1024 * 1024));
+//         printf("  Reclaimable memory: %lld MB\n", *search_reclaimable / (1024 * 1024));
+//         printf("  Total indexed documents: %lld\n", *search_total_docs);
+//         printf("  Total ingest field vectors: %lld\n", *search_ingest_field_vector);
+//         if (*search_background_indexing_status > 0) {
+//             printf("  Nodes with background indexing: %lld\n", *search_background_indexing_status);
+//         }
+        
+//         /* Distribution metrics */
+//         if (nodes_with_search > 1) {
+//             printf("\nAverage per node:\n");
+//             printf("  Memory: %lld MB\n", 
+//                    (*search_memory / nodes_with_search) / (1024 * 1024));
+//             printf("  Documents: %lld\n", *search_total_docs / nodes_with_search);
+//         }
+//     }
+    
+//     printf("========================================\n\n");
+    
+//     /* Call the index info function */
+//     getSearchIndexInfo(config.search.name, NULL);
+// }
 
 int isSelected(int is_primary) {
     if ((config.read_from_replica == FROM_REPLICA_ONLY && is_primary) || 
