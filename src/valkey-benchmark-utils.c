@@ -779,6 +779,27 @@ static void diff_latency_change(const char *field_name, fieldSnapshot *old,
     }
 }
 
+// static sds parse_string_value(const char *value) {
+//     if (!value) return NULL;
+    
+//     while (*value == ' ' || *value == '\t') value++;
+    
+//     /* Handle quoted values */
+//     if (*value == '"') {
+//         value++;
+//         char *end_quote = strchr(value, '"');
+//         if (end_quote) {
+//             size_t len = end_quote - value;
+//             return sdsnewlen(value, len);
+//         }
+//     }
+    
+//     /* Unquoted value - read until whitespace or end */
+//     const char *end = value;
+//     while (*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') end++;
+    
+//     return sdsnewlen(value, end - value);
+// }
 /* Parse cmdstat line and extract calls value */
 static long long parse_cmdstat_calls(const char *value) {
     /* value points to: "calls=2858704123,usec=275125382879,..." */
@@ -1016,7 +1037,7 @@ static sds parseFtInfoAttributesArray(valkeyReply *attrs) {
 /* Convert FT.INFO RESP array response to line-based format */
 static sds convertFtInfoToLines(valkeyReply *reply, const char *prefix) {
     if (!reply || reply->type != VALKEY_REPLY_ARRAY) return NULL;
-    
+    printf("Converting FT.INFO response to lines with prefix: %s\n", prefix ? prefix : "(none)");
     sds lines = sdsempty();
     
     for (size_t i = 0; i < reply->elements; i += 2) {
@@ -1024,24 +1045,28 @@ static sds convertFtInfoToLines(valkeyReply *reply, const char *prefix) {
         
         valkeyReply *key = reply->element[i];
         valkeyReply *value = reply->element[i + 1];
-        
-        if (!key || key->type != VALKEY_REPLY_STRING) continue;
+        printf("Element %zu: key type %d, value type %d\n", i/2, key ? key->type : -1, value ? value->type : -1);
+        if (!key || (key->type != VALKEY_REPLY_STRING && value->type == VALKEY_REPLY_STATUS)) continue;
         
         char *key_name = key->str;
         
         /* Build full key with prefix if provided */
         sds full_key = prefix ? sdscatprintf(sdsempty(), "%s.%s", prefix, key_name) 
                               : sdsnew(key_name);
-        
+        printf("Processing key: %s\n", full_key);
+        printf("Value type: %d\n", value->type);
+        // try print value if string or integer
+        printf("Value: ");
         if (value->type == VALKEY_REPLY_STRING || value->type == VALKEY_REPLY_STATUS) {
             lines = sdscatprintf(lines, "%s:%s\n", full_key, value->str);
-            
+            printf("String: %s\n", value->str);
         } else if (value->type == VALKEY_REPLY_INTEGER) {
             lines = sdscatprintf(lines, "%s:%lld\n", full_key, value->integer);
-            
+            printf("Integer: %lld\n", value->integer);
         } else if (value->type == VALKEY_REPLY_ARRAY) {
             /* Handle nested arrays */
             if (strcmp(key_name, "attributes") == 0) {
+                printf("Parsing attributes array\n");
                 /* Attributes array contains one or more attribute definitions */
                 sds attr_lines = parseFtInfoAttributesArray(value);
                 if (attr_lines) {
@@ -1049,6 +1074,7 @@ static sds convertFtInfoToLines(valkeyReply *reply, const char *prefix) {
                     sdsfree(attr_lines);
                 }
             } else {
+                printf("Recursively parsing nested array for key: %s\n", full_key);
                 /* Recursively parse nested key-value arrays */
                 sds nested = convertFtInfoToLines(value, full_key);
                 if (nested) {
@@ -1056,6 +1082,8 @@ static sds convertFtInfoToLines(valkeyReply *reply, const char *prefix) {
                     sdsfree(nested);
                 }
             }
+        } else {
+            printf("Skipping unsupported value type %d for key %s\n", value->type, full_key);
         }
         
         sdsfree(full_key);
@@ -1081,7 +1109,7 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
     
     /* Initialize fields */
     for (int i = 0; i < num_fields; i++) {
-        snapshot->fields[i].field_name = sdsdup(fields[i].prefix_match);
+        snapshot->fields[i].field_name = fields[i].prefix_match;
         snapshot->fields[i].valid = 0;
         snapshot->fields[i].per_node_values = NULL;
         snapshot->fields[i].node_count = 0;
@@ -1097,7 +1125,7 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
     
     /* Detect command type */
     int is_ftinfo = (strncasecmp(command, "FT.INFO", 7) == 0);
-    
+    printf("Collecting data using command: %s is_ftinfo %s\n", command, is_ftinfo ? " (FT.INFO mode)" : "");
     /* Query each node */
     for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
         clusterNode *node = config.cluster_primary_nodes[node_idx];
@@ -1204,7 +1232,7 @@ void freeClusterSnapshot(clusterSnapshot *snapshot) {
     if (!snapshot) return;
     
     for (int i = 0; i < snapshot->num_fields; i++) {
-        sdsfree(snapshot->fields[i].field_name);
+        // sdsfree(snapshot->fields[i].field_name);
         if (snapshot->fields[i].per_node_values) {
             zfree(snapshot->fields[i].per_node_values);
         }
@@ -1255,7 +1283,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
         }
         
         /* Ensure field names match */
-        if (sdscmp(old_field->field_name, new_field->field_name) != 0) {
+        if (strcmp(old_field->field_name, new_field->field_name) != 0) {
             fprintf(stderr, "Field mismatch: %s vs %s\n", 
                    old_field->field_name, new_field->field_name);
             continue;
@@ -1349,7 +1377,7 @@ void getAggregatedClusterStats(const char *command, int num_fields,
                             char *colon = strchr(line, ':');
                             if (colon) {
                                 long long value = field->parse(colon + 1);
-                                printf("  %s: %lld\n", field->prefix_match, value);
+                                // printf("  %s: %lld\n", field->prefix_match, value);
                                 
                                 int is_last = (node_idx == config.cluster_primary_node_count - 1);
                                 field->agg(&field_opaques[field_idx], value, 
@@ -1414,7 +1442,13 @@ infoFieldType search_info_fields[] = {
     /* Memory growth */
     {"search_used_memory_bytes", "", exact_field_matcher, 
      parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0},
-    
+    {"search_index_reclaimable_memory", "", exact_field_matcher, 
+     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0},     
+    /* Memory growth */
+    {"search_ingest_field_vector", "", exact_field_matcher, 
+     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0},
+    // {"search_background_indexing_status", "", exact_field_matcher, 
+    //  parse_string_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0},
     /* Indexing rates */
     {"search_total_indexed_documents", "", exact_field_matcher, 
      parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
@@ -1519,8 +1553,8 @@ void getFullInfo(const char *index_name) {
     long long search_ingest_field_vector = 0;
     long long search_background_indexing_status = 0;
     getSearchInfo(&search_memory, &search_reclaimable, &search_total_docs, &search_ingest_field_vector, &search_background_indexing_status);
-    printf("Search Memory: %lld bytes\n", search_memory);
-    printf("Search Reclaimable Memory: %lld bytes\n", search_reclaimable);
+    printf("Search Memory: %f MB\n", search_memory / (1024.0 * 1024.0));
+    printf("Search Reclaimable Memory: %f MB\n", search_reclaimable / (1024.0 * 1024.0));
     printf("Search Total Indexed Documents: %lld\n", search_total_docs);
     printf("Search Ingest Field Vector Bytes: %lld bytes\n", search_ingest_field_vector);
     printf("Search Background Indexing Status: %lld\n", search_background_indexing_status);
@@ -1545,16 +1579,18 @@ void getSearchInfo(long long *search_memory, long long *search_reclaimable,
         if (info_snapshot->fields[i].valid) {
             if (sdscmp(info_snapshot->fields[i].field_name, "search_used_memory_bytes") == 0) {
                 *search_memory = info_snapshot->fields[i].value;
-            } else if (sdscmp(info_snapshot->fields[i].field_name, "search_used_memory_reclaimable_bytes") == 0) {
+            } else if (sdscmp(info_snapshot->fields[i].field_name, "search_index_reclaimable_memory") == 0) {
                 *search_reclaimable = info_snapshot->fields[i].value;
             } else if (sdscmp(info_snapshot->fields[i].field_name, "search_total_indexed_documents") == 0) {
                 *search_total_docs = info_snapshot->fields[i].value;
-            } else if (sdscmp(info_snapshot->fields[i].field_name, "search_ingest_field_vector_bytes") == 0) {
+            } else if (sdscmp(info_snapshot->fields[i].field_name, "search_ingest_field_vector") == 0) {
                 *search_ingest_field_vector = info_snapshot->fields[i].value;
             } else if (sdscmp(info_snapshot->fields[i].field_name, "search_background_indexing_status") == 0) {
                 *search_background_indexing_status = info_snapshot->fields[i].value;
             }
+            printf("getSearchInfo: from snapshot:%s: %lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
         }
+
     }
     freeClusterSnapshot(info_snapshot);
 }
@@ -1567,7 +1603,7 @@ void getInfoCluster(void) {
     assert(info_snapshot); 
     for (int i = 0; i < info_snapshot->num_fields; i++) {
         if (info_snapshot->fields[i].valid) {
-            printf("%s: %lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
+            printf("getInfoCluster: from snapshot:%s: %lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
         }
     }
     freeClusterSnapshot(info_snapshot);
@@ -1575,19 +1611,20 @@ void getInfoCluster(void) {
 
 /* Example 4: Get current FT.INFO statistics */
 void getFtInfoStatistics(const char *index_name) {
-    sds cmd = sdscatprintf(sdsempty(), "FT.INFO %s", index_name);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
     int num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
     getAggregatedClusterStats(cmd, num_fields, ftinfo_fields);
     clusterSnapshot* info_snapshot = createClusterSnapshot(cmd, num_fields, ftinfo_fields);
     assert(info_snapshot); 
     for (int i = 0; i < info_snapshot->num_fields; i++) {
         if (info_snapshot->fields[i].valid) {
-            printf("%s: %lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
+            printf("getFtInfoStatistics: from snapshot:%s: %lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
         }
     }
     freeClusterSnapshot(info_snapshot);
     
     // getAggregatedClusterStats(cmd, num_fields, ftinfo_fields);
     
-    sdsfree(cmd);
+    // sdsfree(cmd);
 }
