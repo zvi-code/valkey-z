@@ -280,6 +280,8 @@ static struct config {
     struct clusterNode **cluster_nodes;
     int cluster_primary_node_count;
     struct clusterNode **cluster_primary_nodes;
+    int selected_node_count;
+    struct clusterNode **selected_nodes;
     struct serverConfig *server_config;
     struct hdr_histogram *latency_histogram;
     struct hdr_histogram *current_sec_latency_histogram;
@@ -336,8 +338,16 @@ typedef struct _client {
     uint64_t reuse : 1;
 } *client;
 
-/* Threads. */
+/* Struct for prefil state */
+struct prefilState {
+    int done;               /* Prefill completed */
+    int total;              /* Total number of prefill commands */
+    _Atomic int progress;   /* Number of prefill commands completed */
+    long long start;        /* Start time */
+    long long end;          /* End time */
+}  prefill_state = {0,0,0,0,0};
 
+/* Threads. */
 typedef struct benchmarkThread {
     int index;
     pthread_t thread;
@@ -351,8 +361,6 @@ typedef struct prefillThreadData {
     int start_index;
     int end_index;
     int total_count;
-    pthread_mutex_t *progress_mutex;
-    int *global_progress;
 } prefillThreadData;
 
 /* Cluster. */
@@ -384,7 +392,7 @@ static void freeBenchmarkThreads(void);
 static void *execBenchmarkThread(void *ptr);
 static void benchmark(const char *title, char *cmd, int len);
 static clusterNode *createClusterNode(char *ip, int port);
-static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port);
+// static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port);
 static sds selectTagByDistribution(void);
 static void parseTagDistributions(const char *distributions_str);
 static valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
@@ -399,7 +407,10 @@ static int dictSdsKeyCompare(const void *key1, const void *key2);
 
 
 /* Fast unique vector generation using key-based deterministic randomization */
-static void generateVectorUnique(float *vector, int dim, uint64_t key_idx) {
+static sds createVectorTemplate(int hash) {
+    uint64_t key_idx = hash ^ ((uint64_t)pthread_self() << 32);
+    int dim = config.search.vector_dim - VECTOR_NUM_RAND_DIM;
+    float *vector = zmalloc(dim * sizeof(float));
     /* Use multiple hash passes for better distribution */
     uint64_t hash1 = key_idx * 0x9E3779B97F4A7C15ULL;
     uint64_t hash2 = key_idx * 0xBF58476D1CE4E5B9ULL;
@@ -431,6 +442,16 @@ static void generateVectorUnique(float *vector, int dim, uint64_t key_idx) {
             }
         }
     }
+    sds vector_data = sdsempty();
+    vector_data = sdscatlen(vector_data, (char*)vector, dim * sizeof(float));
+    zfree(vector);
+    assert(sdslen(vector_data) == (config.search.vector_dim - VECTOR_NUM_RAND_DIM) * sizeof(float));    
+    /* Append the 8-byte placeholder (will be replaced in-place later) */
+    vector_data = sdscatlen(vector_data, VECTOR_PLACEHOLDER, VECTOR_PLACEHOLDER_LEN);
+    
+    /* Verify total size matches expected vector dimension */
+    assert(sdslen(vector_data) == config.search.vector_dim * sizeof(float));
+    return vector_data;
 }
 
 /* Optimized binary conversion without sds overhead */
@@ -743,6 +764,13 @@ static void getSearchInfo(long long *search_memory, long long *search_reclaimabl
     getSearchIndexInfo(config.search.name, NULL); /* Fetch index info after getting search info */
 }
 
+int isSelected(int is_primary) {
+    if ((config.read_from_replica == FROM_REPLICA_ONLY && is_primary) || 
+        ((config.read_from_replica == FROM_PRIMARY_ONLY) && !is_primary)) {
+        return 0;
+    }
+    return 1;
+}
 
 /* Implementation */
 static long long ustime(void) {
@@ -790,7 +818,12 @@ static valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char 
     valkeyContext *ctx = NULL;
     valkeyReply *reply = NULL;
     struct timeval tv = {0};
+
     ctx = valkeyConnectWrapper(ct, ip_or_path, port, tv, 0, config.mptcp);
+    printf("Connecting to %s", (ct != VALKEY_CONN_UNIX ? ip_or_path : ""));
+    if (ct != VALKEY_CONN_UNIX) printf(":%d", port);
+    printf("... ");
+    fflush(stdout);
     if (ctx == NULL || ctx->err) {
         fprintf(stderr, "Could not connect to server at ");
         char *err = (ctx != NULL ? ctx->errstr : "");
@@ -801,6 +834,7 @@ static valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char 
         goto cleanup;
     }
     if (config.tls == 1) {
+        printf("Negotiating TLS connection...\n");
         const char *err = NULL;
         if (cliSecureConnection(ctx, config.sslconfig, &err) == VALKEY_ERR && err) {
             fprintf(stderr, "Could not negotiate a TLS connection: %s\n", err);
@@ -877,132 +911,104 @@ static sds vectorToBinary(float *vector, int dim) {
     return result;
 }
 static void *searchPrefillWorkerThreadCluster(void *arg) ;
-/* Benchmark function for vector operations with cluster awareness */
-static void benchmarkVectorOpClusterAware(const char *title, int is_insert) {
-    char *cmd;
-    int len;
-    
-    /* Validation checks */
-    assert(config.search.vector_dim > 0 && config.use_search);
-    assert(strlen(VECTOR_PLACEHOLDER) == VECTOR_PLACEHOLDER_LEN);  // Self-check
-    
-    /* Ensure we have at least 2 dimensions for the random part */
-    if (config.search.vector_dim < VECTOR_NUM_RAND_DIM) {
-        fprintf(stderr, "Error: Vector dimension must be at least %ld (current: %d)\n", 
-                VECTOR_NUM_RAND_DIM, config.search.vector_dim);
-        exit(1);
-    }
 
-    int fixed_dims = config.search.vector_dim - VECTOR_NUM_RAND_DIM;  // Reserve 2 floats for randomness
-
-    if (is_insert) {
-        /* Generate key with appropriate cluster tag */
-        sds key;
-        if (config.cluster_mode) {
-            key = sdscatprintf(sdsempty(), "%s{tag}:__rand_int__", config.search.prefix);
-        } else {
-            key = sdscatprintf(sdsempty(), "%s__rand_int__", config.search.prefix);
-        }
-        
-        /* Build vector data: fixed part + placeholder */
-        sds vector_data = sdsempty();
-        
-        /* Generate fixed portion if needed */
-        if (fixed_dims > 0) {
-            float *fixed_vector = zmalloc(fixed_dims * sizeof(float));
-            static __thread uint64_t local_counter = 0;
-            generateVectorUnique(fixed_vector, fixed_dims, 
-                               local_counter++ ^ ((uint64_t)pthread_self() << 32));
-            
-            /* Append binary data for fixed portion */
-            vector_data = sdscatlen(vector_data, (char*)fixed_vector, 
-                                   fixed_dims * sizeof(float));
-            zfree(fixed_vector);
-        }
-        
-        /* Append the 8-byte placeholder (will be replaced in-place later) */
-        vector_data = sdscatlen(vector_data, VECTOR_PLACEHOLDER, VECTOR_PLACEHOLDER_LEN);
-        
-        /* Verify total size matches expected vector dimension */
-        assert(sdslen(vector_data) == config.search.vector_dim * sizeof(float));
-        
-        /* Build HSET command */
-        if (config.search.tag_field && config.search.curr_conf.tag_dists) {
-            sds selected_tag = selectTagByDistribution();
-            len = valkeyFormatCommand(&cmd, 
-                "HSET %b %s %b %s %s", 
-                key, sdslen(key), 
-                config.search.vector_field,
-                vector_data, sdslen(vector_data),
-                config.search.tag_field, 
-                selected_tag ? selected_tag : "");
-            if (selected_tag) sdsfree(selected_tag);
-        } else {
-            len = valkeyFormatCommand(&cmd, 
-                "HSET %b %s %b", 
-                key, sdslen(key), 
-                config.search.vector_field,
-                vector_data, sdslen(vector_data));
-        }
-        
-        sdsfree(key);
-        sdsfree(vector_data);
-        
+static sds getVectorKey(void) {
+    sds key;
+    if (config.cluster_mode) {
+        key = sdscatprintf(sdsempty(), "%s{tag}:__rand_int__", config.search.prefix);
     } else {
-        /* For QUERY: generate complete vector without placeholders */
-        int vec_dim = config.search.vector_dim;
-        float *vector = zmalloc(vec_dim * sizeof(float));
-        
-        static __thread uint64_t local_counter = 0;
-        generateVectorUnique(vector, vec_dim, 
-                            local_counter++ ^ ((uint64_t)pthread_self() << 32));
-        
-        sds vector_binary = vectorToBinary(vector, vec_dim);
-        
-        /* Build KNN query */
-        sds query;
-        if (config.search.curr_conf.tag_filter && config.search.tag_field) {
-            query = sdscatprintf(sdsempty(), 
-                "@%s:{%s}=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
-                config.search.tag_field, 
-                config.search.curr_conf.tag_filter,
-                config.search.k, 
-                config.search.vector_field, 
-                config.search.ef_search);
-        } else {
-            query = sdscatprintf(sdsempty(), 
-                "*=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
-                config.search.k, 
-                config.search.vector_field, 
-                config.search.ef_search);
-        }
-        
-        /* Build FT.SEARCH command */
-        if (config.search.nocontent) {
-            len = valkeyFormatCommand(&cmd, 
-                "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b DIALECT 2", 
-                config.search.name, sdslen(config.search.name), 
-                query, sdslen(query), 
-                vector_binary, sdslen(vector_binary));
-        } else {
-            len = valkeyFormatCommand(&cmd,
-                "FT.SEARCH %b %b PARAMS 2 query_vector %b DIALECT 2", 
-                config.search.name, sdslen(config.search.name),
-                query, sdslen(query), 
-                vector_binary, sdslen(vector_binary));
-        }
-        
-        sdsfree(query);
-        sdsfree(vector_binary);
-        zfree(vector);
+        key = sdscatprintf(sdsempty(), "%s__rand_int__", config.search.prefix);
+    }
+    return key;
+}
+
+
+
+/* Benchmark function for vector operations with cluster awareness */
+static int createVectorInsertCmdTemplate(char **cmd) {
+    int len;    
+    /* Generate key with appropriate cluster tag */
+    sds key = getVectorKey();
+    /* Validation checks */
+    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim < VECTOR_NUM_RAND_DIM);    
+    /* Build vector data: fixed part + placeholder */
+    sds vector_data = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32)); // "someusername" as base
+
+    
+    /* Build HSET command */
+    if (config.search.tag_field && config.search.curr_conf.tag_dists) {
+        sds selected_tag = selectTagByDistribution();
+        len = valkeyFormatCommand(&cmd, 
+            "HSET %b %s %b %s %s", 
+            key, sdslen(key), 
+            config.search.vector_field,
+            vector_data, sdslen(vector_data),
+            config.search.tag_field, 
+            selected_tag ? selected_tag : "");
+        if (selected_tag) sdsfree(selected_tag);
+    } else {
+        len = valkeyFormatCommand(&cmd, 
+            "HSET %b %s %b", 
+            key, sdslen(key), 
+            config.search.vector_field,
+            vector_data, sdslen(vector_data));
     }
     
-    benchmark(title, cmd, len);
-    free(cmd);
+    sdsfree(key);
+    sdsfree(vector_data);            
+    return len;
 }
+
+/* Benchmark function for vector operations with cluster awareness */
+static int createSearchCmdTemplate(char **cmd) {
+    int len;
+    /* Validation checks */
+    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim < VECTOR_NUM_RAND_DIM);    
+    /* Build vector data: fixed part + placeholder */
+    sds vector_data = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32)); // "someusername" as base
+    
+    /* Build KNN query */
+    sds query;
+    if (config.search.curr_conf.tag_filter && config.search.tag_field) {
+        query = sdscatprintf(sdsempty(), 
+            "@%s:{%s}=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
+            config.search.tag_field, 
+            config.search.curr_conf.tag_filter,
+            config.search.k, 
+            config.search.vector_field, 
+            config.search.ef_search);
+    } else {
+        query = sdscatprintf(sdsempty(), 
+            "*=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
+            config.search.k, 
+            config.search.vector_field, 
+            config.search.ef_search);
+    }
+    
+    /* Build FT.SEARCH command */
+    if (config.search.nocontent) {
+        len = valkeyFormatCommand(&cmd, 
+            "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b DIALECT 2", 
+            config.search.name, sdslen(config.search.name), 
+            query, sdslen(query), 
+            vector_binary, sdslen(vector_binary));
+    } else {
+        len = valkeyFormatCommand(&cmd,
+            "FT.SEARCH %b %b PARAMS 2 query_vector %b DIALECT 2", 
+            config.search.name, sdslen(config.search.name),
+            query, sdslen(query), 
+            vector_binary, sdslen(vector_binary));
+    }
+    
+    sdsfree(query);
+    sdsfree(vector_binary);
+    zfree(vector);
+    return len;
+}
+
 /* Non-cluster prefill worker thread */
-static void *searchPrefillWorkerThread(void *arg) {
-    assert(config.use_search);
+static void *searchPrefillWorkerThread(void *arg) {    
+    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim < VECTOR_NUM_RAND_DIM);    
     prefillThreadData *data = (prefillThreadData *)arg;
     
     /* Connect to single node */
@@ -1025,12 +1031,11 @@ static void *searchPrefillWorkerThread(void *arg) {
     
     for (int i = data->start_index; i <= data->end_index; i++) {
         /* Simple key without cluster tags */
-        sds key = sdscatprintf(sdsempty(), "%s%012d", 
-                              config.search.prefix, i);
+        sds key = getVectorKey();
         
-        /* Generate unique vector deterministically based on key index */
-        generateVectorUnique(vector, vec_dim, i);
-        sds vector_binary = vectorToBinary(vector, vec_dim);
+        /* Validation checks */
+        /* Build vector data: fixed part + placeholder */
+        sds vector_binary = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32) + i); // "someusername" as base
         
         /* Use pipelining for better throughput */
         if (config.search.tag_field && config.search.curr_conf.tag_dists) {
@@ -1073,10 +1078,7 @@ static void *searchPrefillWorkerThread(void *arg) {
             }
             
             /* Update progress */
-            pthread_mutex_lock(data->progress_mutex);
-            (*data->global_progress) += pipeline_count;
-            pthread_mutex_unlock(data->progress_mutex);
-            
+            atomic_fetch_add_explicit(&prefill_state.progress, pipeline_count, memory_order_relaxed);
             pipeline_count = 0;
         }
         
@@ -1111,10 +1113,9 @@ static void prefillVectorIndex(int count) {
     /* Use multithreaded approach */
     pthread_t *threads = zmalloc(num_threads * sizeof(pthread_t));
     prefillThreadData *thread_data = zmalloc(num_threads * sizeof(prefillThreadData));
-    pthread_mutex_t progress_mutex = PTHREAD_MUTEX_INITIALIZER;
-    int global_progress = 0;
     
     long long start_time = mstime();
+    prefill_state.start = mstime();
     int progress_interval = count >= 10000 ? 1000 : (count >= 1000 ? 100 : 10);
     
     /* Calculate work distribution */
@@ -1134,8 +1135,6 @@ static void prefillVectorIndex(int count) {
         }
         
         thread_data[i].total_count = count;
-        thread_data[i].progress_mutex = &progress_mutex;
-        thread_data[i].global_progress = &global_progress;
         
         current_start = thread_data[i].end_index + 1;
         
@@ -1152,13 +1151,10 @@ static void prefillVectorIndex(int count) {
     /* Rest of the function remains the same... */
     /* Monitor progress while threads are working */
     int last_progress = 0;
-    while (global_progress < count) {
+    int current_progress = atomic_load(&prefill_state.progress);
+    while (current_progress < count) {
         usleep(100000); /* Sleep 100ms */
-        
-        pthread_mutex_lock(&progress_mutex);
-        int current_progress = global_progress;
-        pthread_mutex_unlock(&progress_mutex);
-        
+        current_progress = atomic_load(&prefill_state.progress);
         if (current_progress >= last_progress + progress_interval || current_progress == count) {
             float progress = (float)current_progress / count * 100.0f;
             printf("Prefilled %d vectors (%.1f%%)...\n", current_progress, progress);
@@ -1173,11 +1169,11 @@ static void prefillVectorIndex(int count) {
     
     long long elapsed_ms = mstime() - start_time;
     float rate = elapsed_ms > 0 ? (float)count / elapsed_ms * 1000.0f : 0.0f;
-    
+    prefill_state.done = 1;
+    prefill_state.end = mstime();
     printf("Prefilled %d vectors in %.2f seconds (%.0f vectors/sec) using %d threads\n\n", 
             count, elapsed_ms / 1000.0f, rate, num_threads);
     
-    pthread_mutex_destroy(&progress_mutex);
     zfree(threads);
     zfree(thread_data);
 }
@@ -1190,61 +1186,38 @@ static void *searchPrefillWorkerThreadCluster(void *arg) {
     /* In cluster mode, connect to a specific node based on thread ID */
     const char *ip = config.conn_info.hostip;
     int port = config.conn_info.hostport;
-    
-    if (config.cluster_mode && config.cluster_primary_node_count) {
+    int node_idx = -1;
+    clusterNode *node = NULL;
+    if (config.cluster_mode) {
+        assert(config.cluster_primary_node_count > 0);
         /* Distribute threads across cluster nodes */
-        int node_idx = data->thread_id % config.cluster_primary_node_count;
-        clusterNode *node = config.cluster_primary_nodes[node_idx];
-        if (node) {
-            ip = node->ip;
-            port = node->port;
-        }
+        int i = 0;
+        do {
+            assert(i < config.cluster_primary_node_count); /* Prevent infinite loop */
+            node_idx = (data->thread_id + i) % config.cluster_primary_node_count;
+            node = config.cluster_primary_nodes[node_idx];
+            assert(node);
+            i++;            
+        } while (node->slots_count == 0);
+        ip = node->ip;
+        port = node->port;        
     }
-    
     valkeyContext *ctx = getValkeyContext(config.ct, ip, port);
     if (!ctx) {
         fprintf(stderr, "Thread %d: Failed to connect to %s:%d\n", 
                 data->thread_id, ip, port);
         return NULL;
     }
-
-    int vec_dim = config.search.vector_dim;
-    float *vector = zmalloc(vec_dim * sizeof(float));
     
     /* Use pipelining to batch commands */
     int pipeline_size = 4;
     int pipeline_count = 0;
     
     for (int i = data->start_index; i <= data->end_index; i++) {
-        sds key;
-        
-        if (config.cluster_mode) {
-            /* For cluster mode, ensure deterministic slot assignment */
-            /* Use a specific slot tag to route to the connected node */
-            int node_idx = data->thread_id % config.cluster_primary_node_count;
-            clusterNode *node = config.cluster_primary_nodes[node_idx];
-            
-            if (node && node->slots_count > 0) {
-                /* Pick a slot that this node owns */
-                int slot_idx = i % node->slots_count;
-                int slot = node->slots[slot_idx];
-                const char *tag = crc16_slot_table[slot];
-                
-                key = sdscatprintf(sdsempty(), "%s%012d{%s}", 
-                                  config.search.prefix, i, tag);
-            } else {
-                /* Fallback: let cluster redirect as needed */
-                key = sdscatprintf(sdsempty(), "%s%012d", 
-                                  config.search.prefix, i);
-            }
-        } else {
-            key = sdscatprintf(sdsempty(), "%s%012d", 
-                              config.search.prefix, i);
-        }
+        sds key = getVectorKey();
         
         /* Generate unique vector deterministically based on key index */
-        generateVectorUnique(vector, vec_dim, i);
-        sds vector_binary = vectorToBinary(vector, vec_dim);
+        sds vector_binary = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32) + i); // "someusername" as base
         
         /* Use pipelining for better throughput */
         if (config.search.tag_field && config.search.curr_conf.tag_dists) {
@@ -1293,10 +1266,8 @@ static void *searchPrefillWorkerThreadCluster(void *arg) {
             }
             
             /* Update progress */
-            pthread_mutex_lock(data->progress_mutex);
-            (*data->global_progress) += pipeline_count;
-            pthread_mutex_unlock(data->progress_mutex);
-            
+            atomic_fetch_add_explicit(&prefill_state.progress, pipeline_count, memory_order_relaxed);
+
             pipeline_count = 0;
         }
         
@@ -1304,7 +1275,6 @@ static void *searchPrefillWorkerThreadCluster(void *arg) {
         sdsfree(vector_binary);
     }
     
-    zfree(vector);
     if (ctx) valkeyFree(ctx);
     return NULL;
 }
@@ -1351,6 +1321,11 @@ static void setClusterKeyHashTagForVectors(client c) {
 // If it matches, we can skip index creation.
 static void createDefaultSearchIndexes(void) {    
     if (!config.use_search) return;
+    // connect to a primary node
+    if (config.cluster_mode && config.cluster_primary_nodes[0]) {
+        config.conn_info.hostip = config.cluster_primary_nodes[0]->ip;
+        config.conn_info.hostport = config.cluster_primary_nodes[0]->port;
+    }
     valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
     if (ctx == NULL) {
         fprintf(stderr, "Failed to connect to Valkey server for creating search indexes.\n");
@@ -1408,56 +1383,82 @@ static void createDefaultSearchIndexes(void) {
     valkeyFree(ctx);
 }
 
+/* Best-effort server config fetch: use INFO; skip CONFIG on managed services */
+static void safeGetServerConfig(enum valkeyConnectionType ct, const char *host, int port, serverConfig *dst) {
+    valkeyContext *ctx = getValkeyContext(ct, host, port);
+    if (!ctx) return;
 
-static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port) {
-    serverConfig *cfg = zcalloc(sizeof(*cfg));
-    if (!cfg) return NULL;
-    valkeyContext *c = NULL;
-    valkeyReply *reply = NULL, *sub_reply = NULL;
-    c = getValkeyContext(ct, ip_or_path, port);
-    if (c == NULL) {
-        freeServerConfig(cfg);
-        exit(1);
-    }
-    valkeyAppendCommand(c, "CONFIG GET %s", "save");
-    valkeyAppendCommand(c, "CONFIG GET %s", "appendonly");
-    int abort_test = 0;
-    int i = 0;
-    void *r = NULL;
-    for (; i < 2; i++) {
-        int res = valkeyGetReply(c, &r);
-        if (reply) freeReplyObject(reply);
-        reply = res == VALKEY_OK ? ((valkeyReply *)r) : NULL;
-        if (res != VALKEY_OK || !r) goto fail;
-        if (reply->type == VALKEY_REPLY_ERROR) {
-            goto fail;
-        }
-        if (reply->type != VALKEY_REPLY_ARRAY || reply->elements < 2) goto fail;
-        sub_reply = reply->element[1];
-        char *value = sub_reply->str;
-        if (!value) value = "";
-        switch (i) {
-        case 0: cfg->save = sdsnew(value); break;
-        case 1: cfg->appendonly = sdsnew(value); break;
-        }
-    }
-    freeReplyObject(reply);
-    valkeyFree(c);
-    return cfg;
-fail:
-    if (reply && reply->type == VALKEY_REPLY_ERROR && !strncmp(reply->str, "NOAUTH", 6)) {
-        if (ct != VALKEY_CONN_UNIX)
-            fprintf(stderr, "Node %s:%d replied with error:\n%s\n", ip_or_path, port, reply->str);
-        else
-            fprintf(stderr, "Node %s replied with error:\n%s\n", ip_or_path, reply->str);
-        abort_test = 1;
-    }
-    freeReplyObject(reply);
-    valkeyFree(c);
-    freeServerConfig(cfg);
-    if (abort_test) exit(1);
-    return NULL;
+    /* 1) INFO server (non-privileged, should work on ElastiCache) */
+    valkeyReply *r = valkeyCommand(ctx, "INFO SERVER");
+    if (r && (r->type == VALKEY_REPLY_STRING || r->type == VALKEY_REPLY_STATUS)) {
+        /* parse into dst if you want; or store raw */
+        /* ... your existing parsing hook ... */
+        freeReplyObject(r);
+        r = NULL;
+    } else if (r) { freeReplyObject(r); r = NULL; }
+
+    /* 2) Optionally INFO memory (also non-privileged) */
+    r = valkeyCommand(ctx, "INFO MEMORY");
+    if (r && (r->type == VALKEY_REPLY_STRING || r->type == VALKEY_REPLY_STATUS)) {
+        /* parse into dst if you want */
+        freeReplyObject(r); r = NULL;
+    } else if (r) { freeReplyObject(r); r = NULL; }
+
+    valkeyFree(ctx);
 }
+
+// static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port) {
+//     serverConfig *cfg = zcalloc(sizeof(*cfg));
+//     if (!cfg) return NULL;
+//     valkeyContext *c = NULL;
+//     valkeyReply *reply = NULL, *sub_reply = NULL;
+//     printf("Fetching server configs from %s:%d\n", ip_or_path, port);
+//     c = getValkeyContext(ct, ip_or_path, port);
+//     if (c == NULL) {
+//         freeServerConfig(cfg);
+//         exit(1);
+//     }
+//     char* configs[] = {"save", "appendonly"};
+
+//     int abort_test = 0;
+    
+//     void *r = NULL;
+//     for (int i = 0; i < 2; i++) {
+//         printf("Fetching config parameter: %s from %s:%d\n", configs[i], ip_or_path, port);
+//         valkeyAppendCommand(c, "CONFIG GET %s", configs[i]);
+//         int res = valkeyGetReply(c, &r);
+//         if (reply) freeReplyObject(reply);
+//         reply = res == VALKEY_OK ? ((valkeyReply *)r) : NULL;
+//         if (res != VALKEY_OK || !r) goto fail;
+//         if (reply->type == VALKEY_REPLY_ERROR) {
+//             goto fail;
+//         }
+//         if (reply->type != VALKEY_REPLY_ARRAY || reply->elements < 2) goto fail;
+//         sub_reply = reply->element[1];
+//         char *value = sub_reply->str;
+//         if (!value) value = "";
+//         switch (i) {
+//         case 0: cfg->save = sdsnew(value); break;
+//         case 1: cfg->appendonly = sdsnew(value); break;
+//         }
+//     }
+//     freeReplyObject(reply);
+//     valkeyFree(c);
+//     return cfg;
+// fail:
+//     if (reply && reply->type == VALKEY_REPLY_ERROR && !strncmp(reply->str, "NOAUTH", 6)) {
+//         if (ct != VALKEY_CONN_UNIX)
+//             fprintf(stderr, "Node %s:%d replied with error:\n%s\n", ip_or_path, port, reply->str);
+//         else
+//             fprintf(stderr, "Node %s replied with error:\n%s\n", ip_or_path, reply->str);
+//         abort_test = 1;
+//     }
+//     freeReplyObject(reply);
+//     valkeyFree(c);
+//     freeServerConfig(cfg);
+//     if (abort_test) exit(1);
+//     return NULL;
+// }
 static void freeServerConfig(serverConfig *cfg) {
     if (cfg->save) sdsfree(cfg->save);
     if (cfg->appendonly) sdsfree(cfg->appendonly);
@@ -1559,7 +1560,7 @@ static void replacePlaceholderVector(const size_t *indices, const size_t count,
     uint64_t key = 0;
     if (config.keyspacelen != 0) {
         if (config.sequential_replacement) {
-            key = atomic_fetch_add_explicit(key_counter, 1, memory_order_relaxed);
+            key = atomic_load_explicit(key_counter, memory_order_relaxed);
         } else {
             key = random();
         }
@@ -2465,18 +2466,307 @@ static void freeClusterNodes(void) {
     config.cluster_primary_nodes = NULL;
 }
 
-static clusterNode **addClusterNode(clusterNode *node) {
+static clusterNode **addClusterNode(clusterNode *node, int selected) {
+    printf("Adding cluster node %s:%d\n", node->ip, node->port);
+    // verify node ip + port is unique
+    for (int i = 0; i < config.cluster_node_count; i++) {
+        clusterNode *n = config.cluster_nodes[i];
+        if (strcmp(n->ip, node->ip) == 0 && n->port == node->port) {
+            printf("Node %s:%d already exists, skipping name=%s, replicate=%s <==> n_name=%s, n_replicate=%s\n", node->ip, node->port, node->name, node->replicate, n->name, n->replicate);
+            freeClusterNode(node);
+            return config.cluster_nodes;
+        }
+    }
     int count = config.cluster_node_count + 1;
     config.cluster_nodes = zrealloc(config.cluster_nodes, count * sizeof(clusterNode *));
-    if (!config.cluster_nodes) return NULL;
+    assert(config.cluster_nodes != NULL);
     config.cluster_nodes[config.cluster_node_count++] = node;
     if (node->replicate == NULL) {
+        printf("Adding cluster primary node %s:%d\n", node->ip, node->port);
         config.cluster_primary_nodes = zrealloc(config.cluster_primary_nodes, (config.cluster_primary_node_count + 1) * sizeof(clusterNode *));
         config.cluster_primary_nodes[config.cluster_primary_node_count++] = node;
+    }
+    if (selected) {
+        config.selected_nodes = zrealloc(config.selected_nodes, (config.selected_node_count + 1) * sizeof(clusterNode *));
+        config.selected_nodes[config.selected_node_count++] = node;
     }
     return config.cluster_nodes;
 }
 
+int isElastiCacheEndpoint(const char *hostname) {
+    /* Must contain ElastiCache domain markers */
+    if (strstr(hostname, ".cache.amazonaws.com") == NULL) {
+        return 0;
+    }
+    return 1;
+}
+/* CMD (Cluster Mode Disabled) configuration prototypes */
+static int fetchCMDNodesConfiguration(void);
+static int setupElastiCacheCMDNodes(void);
+static sds constructElastiCacheReaderEndpoint(const char *hostname);
+static int setupOpenSourceCMDPrimary(valkeyReply *role_reply);
+static int setupOpenSourceCMDReplica(valkeyReply *role_reply);
+// static serverConfig *getServerConfigSafe(enum valkeyConnectionType ct, const char *host, int port);
+
+/**
+ * Fetch nodes configuration for Cluster Mode Disabled (CMD) setup.
+ * Handles open-source Valkey (via ROLE) and AWS ElastiCache (reader endpoint synthesis).
+ * 
+ * For ElastiCache CMD: creates primary + single reader endpoint node (load-balanced across replicas).
+ * For open-source: creates primary + individual replica nodes from ROLE output.
+ * 
+ * Returns 1 on success, 0 on failure.
+ */
+static int fetchCMDNodesConfiguration(void) {
+    int success = 1;
+    valkeyContext *ctx = NULL;
+    valkeyReply *reply = NULL;
+    assert(!isElastiCacheEndpoint(config.conn_info.hostip));
+    ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+    if (ctx == NULL) {
+        return 0;
+    }
+
+    /* Detect ElastiCache by trying ROLE first */
+    reply = valkeyCommand(ctx, "ROLE");
+    if (reply == NULL || ctx->err || reply->type != VALKEY_REPLY_ARRAY || reply->elements < 1) {        
+        success = 0;
+        /* ROLE failed - try ElastiCache reader endpoint synthesis */
+        printf("ROLE command failed, assuming ElastiCache endpoint and trying reader endpoint synthesis\n");
+        goto cleanup;
+    }
+    printf("Detected open-source Valkey endpoint, using ROLE output for replicas\n");    
+    char *role = reply->element[0]->str;
+    if (strcmp(role, "master") == 0) {
+        success = setupOpenSourceCMDPrimary(reply);
+    } else if (strcmp(role, "slave") == 0) {
+        success = setupOpenSourceCMDReplica(reply);
+    } else {
+        success = 0;
+    }
+
+cleanup:
+    if (reply) freeReplyObject(reply);
+    if (ctx) valkeyFree(ctx);
+    
+    if (!success && config.cluster_nodes) {
+        freeClusterNodes();
+    }
+    
+    return success;
+}
+
+/**
+ * Setup nodes for ElastiCache CMD by synthesizing reader endpoint.
+ * Pattern: <primary-host> → <primary-host with -ro inserted before .ng. or domain>
+ * 
+ * ElastiCache exposes replicas via DNS load-balanced reader endpoint, not individual IPs.
+ */
+static int setupElastiCacheCMDNodes(void) {
+    /* Add primary node */
+    clusterNode *primary = createClusterNode((char *)config.conn_info.hostip, 
+                                              config.conn_info.hostport);
+    if (!primary) return 0;
+    
+    primary->name = sdsnew("primary");
+    for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+        primary->slots[primary->slots_count++] = slot;
+    }
+
+    if (!addClusterNode(primary, isSelected(1))) {
+        freeClusterNode(primary);
+        return 0;
+    }
+    
+    /* Synthesize reader endpoint if ElastiCache pattern detected */
+    sds reader_hostname = constructElastiCacheReaderEndpoint(config.conn_info.hostip);
+    if (reader_hostname == NULL) {
+        printf("No ElastiCache reader endpoint pattern detected in hostname %s, skipping\n",
+                config.conn_info.hostip);
+        /* Not an ElastiCache endpoint pattern - no reader to add */
+        return 1;
+    }
+    
+    /* Verify reader endpoint is reachable */
+    valkeyContext *test_ctx = valkeyConnect(reader_hostname, config.conn_info.hostport);
+    if (test_ctx == NULL || test_ctx->err) {
+        fprintf(stderr, "WARNING: Synthesized reader endpoint %s:%d unreachable, skipping\n",
+                reader_hostname, config.conn_info.hostport);
+        sdsfree(reader_hostname);
+        if (test_ctx) valkeyFree(test_ctx);
+        exit(1);
+        // return 1; /* Non-fatal - primary still usable */
+    }
+    valkeyFree(test_ctx);
+    
+    /* Add reader node */
+    clusterNode *reader = createClusterNode(reader_hostname, config.conn_info.hostport);
+    if (!reader) {
+        fprintf(stderr, "ERROR: Failed to create reader node for %s:%d\n",
+                reader_hostname, config.conn_info.hostport);
+        sdsfree(reader_hostname);
+        fflush(stderr);
+        exit(1);
+        // sdsfree(reader_hostname);
+        // return 0;
+    }
+    
+    reader->name = sdsnew("reader-endpoint");
+    reader->flags = 1; /* Mark as replica endpoint */
+    reader->replicate = sdsnew(primary->name);
+    
+    for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+        reader->slots[reader->slots_count++] = slot;
+    }
+
+    if (!addClusterNode(reader, isSelected(0))) {
+        freeClusterNode(reader);
+        return 0;
+    }
+    
+    primary->replicas_count = 1; /* Logical count - reader represents N replicas */
+    return 1;
+}
+
+/**
+ * Construct ElastiCache reader endpoint from primary hostname.
+ * 
+ * Patterns:
+ *   CMD: xxx.ng.0001.region.cache.amazonaws.com → xxx-ro.ng.0001.region.cache.amazonaws.com
+ *   CMD: xxx.ajfdds.ng.0001.region.cache.amazonaws.com → xxx-ro.ajfdds.ng.0001.region.cache.amazonaws.com
+ * 
+ * Returns allocated sds with reader hostname, or NULL if pattern not detected.
+ */
+static sds constructElastiCacheReaderEndpoint(const char *hostname) {
+    /* Must contain ElastiCache domain markers */
+    
+    if (!isElastiCacheEndpoint(hostname)) {
+        return NULL;
+    }
+    /* Already a -ro endpoint */
+    if (strstr(hostname, "-ro.") != NULL) {
+        return NULL;
+    }
+    
+    /* Find the first dot - this is after the cluster name prefix */
+    const char *first_dot = strchr(hostname, '.');
+    if (first_dot == NULL) {
+        return NULL;
+    }
+    
+    /* Insert -ro before the first dot:
+     * ec-search-ec-cmd.ajfdds.ng... → ec-search-ec-cmd-ro.ajfdds.ng... */
+    size_t prefix_len = first_dot - hostname;
+    sds reader = sdsnewlen(hostname, prefix_len);
+    reader = sdscat(reader, "-ro");
+    reader = sdscat(reader, first_dot);
+    
+    return reader;
+}
+/**
+ * Setup nodes for open-source Valkey CMD when connected to primary.
+ * Parses ROLE response to enumerate individual replica endpoints.
+ */
+static int setupOpenSourceCMDPrimary(valkeyReply *role_reply) {
+    /* Add primary node */
+    clusterNode *primary = createClusterNode((char *)config.conn_info.hostip, 
+                                              config.conn_info.hostport);
+    if (!primary) return 0;
+    
+    primary->name = sdsnew("primary");
+    for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+        primary->slots[primary->slots_count++] = slot;
+    }
+    
+    if (!addClusterNode(primary, isSelected(1))) {
+        freeClusterNode(primary);
+        return 0;
+    }
+    
+    /* Parse replicas from ROLE response: [role, repl_offset, [[ip, port, offset], ...]] */
+    if (role_reply->elements >= 3 && role_reply->element[2]->type == VALKEY_REPLY_ARRAY) {
+        size_t replica_count = role_reply->element[2]->elements;
+        
+        for (size_t i = 0; i < replica_count; i++) {
+            valkeyReply *replica_info = role_reply->element[2]->element[i];
+            if (replica_info->type != VALKEY_REPLY_ARRAY || replica_info->elements < 2) {
+                continue;
+            }
+            
+            char *replica_ip = replica_info->element[0]->str;
+            int replica_port = (int)replica_info->element[1]->integer;
+            
+            clusterNode *replica = createClusterNode(sdsnew(replica_ip), replica_port);
+            if (!replica) return 0;
+            
+            replica->name = sdscatprintf(sdsempty(), "replica-%zu", i);
+            replica->flags = 1;
+            replica->replicate = sdsnew(primary->name);
+            
+            for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+                replica->slots[replica->slots_count++] = slot;
+            }
+            
+            if (!addClusterNode(replica, isSelected(0))) {
+                freeClusterNode(replica);
+                return 0;
+            }
+            
+            primary->replicas_count++;
+        }
+    }
+    
+    return 1;
+}
+
+/**
+ * Setup nodes for open-source Valkey CMD when connected to replica.
+ * Parses ROLE response to find primary, then adds current replica.
+ */
+static int setupOpenSourceCMDReplica(valkeyReply *role_reply) {
+    if (role_reply->elements < 3) return 0;
+    
+    char *primary_ip = role_reply->element[1]->str;
+    int primary_port = (int)role_reply->element[2]->integer;
+    
+    /* Add primary node */
+    clusterNode *primary = createClusterNode(sdsnew(primary_ip), primary_port);
+    if (!primary) return 0;
+    
+    primary->name = sdsnew("primary");
+    for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+        primary->slots[primary->slots_count++] = slot;
+    }
+
+    if (!addClusterNode(primary, isSelected(1))) {
+        freeClusterNode(primary);
+        return 0;
+    }
+    
+    /* Add current replica node */
+    clusterNode *replica = createClusterNode((char *)config.conn_info.hostip,
+                                              config.conn_info.hostport);
+    if (!replica) return 0;
+    
+    replica->name = sdsnew("replica-0");
+    replica->flags = 1;
+    replica->replicate = sdsnew(primary->name);
+    
+    for (int slot = 0; slot < CLUSTER_SLOTS; slot++) {
+        replica->slots[replica->slots_count++] = slot;
+    }
+    
+    if (!addClusterNode(replica, isSelected(0))) {
+        freeClusterNode(replica);
+        return 0;
+    }
+    
+    primary->replicas_count = 1;
+    return 1;
+}
+
+/* Fetch the cluster configuration by calling CLUSTER SLOTS and update
+ * the internal representation of the cluster nodes accordingly. */
 static int fetchClusterConfiguration(void) {
     int success = 1;
     valkeyContext *ctx = NULL;
@@ -2512,8 +2802,7 @@ static int fetchClusterConfiguration(void) {
 
             int is_primary = (j == 2);
             if (is_primary) primary = sdsnew(nr->element[2]->str);
-            int is_cluster_option_only = (config.read_from_replica == FROM_PRIMARY_ONLY);
-            if ((config.read_from_replica == FROM_REPLICA_ONLY && is_primary) || (is_cluster_option_only && !is_primary)) continue;
+
 
             sds ip = sdsnew(nr->element[0]->str);
             sds name = sdsnew(nr->element[2]->str);
@@ -2549,7 +2838,7 @@ static int fetchClusterConfiguration(void) {
             }
             if (entry == NULL) {
                 dictReplace(nodes, node->name, node);
-                if (!addClusterNode(node)) {
+                if (!addClusterNode(node, isSelected(is_primary))) {
                     success = 0;
                     goto cleanup;
                 }
@@ -3444,7 +3733,10 @@ int main(int argc, char **argv) {
         cliSecureInit();
     }
 #endif
-
+  
+    /* Initialize base vector */
+    initBaseVector(config.search.vector_dim);
+    
     if (config.mptcp && (config.ct != VALKEY_CONN_TCP)) {
         fprintf(stderr, "Options --mptcp is only supported by TCP\n");
         exit(1);
@@ -3472,42 +3764,66 @@ int main(int argc, char **argv) {
         if (config.cluster_node_count == 0) {
             fprintf(stderr, "Invalid cluster: %d node(s).\n", config.cluster_node_count);
             exit(1);
+        }       
+    } else if (isElastiCacheEndpoint(config.conn_info.hostip)) {
+        int res = setupElastiCacheCMDNodes();
+        if (!res) {
+            fprintf(stderr,
+                    "Failed to fetch cluster configuration from "
+                    "%s:%d\n",
+                    config.conn_info.hostip, config.conn_info.hostport);
+            exit(1);
         }
-        const char *node_roles = NULL;
-        if (config.read_from_replica == FROM_ALL) {
-            node_roles = "cluster";
-        } else if (config.read_from_replica == FROM_REPLICA_ONLY) {
-            node_roles = "replica";
-        } else {
-            node_roles = "primary";
-        }
-        printf("Cluster has %d %s nodes:\n\n", config.cluster_node_count, node_roles);
-        int i = 0;
-        for (; i < config.cluster_node_count; i++) {
-            clusterNode *node = config.cluster_nodes[i];
-            if (!node) {
-                fprintf(stderr, "Invalid cluster node #%d\n", i);
-                exit(1);
-            }
-            const char *node_type = (node->replicate == NULL ? "Primary" : "Replica");
-            printf("Node %d(%s): ", i, node_type);
-            if (node->name) printf("%s ", node->name);
-            printf("%s:%d\n", node->ip, node->port);
-            node->server_config = getServerConfig(config.ct, node->ip, node->port);
-            if (node->server_config == NULL) {
-                fprintf(stderr, "WARNING: Could not fetch node CONFIG %s:%d\n", node->ip, node->port);
-            }
-        }
-        printf("\n");
-        /* Automatically set thread number to node count if not specified
-         * by the user. */
-        if (config.num_threads == 0) config.num_threads = config.cluster_node_count;
     } else {
-        config.server_config = getServerConfig(config.ct, config.conn_info.hostip, config.conn_info.hostport);
-        if (config.server_config == NULL) {
-            fprintf(stderr, "WARNING: Could not fetch server CONFIG\n");
+        int res = fetchCMDNodesConfiguration();
+        if (!res) {
+            if (config.ct != VALKEY_CONN_UNIX) {
+                fprintf(stderr,
+                        "Failed to fetch cluster configuration from "
+                        "%s:%d\n",
+                        config.conn_info.hostip, config.conn_info.hostport);
+            } else {
+                fprintf(stderr,
+                        "Failed to fetch cluster configuration from "
+                        "%s\n",
+                        config.conn_info.hostip);
+            }
+            exit(1);
+        }
+        // config.server_config = getServerConfig(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+        // if (config.server_config == NULL) {
+        //     fprintf(stderr, "WARNING: Could not fetch server CONFIG\n");
+        // }
+    }
+    const char *node_roles = NULL;
+    if (config.read_from_replica == FROM_ALL) {
+        node_roles = "cluster";
+    } else if (config.read_from_replica == FROM_REPLICA_ONLY) {
+        node_roles = "replica";
+    } else {
+        node_roles = "primary";
+    }
+    printf("Cluster has %d %s nodes:\n\n", config.cluster_node_count, node_roles);
+    i = 0;
+    for (; i < config.cluster_node_count; i++) {
+        clusterNode *node = config.cluster_nodes[i];
+        if (!node) {
+            fprintf(stderr, "Invalid cluster node #%d\n", i);
+            exit(1);
+        }
+        const char *node_type = (node->replicate == NULL ? "Primary" : "Replica");
+        printf("Node %d(%s): ", i, node_type);
+        if (node->name) printf("%s ", node->name);
+        printf("%s:%d\n", node->ip, node->port);
+        safeGetServerConfig(config.ct, node->ip, node->port, node->server_config);
+        if (node->server_config == NULL) {
+            fprintf(stderr, "WARNING: Could not fetch node CONFIG %s:%d\n", node->ip, node->port);
         }
     }
+    printf("\n");
+    /* Automatically set thread number to node count if not specified
+        * by the user. */
+    if (config.num_threads == 0) config.num_threads = config.cluster_node_count;
     if (config.num_threads > 0) {
         pthread_mutex_init(&(config.liveclients_mutex), NULL);
         pthread_mutex_init(&(config.is_updating_slots_mutex), NULL);
@@ -3702,44 +4018,26 @@ int main(int argc, char **argv) {
         }
         if (config.use_search) {
             if (test_is_selected("vec-insert")) {
-                int vec_dim = config.search.vector_dim;
-                
-                /* Initialize base vector */
-                initBaseVector(vec_dim);
-                
                 /* Use custom vector benchmark function */
-                benchmarkVectorOpClusterAware("VEC-INSERT", 1);
+                len = createVectorInsertCmdTemplate(&cmd);
+                benchmark("VEC-INSERT", cmd, len);
+                free(cmd);
             }
 
-            if (test_is_selected("vec-query")) {
-                int vec_dim = config.search.vector_dim;
-                
-                /* Initialize base vector if not already done */
-                initBaseVector(vec_dim);
-                
+            if (test_is_selected("vec-query")) {                
                 /* Use custom vector benchmark function */
-                benchmarkVectorOpClusterAware("VEC-QUERY", 0);
+                len = createSearchCmdTemplate(&cmd);
+                benchmark("VEC-QUERY", cmd, len);
+                free(cmd);
             }
 
             if (test_is_selected("vec-del")) {
-                sds prefix = config.search.prefix;
-                if (config.cluster_mode) {
-                    len = valkeyFormatCommand(&cmd, "DEL %s{tag}:__rand_int__", prefix);
-                } else {
-                    len = valkeyFormatCommand(&cmd, "DEL %s__rand_int__", prefix);
-                }
+                sds key = getVectorKey();
+                len = valkeyFormatCommand(&cmd, "DEL %s", key);
                 benchmark("VEC-DEL", cmd, len);
+                sdsfree(key);
                 free(cmd);
             }
-#if 0
-            if (test_is_selected("vec-del")) {
-                /* Use DEL command to delete keys from vector index */
-                sds prefix = config.search.prefix;
-                len = valkeyFormatCommand(&cmd, "DEL %s__rand_int__", prefix);
-                benchmark("VEC-DEL", cmd, len);
-                free(cmd);
-            }
-#endif
         }
         if (test_is_selected("spop")) {
             len = valkeyFormatCommand(&cmd, "SPOP myset%s", tag);
