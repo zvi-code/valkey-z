@@ -75,19 +75,26 @@ extern uint16_t crc16(const char *buf, int len);
 #define SHOW_THROUGHPUT_INTERVAL 250                        /* 250ms */
 
 #define CLIENT_GET_EVENTLOOP(c) (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
-#define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
 
+#define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
 #define VECTOR_PLACEHOLDER_LEN 8 // length of VECTOR_PLACEHOLDER strings
-#define VECTOR_PLACEHOLDER_INDEX 10
-#define PLACEHOLDER_LEN 12 // length of BENCHMARK_PLACEHOLDERS strings
+#define VECTOR_NUM_RAND_DIM (VECTOR_PLACEHOLDER_LEN/sizeof(float)) // Number of random dimensions for vector generation
+#define VECTOR_PLACEHOLDER_INDEX 11
+
+#define CLUSTER_PLACEHOLDER "{tag}"
+#define CLUSTER_PLACEHOLDER_LEN 5 // length of CLUSTER_PLACEHOLDER strings
+#define CLUSTER_PLACEHOLDER_INDEX 10
+
+#define PLACEHOLDER_NORMAL_LEN 12 // length of BENCHMARK_PLACEHOLDERS strings
+#define PLACEHOLDER_NUM_OF 12
+#define PLACEHOLDER_NORMAL_NUM_OF 10  // Number of normal placeholders excluding vector and cluster placeholders
 // TODO: Use existing vectors\fields in the index as base for vector\tag\numeric generation
-static const char *PLACEHOLDERS[] = {
+static const char *PLACEHOLDERS[PLACEHOLDER_NUM_OF] = {
     "__rand_int__", "__rand_1st__", "__rand_2nd__", "__rand_3rd__", "__rand_4th__",
     "__rand_5th__", "__rand_6th__", "__rand_7th__", "__rand_8th__", "__rand_9th__",
+    CLUSTER_PLACEHOLDER,
     VECTOR_PLACEHOLDER  // Vector placeholder
 };
-#define VECTOR_NUM_RAND_DIM (VECTOR_PLACEHOLDER_LEN/sizeof(float)) // Number of random dimensions for vector generation
-#define PLACEHOLDER_COUNT 11
 
 struct benchmarkThread;
 struct clusterNode;
@@ -201,7 +208,6 @@ typedef struct tagDistribution {
 } tagDistribution;
 
 typedef struct searchRuntimeConfig {
-    int n_prefill; /* Number of vectors to prefill before benchmarking */
     /* Tag distribution fields */
     tagDistribution *tag_dists; /* Array of tag distributions */
     int n_dists;               /* Number of distributions */
@@ -311,8 +317,9 @@ static int base_vector_dim = 0;
  * __rand_2nd, etc. within the RESP encoded command buffer. */
 static struct placeholders {
     size_t cmd_len;                     /* length of the command */
-    size_t count[PLACEHOLDER_COUNT];    /* number of each placeholder in the command */
-    size_t *indices[PLACEHOLDER_COUNT]; /* pointer to indices for each placeholder */
+    size_t count[PLACEHOLDER_NUM_OF];    /* number of each placeholder in the command */
+    size_t len[PLACEHOLDER_NUM_OF];      /* length of each placeholder */
+    size_t *indices[PLACEHOLDER_NUM_OF]; /* pointer to indices for each placeholder */
     size_t *index_data;                 /* allocation holding all index data */
 } placeholders;
 
@@ -338,14 +345,6 @@ typedef struct _client {
     uint64_t reuse : 1;
 } *client;
 
-/* Struct for prefil state */
-struct prefilState {
-    int done;               /* Prefill completed */
-    int total;              /* Total number of prefill commands */
-    _Atomic int progress;   /* Number of prefill commands completed */
-    long long start;        /* Start time */
-    long long end;          /* End time */
-}  prefill_state = {0,0,0,0,0};
 
 /* Threads. */
 typedef struct benchmarkThread {
@@ -355,13 +354,7 @@ typedef struct benchmarkThread {
     list *paused_clients;
 } benchmarkThread;
 
-/* Prefill thread data */
-typedef struct prefillThreadData {
-    int thread_id;
-    int start_index;
-    int end_index;
-    int total_count;
-} prefillThreadData;
+
 
 /* Cluster. */
 typedef struct clusterNode {
@@ -407,10 +400,9 @@ static int dictSdsKeyCompare(const void *key1, const void *key2);
 
 
 /* Fast unique vector generation using key-based deterministic randomization */
-static sds createVectorTemplate(int hash) {
-    uint64_t key_idx = hash ^ ((uint64_t)pthread_self() << 32);
+static sds createVectorTemplate(uint64_t key_idx) {
     int dim = config.search.vector_dim - VECTOR_NUM_RAND_DIM;
-    float *vector = zmalloc(dim * sizeof(float));
+    float *vector = zcalloc(config.search.vector_dim * sizeof(float));
     /* Use multiple hash passes for better distribution */
     uint64_t hash1 = key_idx * 0x9E3779B97F4A7C15ULL;
     uint64_t hash2 = key_idx * 0xBF58476D1CE4E5B9ULL;
@@ -428,8 +420,9 @@ static sds createVectorTemplate(int hash) {
         uint32_t bits = (uint32_t)(mixed >> 32);
         vector[i] = (float)((int32_t)bits) / 2147483648.0f;
     }
-    
-    /* Optional: Normalize vector for cosine similarity */
+
+    /* Optional: Normalize vector for cosine similarity
+     NOT REALLY WORKING BEFORE REPLACEMENT */
     if (strcmp(config.search.metric, "COSINE") == 0) {
         float norm = 0.0f;
         for (int i = 0; i < dim; i++) {
@@ -442,21 +435,13 @@ static sds createVectorTemplate(int hash) {
             }
         }
     }
-    sds vector_data = sdsempty();
-    vector_data = sdscatlen(vector_data, (char*)vector, dim * sizeof(float));
-    zfree(vector);
-    assert(sdslen(vector_data) == (config.search.vector_dim - VECTOR_NUM_RAND_DIM) * sizeof(float));    
     /* Append the 8-byte placeholder (will be replaced in-place later) */
-    vector_data = sdscatlen(vector_data, VECTOR_PLACEHOLDER, VECTOR_PLACEHOLDER_LEN);
-    
+    memcpy(vector + dim, VECTOR_PLACEHOLDER, VECTOR_PLACEHOLDER_LEN); // Append placeholder for random part
+    sds vector_data = sdsnewlen(vector, config.search.vector_dim * sizeof(float));
     /* Verify total size matches expected vector dimension */
     assert(sdslen(vector_data) == config.search.vector_dim * sizeof(float));
+    zfree(vector);
     return vector_data;
-}
-
-/* Optimized binary conversion without sds overhead */
-static inline void vectorToBinaryDirect(float *vector, int dim, char *output) {
-    memcpy(output, vector, dim * sizeof(float));
 }
 
 /* Print FT.SEARCH results in a user-friendly format */
@@ -617,9 +602,706 @@ static void parseIndexAttributes(valkeyReply *attrs, int indent, char **algorith
     }
 }
 
+static int getSearchIndexInfoCluster(sds index_name, searchIndex *index) {
+    UNUSED(index);
+    
+    if (!config.use_search) return -1;
+    
+    if (!config.cluster_primary_nodes || config.cluster_primary_node_count == 0) {
+        fprintf(stderr, "ERROR: No primary nodes available for cluster search info.\n");
+        return -1;
+    }
+    
+    /* Aggregate statistics across cluster */
+    typedef struct {
+        long long num_docs;
+        long long num_terms;
+        long long num_records;
+        long long curr_vectors;
+        long long curr_deleted_vectors;
+        long long hash_indexing_failures;
+        long long mutation_queue_size;
+        long long backfill_in_progress;
+        double backfill_complete_percent_sum;
+        int nodes_with_index;
+        int nodes_missing_index;
+        int nodes_unreachable;
+        char *algorithm_type;
+        char *distance_metric;
+        char *data_type;
+        char *default_score;
+        int vector_dim;
+        int ef_construction;
+        int ef_runtime;
+        int m;
+        long long capacity;
+        long long size;
+        int first_node_processed;
+    } cluster_index_stats;
+    
+    cluster_index_stats stats = {0};
+    
+    printf("\nSearch Index: %s\n", index_name);
+    printf("========================================\n");
+    printf("Querying %d primary nodes...\n\n", config.cluster_primary_node_count);
+    
+    /* Query each primary node */
+    for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
+        clusterNode *node = config.cluster_primary_nodes[node_idx];
+        if (!node) {
+            stats.nodes_unreachable++;
+            continue;
+        }
+        
+        valkeyContext *ctx = getValkeyContext(config.ct, node->ip, node->port);
+        if (!ctx) {
+            fprintf(stderr, "WARNING: Failed to connect to node %s:%d\n", 
+                    node->ip, node->port);
+            stats.nodes_unreachable++;
+            continue;
+        }
+        
+        sds cmd = sdscatprintf(sdsempty(), "FT.INFO %s", index_name);
+        valkeyReply *reply = valkeyCommand(ctx, cmd);
+        sdsfree(cmd);
+        
+        if (!reply) {
+            fprintf(stderr, "WARNING: Node %s:%d - No reply received\n", 
+                    node->ip, node->port);
+            stats.nodes_unreachable++;
+            valkeyFree(ctx);
+            continue;
+        }
+        
+        if (reply->type == VALKEY_REPLY_ERROR) {
+            if (strstr(reply->str, "Unknown index") || strstr(reply->str, "no such index")) {
+                printf("Node %s:%d - Index not found\n", node->ip, node->port);
+                stats.nodes_missing_index++;
+            } else {
+                fprintf(stderr, "WARNING: Node %s:%d - Error: %s\n", 
+                        node->ip, node->port, reply->str);
+                stats.nodes_unreachable++;
+            }
+            freeReplyObject(reply);
+            valkeyFree(ctx);
+            continue;
+        }
+        
+        if (reply->type != VALKEY_REPLY_ARRAY) {
+            fprintf(stderr, "WARNING: Node %s:%d - Unexpected reply type: %d\n", 
+                    node->ip, node->port, reply->type);
+            freeReplyObject(reply);
+            valkeyFree(ctx);
+            continue;
+        }
+        
+        stats.nodes_with_index++;
+        
+        /* Parse node-specific stats */
+        long long node_num_docs = 0;
+        long long node_curr_vectors = 0;
+        long long node_curr_deleted = 0;
+        
+        /* Parse all fields in a single pass */
+        for (size_t i = 0; i < reply->elements; i += 2) {
+            if (i + 1 >= reply->elements) break;
+            
+            valkeyReply *keyReply = reply->element[i];
+            valkeyReply *value = reply->element[i + 1];
+            
+            if (!keyReply || !value) continue;
+            if (keyReply->type != VALKEY_REPLY_STATUS) continue;
+            
+            char *key = keyReply->str;
+            if (!key) continue;
+            
+            /* Handle each field by name, checking both possible types */
+            if (strcmp(key, "num_docs") == 0) {
+                if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    node_num_docs = atoll(value->str);
+                } else if (value->type == VALKEY_REPLY_INTEGER) {
+                    node_num_docs = value->integer;
+                }
+                stats.num_docs += node_num_docs;
+            } else if (strcmp(key, "curr_vectors") == 0) {
+                if (value->type == VALKEY_REPLY_INTEGER) {
+                    node_curr_vectors = value->integer;
+                } else if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    node_curr_vectors = atoll(value->str);
+                }
+                stats.curr_vectors += node_curr_vectors;
+            } else if (strcmp(key, "curr_deleted_vectors") == 0) {
+                if (value->type == VALKEY_REPLY_INTEGER) {
+                    node_curr_deleted = value->integer;
+                } else if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    node_curr_deleted = atoll(value->str);
+                }
+                stats.curr_deleted_vectors += node_curr_deleted;
+            } else if (strcmp(key, "num_terms") == 0) {
+                if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    stats.num_terms += atoll(value->str);
+                } else if (value->type == VALKEY_REPLY_INTEGER) {
+                    stats.num_terms += value->integer;
+                }
+            } else if (strcmp(key, "num_records") == 0) {
+                if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    stats.num_records += atoll(value->str);
+                } else if (value->type == VALKEY_REPLY_INTEGER) {
+                    stats.num_records += value->integer;
+                }
+            } else if (strcmp(key, "hash_indexing_failures") == 0) {
+                if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    stats.hash_indexing_failures += atoll(value->str);
+                } else if (value->type == VALKEY_REPLY_INTEGER) {
+                    stats.hash_indexing_failures += value->integer;
+                }
+            } else if (strcmp(key, "mutation_queue_size") == 0) {
+                if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    stats.mutation_queue_size += atoll(value->str);
+                } else if (value->type == VALKEY_REPLY_INTEGER) {
+                    stats.mutation_queue_size += value->integer;
+                }
+            } else if (strcmp(key, "backfill_in_progress") == 0) {
+                if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    stats.backfill_in_progress += atoll(value->str);
+                } else if (value->type == VALKEY_REPLY_INTEGER) {
+                    stats.backfill_in_progress += value->integer;
+                }
+            } else if (strcmp(key, "backfill_complete_percent") == 0) {
+                if (value->type == VALKEY_REPLY_STRING && value->str) {
+                    stats.backfill_complete_percent_sum += atof(value->str);
+                }
+            } else if (strcmp(key, "index_definition") == 0 && value->type == VALKEY_REPLY_ARRAY && !stats.first_node_processed) {
+                /* Parse index definition */
+                for (size_t j = 0; j < value->elements; j += 2) {
+                    if (j + 1 >= value->elements) break;
+                    valkeyReply *defKeyReply = value->element[j];
+                    valkeyReply *defVal = value->element[j + 1];
+                    if (defKeyReply && defKeyReply->type == VALKEY_REPLY_STATUS && defVal) {
+                        if (strcmp(defKeyReply->str, "default_score") == 0) {
+                            if ((defVal->type == VALKEY_REPLY_STRING || defVal->type == VALKEY_REPLY_STATUS) && defVal->str) {
+                                if (!stats.default_score) {
+                                    stats.default_score = strdup(defVal->str);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (strcmp(key, "attributes") == 0 && value->type == VALKEY_REPLY_ARRAY && !stats.first_node_processed) {
+                /* Extract algorithm type using the existing function */
+                parseIndexAttributes(value, 0, &stats.algorithm_type);
+                /* TODO: Extract more detailed configuration here if needed */
+                stats.first_node_processed = 1;
+            }
+        }
+        
+        printf("Node %s:%d: docs=%lld, vectors=%lld, deleted=%lld\n",
+               node->ip, node->port, node_num_docs, node_curr_vectors, node_curr_deleted);
+        
+        freeReplyObject(reply);
+        valkeyFree(ctx);
+    }
+    
+    /* Print aggregated results - with NULL checks */
+    if (stats.nodes_with_index > 0) {
+        if (stats.default_score) {
+            printf("default_score: %s\n", stats.default_score);
+        }
+        
+        printf("num_docs: %lld\n", stats.num_docs);
+        printf("num_terms: %lld\n", stats.num_terms);
+        printf("num_records: %lld\n", stats.num_records);
+        printf("hash_indexing_failures: %lld\n", stats.hash_indexing_failures);
+        printf("backfill_in_progress: %lld\n", stats.backfill_in_progress);
+        
+        double avg_backfill = stats.backfill_complete_percent_sum / stats.nodes_with_index;
+        printf("backfill_complete_percent: %.6f (%.1f%%)\n", avg_backfill, avg_backfill * 100);
+        printf("mutation_queue_size: %lld\n", stats.mutation_queue_size);
+        
+        /* Algorithm info - NULL check */
+        if (stats.algorithm_type) {
+            printf("\n*** INDEX TYPE: %s ***\n", stats.algorithm_type);
+            if (strcmp(stats.algorithm_type, "HNSW") == 0) {
+                printf("Using Hierarchical Navigable Small World graph for approximate nearest neighbor search\n");
+            } else if (strcmp(stats.algorithm_type, "FLAT") == 0) {
+                printf("Using brute-force exact nearest neighbor search\n");
+            }
+        }
+        
+        /* Index Attributes */
+        printf("\nIndex Attributes:\n");
+        printf("  Vector Configuration:\n");
+        if (stats.vector_dim > 0) {
+            printf("    dimensions: %d\n", stats.vector_dim);
+        }
+        if (stats.distance_metric) {
+            printf("    distance_metric: %s\n", stats.distance_metric);
+        }
+        if (stats.data_type) {
+            printf("    data_type: %s\n", stats.data_type);
+        }
+        if (stats.capacity > 0) {
+            printf("    total capacity: %lld\n", stats.capacity);
+        }
+        if (stats.size > 0) {
+            printf("    total size: %lld\n", stats.size);
+        }
+        
+        /* HNSW params - NULL check for algorithm_type */
+        if (stats.algorithm_type && strcmp(stats.algorithm_type, "HNSW") == 0) {
+            printf("    HNSW Parameters:\n");
+            if (stats.m > 0) printf("      m: %d\n", stats.m);
+            if (stats.ef_construction > 0) printf("      ef_construction: %d\n", stats.ef_construction);
+            if (stats.ef_runtime > 0) printf("      ef_runtime: %d\n", stats.ef_runtime);
+        }
+        
+        printf("  curr_vectors: %lld\n", stats.curr_vectors);
+        printf("  curr_deleted_vectors: %lld\n", stats.curr_deleted_vectors);
+        
+        /* Cluster distribution */
+        if (stats.nodes_with_index > 1) {
+            printf("\nCluster Distribution:\n");
+            printf("  Nodes with index: %d/%d\n", stats.nodes_with_index, config.cluster_primary_node_count);
+            printf("  Average docs per node: %.0f\n", (double)stats.num_docs / stats.nodes_with_index);
+            printf("  Average vectors per node: %.0f\n", (double)stats.curr_vectors / stats.nodes_with_index);
+        }
+    } else {
+        printf("\n*** ERROR: Index '%s' not found on any reachable nodes ***\n", index_name);
+    }
+    
+    printf("========================================\n");
+    
+    /* Cleanup */
+    if (stats.algorithm_type) free(stats.algorithm_type);
+    if (stats.distance_metric) free(stats.distance_metric);
+    if (stats.data_type) free(stats.data_type);
+    if (stats.default_score) free(stats.default_score);
+    
+    return (stats.nodes_with_index > 0) ? 0 : -1;
+}
+
+// static int getSearchIndexInfoCluster(sds index_name, searchIndex *index) {
+//     UNUSED(index);
+    
+//     if (!config.use_search) return -1;
+    
+//     if (!config.cluster_primary_nodes || config.cluster_primary_node_count == 0) {
+//         fprintf(stderr, "ERROR: No primary nodes available for cluster search info.\n");
+//         return -1;
+//     }
+    
+//     /* Aggregate statistics across cluster */
+//     typedef struct {
+//         long long num_docs;
+//         long long num_terms;
+//         long long num_records;
+//         long long curr_vectors;
+//         long long curr_deleted_vectors;
+//         long long hash_indexing_failures;
+//         long long mutation_queue_size;
+//         long long backfill_in_progress;
+//         double backfill_complete_percent_sum;
+//         int nodes_with_index;
+//         int nodes_missing_index;
+//         int nodes_unreachable;
+//         char *algorithm_type;
+//         int vector_dim;
+//         int ef_construction;
+//         int ef_runtime;
+//         int m;
+//         int first_node_processed;
+//     } cluster_index_stats;
+    
+//     cluster_index_stats stats = {0};
+    
+//     printf("========================================\n");
+//     printf("Cluster-wide Search Index: %s\n", index_name);
+//     printf("========================================\n");
+//     printf("Querying %d primary nodes...\n\n", config.cluster_primary_node_count);
+    
+//     /* Query each primary node */
+//     for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
+//         clusterNode *node = config.cluster_primary_nodes[node_idx];
+//         if (!node) {
+//             stats.nodes_unreachable++;
+//             continue;
+//         }
+        
+//         valkeyContext *ctx = getValkeyContext(config.ct, node->ip, node->port);
+//         if (!ctx) {
+//             fprintf(stderr, "WARNING: Failed to connect to node %s:%d\n", 
+//                     node->ip, node->port);
+//             stats.nodes_unreachable++;
+//             continue;
+//         }
+        
+//         /* FIXED: Match the pattern from getSearchIndexInfo */
+//         sds cmd = sdscatprintf(sdsempty(), "FT.INFO %s", index_name);
+//         valkeyReply *reply = valkeyCommand(ctx, cmd);
+//         sdsfree(cmd);
+        
+//         /* Handle reply */
+//         if (!reply) {
+//             fprintf(stderr, "WARNING: Node %s:%d - No reply received\n", 
+//                     node->ip, node->port);
+//             stats.nodes_unreachable++;
+//             valkeyFree(ctx);
+//             continue;
+//         }
+        
+//         if (reply->type == VALKEY_REPLY_ERROR) {
+//             if (strstr(reply->str, "Unknown index") || strstr(reply->str, "no such index")) {
+//                 printf("Node %s:%d - Index not found\n", node->ip, node->port);
+//                 stats.nodes_missing_index++;
+//             } else {
+//                 fprintf(stderr, "WARNING: Node %s:%d - Error: %s\n", 
+//                         node->ip, node->port, reply->str);
+//                 stats.nodes_unreachable++;
+//             }
+//             freeReplyObject(reply);
+//             valkeyFree(ctx);
+//             continue;
+//         }
+        
+//         if (reply->type != VALKEY_REPLY_ARRAY) {
+//             fprintf(stderr, "WARNING: Node %s:%d - Unexpected reply type: %d\n", 
+//                     node->ip, node->port, reply->type);
+//             freeReplyObject(reply);
+//             valkeyFree(ctx);
+//             continue;
+//         }
+        
+//         stats.nodes_with_index++;
+        
+//         /* Parse node-specific stats */
+//         long long node_num_docs = 0;
+//         long long node_curr_vectors = 0;
+//         long long node_curr_deleted = 0;
+        
+//         for (size_t i = 0; i < reply->elements; i += 2) {
+//             if (i + 1 >= reply->elements) break;
+            
+//             valkeyReply *keyReply = reply->element[i];
+//             valkeyReply *value = reply->element[i + 1];
+            
+//             if (!keyReply || !value) continue;
+//             if (keyReply->type != VALKEY_REPLY_STATUS) continue;
+            
+//             const char *key = keyReply->str;
+//             if (!key) continue;
+            
+//             /* Parse the same fields as in getSearchIndexInfo */
+//             if (strcmp(key, "num_docs") == 0) {
+//                 if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     node_num_docs = atoll(value->str);
+//                     stats.num_docs += node_num_docs;
+//                 } else if (value->type == VALKEY_REPLY_INTEGER) {
+//                     node_num_docs = value->integer;
+//                     stats.num_docs += node_num_docs;
+//                 }
+//             } else if (strcmp(key, "num_terms") == 0) {
+//                 if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     stats.num_terms += atoll(value->str);
+//                 } else if (value->type == VALKEY_REPLY_INTEGER) {
+//                     stats.num_terms += value->integer;
+//                 }
+//             } else if (strcmp(key, "num_records") == 0) {
+//                 if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     stats.num_records += atoll(value->str);
+//                 } else if (value->type == VALKEY_REPLY_INTEGER) {
+//                     stats.num_records += value->integer;
+//                 }
+//             } else if (strcmp(key, "hash_indexing_failures") == 0) {
+//                 if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     stats.hash_indexing_failures += atoll(value->str);
+//                 } else if (value->type == VALKEY_REPLY_INTEGER) {
+//                     stats.hash_indexing_failures += value->integer;
+//                 }
+//             } else if (strcmp(key, "mutation_queue_size") == 0) {
+//                 if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     stats.mutation_queue_size += atoll(value->str);
+//                 } else if (value->type == VALKEY_REPLY_INTEGER) {
+//                     stats.mutation_queue_size += value->integer;
+//                 }
+//             } else if (strcmp(key, "backfill_in_progress") == 0) {
+//                 if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     stats.backfill_in_progress += atoll(value->str);
+//                 } else if (value->type == VALKEY_REPLY_INTEGER) {
+//                     stats.backfill_in_progress += value->integer;
+//                 }
+//             } else if (strcmp(key, "backfill_complete_percent") == 0) {
+//                 if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     stats.backfill_complete_percent_sum += atof(value->str);
+//                 }
+//             } else if (strcmp(key, "curr_vectors") == 0) {
+//                 if (value->type == VALKEY_REPLY_INTEGER) {
+//                     node_curr_vectors = value->integer;
+//                     stats.curr_vectors += node_curr_vectors;
+//                 } else if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     node_curr_vectors = atoll(value->str);
+//                     stats.curr_vectors += node_curr_vectors;
+//                 }
+//             } else if (strcmp(key, "curr_deleted_vectors") == 0) {
+//                 if (value->type == VALKEY_REPLY_INTEGER) {
+//                     node_curr_deleted = value->integer;
+//                     stats.curr_deleted_vectors += node_curr_deleted;
+//                 } else if (value->type == VALKEY_REPLY_STRING && value->str) {
+//                     node_curr_deleted = atoll(value->str);
+//                     stats.curr_deleted_vectors += node_curr_deleted;
+//                 }
+//             } else if (strcmp(key, "attributes") == 0 && value->type == VALKEY_REPLY_ARRAY && !stats.first_node_processed) {
+//                 /* Extract algorithm type from first node */
+//                 parseIndexAttributes(value, 0, &stats.algorithm_type);
+//                 stats.first_node_processed = 1;
+//             }
+//         }
+        
+//         printf("Node %s:%d - Docs: %lld, Vectors: %lld (Deleted: %lld)\n",
+//                node->ip, node->port, node_num_docs, node_curr_vectors, node_curr_deleted);
+        
+//         freeReplyObject(reply);
+//         valkeyFree(ctx);
+//     }
+    
+//     /* Print aggregated results */
+//     printf("\n========================================\n");
+//     printf("Cluster Aggregate Statistics:\n");
+//     printf("========================================\n");
+    
+//     printf("Node Status:\n");
+//     printf("  With index: %d/%d\n", stats.nodes_with_index, config.cluster_primary_node_count);
+//     if (stats.nodes_missing_index > 0) {
+//         printf("  Missing index: %d\n", stats.nodes_missing_index);
+//     }
+//     if (stats.nodes_unreachable > 0) {
+//         printf("  Unreachable: %d\n", stats.nodes_unreachable);
+//     }
+    
+//     if (stats.nodes_with_index > 0) {
+//         if (stats.algorithm_type) {
+//             printf("\nIndex Type: %s\n", stats.algorithm_type);
+//         }
+        
+//         printf("\nData Statistics:\n");
+//         printf("  Total documents: %lld\n", stats.num_docs);
+//         printf("  Total vectors: %lld\n", stats.curr_vectors);
+//         if (stats.curr_deleted_vectors > 0) {
+//             printf("  Deleted vectors: %lld\n", stats.curr_deleted_vectors);
+//         }
+//         printf("  Total terms: %lld\n", stats.num_terms);
+//         printf("  Total records: %lld\n", stats.num_records);
+        
+//         printf("\nOperational Statistics:\n");
+//         if (stats.hash_indexing_failures > 0) {
+//             printf("  Hash indexing failures: %lld\n", stats.hash_indexing_failures);
+//         }
+//         if (stats.mutation_queue_size > 0) {
+//             printf("  Mutation queue size: %lld\n", stats.mutation_queue_size);
+//         }
+//         if (stats.backfill_in_progress > 0) {
+//             printf("  Nodes with backfill in progress: %lld\n", stats.backfill_in_progress);
+//         }
+        
+//         double avg_backfill = stats.backfill_complete_percent_sum / stats.nodes_with_index;
+//         printf("  Average backfill complete: %.2f%%\n", avg_backfill * 100);
+        
+//         if (stats.nodes_with_index > 1) {
+//             printf("\nDistribution:\n");
+//             printf("  Avg docs/node: %.0f\n", (double)stats.num_docs / stats.nodes_with_index);
+//             printf("  Avg vectors/node: %.0f\n", (double)stats.curr_vectors / stats.nodes_with_index);
+//         }
+//     } else {
+//         printf("\n*** ERROR: Index '%s' not found on any reachable nodes ***\n", index_name);
+//     }
+    
+//     printf("========================================\n\n");
+    
+//     /* Cleanup */
+//     if (stats.algorithm_type) {
+//         free(stats.algorithm_type);
+//     }
+    
+//     return (stats.nodes_with_index > 0) ? 0 : -1;
+// }
+
+// static int getSearchIndexInfoCluster(sds index_name, searchIndex *index) {
+//     UNUSED(index);
+    
+//     if (!config.use_search) return -1;
+    
+//     if (!config.cluster_primary_nodes || config.cluster_primary_node_count == 0) {
+//         fprintf(stderr, "ERROR: No primary nodes available for cluster search info.\n");
+//         return -1;
+//     }
+    
+//     /* Aggregate statistics across cluster */
+//     struct {
+//         long long num_docs;
+//         long long num_terms;
+//         long long num_records;
+//         long long curr_vectors;
+//         long long curr_deleted_vectors;
+//         long long hash_indexing_failures;
+//         long long mutation_queue_size;
+//         double backfill_complete_percent_sum;
+//         int nodes_with_index;
+//         int nodes_missing_index;
+//         char *algorithm_type;
+//     } stats = {0};
+    
+//     printf("========================================\n");
+//     printf("Cluster-wide Search Index: %s\n", index_name);
+//     printf("========================================\n");
+//     printf("Querying %d primary nodes...\n\n", config.cluster_primary_node_count);
+    
+//     /* Query each primary node */
+//     for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
+//         clusterNode *node = config.cluster_primary_nodes[node_idx];
+//         if (!node) continue;
+        
+//         valkeyContext *ctx = getValkeyContext(config.ct, node->ip, node->port);
+//         if (ctx == NULL) {
+//             fprintf(stderr, "Failed to connect to node %s:%d for search info.\n", 
+//                     node->ip, node->port);
+//             continue;
+//         }
+        
+//         /* EXACT pattern from getSearchIndexInfo */
+//         sds cmd = sdscatprintf(sdsempty(), "FT.INFO %s", index_name);
+//         valkeyReply *reply = valkeyCommand(ctx, cmd);
+//         sdsfree(cmd);
+        
+//         if (reply == NULL || reply->type != VALKEY_REPLY_ARRAY) {
+//             if (reply && reply->type == VALKEY_REPLY_ERROR) {
+//                 if (strstr(reply->str, "Unknown index") || strstr(reply->str, "no such index")) {
+//                     printf("Node %s:%d - Index not found\n", node->ip, node->port);
+//                     stats.nodes_missing_index++;
+//                 }
+//             }
+//             if (reply) freeReplyObject(reply);
+//             valkeyFree(ctx);
+//             continue;
+//         }
+        
+//         stats.nodes_with_index++;
+        
+//         /* Parse exactly like getSearchIndexInfo does */
+//         long long node_num_docs = 0;
+//         long long node_curr_vectors = 0;
+//         long long node_curr_deleted = 0;
+        
+//         for (size_t i = 0; i < reply->elements; i += 2) {
+//             if (i + 1 >= reply->elements) break;
+            
+//             valkeyReply *keyReply = reply->element[i];
+//             valkeyReply *value = reply->element[i + 1];
+            
+//             if (!keyReply || !value) continue;
+//             if (keyReply->type != VALKEY_REPLY_STATUS) continue;
+            
+//             char *key = keyReply->str;
+            
+//             /* Follow exact pattern from getSearchIndexInfo */
+//             if (value->type == VALKEY_REPLY_INTEGER) {
+//                 if (strcmp(key, "curr_vectors") == 0) {
+//                     node_curr_vectors = value->integer;
+//                     stats.curr_vectors += node_curr_vectors;
+//                 } else if (strcmp(key, "curr_deleted_vectors") == 0) {
+//                     node_curr_deleted = value->integer;
+//                     stats.curr_deleted_vectors += node_curr_deleted;
+//                 }
+//             } else if ((value->type == VALKEY_REPLY_STRING || value->type == VALKEY_REPLY_STATUS)) {
+//                 if (strcmp(key, "num_docs") == 0) {
+//                     node_num_docs = atoll(value->str);
+//                     stats.num_docs += node_num_docs;
+//                 } else if (strcmp(key, "num_terms") == 0) {
+//                     stats.num_terms += atoll(value->str);
+//                 } else if (strcmp(key, "num_records") == 0) {
+//                     stats.num_records += atoll(value->str);
+//                 } else if (strcmp(key, "hash_indexing_failures") == 0) {
+//                     stats.hash_indexing_failures += atoll(value->str);
+//                 } else if (strcmp(key, "mutation_queue_size") == 0) {
+//                     stats.mutation_queue_size += atoll(value->str);
+//                 } else if (strcmp(key, "backfill_complete_percent") == 0) {
+//                     stats.backfill_complete_percent_sum += atof(value->str);
+//                 }
+//             } else if (strcmp(key, "attributes") == 0 && value->type == VALKEY_REPLY_ARRAY) {
+//                 /* Only extract algorithm from first node */
+//                 if (!stats.algorithm_type) {
+//                     parseIndexAttributes(value, 2, &stats.algorithm_type);
+//                 }
+//             }
+//         }
+        
+//         printf("Node %s:%d - Docs: %lld, Vectors: %lld (Deleted: %lld)\n",
+//                node->ip, node->port, node_num_docs, node_curr_vectors, node_curr_deleted);
+        
+//         freeReplyObject(reply);
+//         valkeyFree(ctx);
+//     }
+    
+//     /* Print aggregated results */
+//     printf("\n========================================\n");
+//     printf("Cluster Aggregate Statistics:\n");
+//     printf("========================================\n");
+//     printf("Node Status:\n");
+//     printf("  With index: %d/%d\n", stats.nodes_with_index, config.cluster_primary_node_count);
+//     if (stats.nodes_missing_index > 0) {
+//         printf("  Missing index: %d\n", stats.nodes_missing_index);
+//     }
+    
+//     if (stats.nodes_with_index > 0) {
+//         if (stats.algorithm_type) {
+//             printf("\n*** INDEX TYPE: %s ***\n", stats.algorithm_type);
+//             if (strcmp(stats.algorithm_type, "HNSW") == 0) {
+//                 printf("Using Hierarchical Navigable Small World graph for approximate nearest neighbor search\n");
+//             } else if (strcmp(stats.algorithm_type, "FLAT") == 0) {
+//                 printf("Using brute-force exact nearest neighbor search\n");
+//             }
+//         }
+        
+//         printf("\nData Statistics:\n");
+//         printf("  Total documents: %lld\n", stats.num_docs);
+//         printf("  Total vectors: %lld\n", stats.curr_vectors);
+//         if (stats.curr_deleted_vectors > 0) {
+//             printf("  Deleted vectors: %lld\n", stats.curr_deleted_vectors);
+//         }
+//         printf("  Total terms: %lld\n", stats.num_terms);
+//         printf("  Total records: %lld\n", stats.num_records);
+        
+//         printf("\nOperational Statistics:\n");
+//         if (stats.hash_indexing_failures > 0) {
+//             printf("  Hash indexing failures: %lld\n", stats.hash_indexing_failures);
+//         }
+//         if (stats.mutation_queue_size > 0) {
+//             printf("  Mutation queue size: %lld\n", stats.mutation_queue_size);
+//         }
+        
+//         double avg_backfill = stats.backfill_complete_percent_sum / stats.nodes_with_index;
+//         printf("  Average backfill complete: %.2f%%\n", avg_backfill * 100);
+        
+//         if (stats.nodes_with_index > 1) {
+//             printf("\nDistribution:\n");
+//             printf("  Avg docs/node: %.0f\n", (double)stats.num_docs / stats.nodes_with_index);
+//             printf("  Avg vectors/node: %.0f\n", (double)stats.curr_vectors / stats.nodes_with_index);
+//         }
+//     } else {
+//         printf("\n*** ERROR: Index '%s' not found on any reachable nodes ***\n", index_name);
+//     }
+    
+//     printf("========================================\n\n");
+    
+//     if (stats.algorithm_type) free(stats.algorithm_type);
+    
+//     return (stats.nodes_with_index > 0) ? 0 : -1;
+// }
+
 static int getSearchIndexInfo(sds index_name, searchIndex *index) {
     UNUSED(index); // TODO: for future validation of index configuration if index exists
     if (!config.use_search) return -1;
+    if (config.cluster_mode) {
+        return getSearchIndexInfoCluster(index_name, index);
+    }   
     valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
     if (ctx == NULL) {
         fprintf(stderr, "Failed to connect to Valkey server for search info.\n");
@@ -712,56 +1394,206 @@ static int getSearchIndexInfo(sds index_name, searchIndex *index) {
     return 0; // Success
 }
 
+// static void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+//                           long long *search_total_docs, long long *search_ingest_field_vector, 
+//                           long long *search_background_indexing_status) {
+//     if (!config.use_search) return;
+//     valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+//     if (ctx == NULL) {
+//         fprintf(stderr, "Failed to connect to Valkey server for search info.\n");
+//         return;
+//     }
+    
+//     valkeyReply *reply = valkeyCommand(ctx, "INFO SEARCH");
+//     if (reply == NULL || reply->type != VALKEY_REPLY_STRING) {
+//         fprintf(stderr, "Failed to get search index info\n");
+//         if (reply) freeReplyObject(reply);
+//         valkeyFree(ctx);
+//         return;
+//     }
+    
+//     printf("Search index info:\n");
+    
+//     char *info = strdup(reply->str);
+//     char *line = strtok(info, "\r\n");
+    
+//     while (line != NULL) {
+//         if (*line && *line != '#') {
+//             char *colon = strchr(line, ':');
+//             if (colon) {
+//                 *colon = '\0';
+//                 char *key = line;
+//                 char *value = colon + 1;
+//                 if (strcmp(key, "search_used_memory_bytes") == 0) {
+//                     *search_memory = atoll(value);
+//                 } else if (strcmp(key, "search_index_reclaimable_memory") == 0) {
+//                     *search_reclaimable = atoll(value);
+//                 } else if (strcmp(key, "search_total_indexed_documents") == 0) {
+//                     *search_total_docs = atoll(value);
+//                 } else if (strcmp(key, "search_ingest_field_vector") == 0) {
+//                     *search_ingest_field_vector = atoll(value);
+//                 } else if (strcmp(key, "search_background_indexing_status") == 0) {
+//                     *search_background_indexing_status = atoll(value);
+//                 }
+//             }
+//         }
+//         line = strtok(NULL, "\r\n");
+//     }
+
+//     free(info);
+//     freeReplyObject(reply);
+//     valkeyFree(ctx);
+//     getSearchIndexInfo(config.search.name, NULL); /* Fetch index info after getting search info */
+// }
+
 static void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
-                          long long *search_total_docs, long long *search_ingest_field_vector, 
-                          long long *search_background_indexing_status) {
+                                 long long *search_total_docs, long long *search_ingest_field_vector, 
+                                 long long *search_background_indexing_status) {
     if (!config.use_search) return;
-    valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
-    if (ctx == NULL) {
-        fprintf(stderr, "Failed to connect to Valkey server for search info.\n");
+    
+    if (!config.cluster_primary_nodes || config.cluster_primary_node_count == 0) {
+        fprintf(stderr, "No primary nodes available for cluster search info.\n");
         return;
     }
     
-    valkeyReply *reply = valkeyCommand(ctx, "INFO SEARCH");
-    if (reply == NULL || reply->type != VALKEY_REPLY_STRING) {
-        fprintf(stderr, "Failed to get search index info\n");
-        if (reply) freeReplyObject(reply);
-        valkeyFree(ctx);
-        return;
-    }
+    /* Initialize aggregated values */
+    *search_memory = 0;
+    *search_reclaimable = 0;
+    *search_total_docs = 0;
+    *search_ingest_field_vector = 0;
+    *search_background_indexing_status = 0;
     
-    printf("Search index info:\n");
+    printf("Search index info (cluster-wide):\n");
+    printf("========================================\n");
     
-    char *info = strdup(reply->str);
-    char *line = strtok(info, "\r\n");
+    int nodes_with_search = 0;
+    int nodes_unreachable = 0;
     
-    while (line != NULL) {
-        if (*line && *line != '#') {
-            char *colon = strchr(line, ':');
-            if (colon) {
-                *colon = '\0';
-                char *key = line;
-                char *value = colon + 1;
-                if (strcmp(key, "search_used_memory_bytes") == 0) {
-                    *search_memory = atoll(value);
-                } else if (strcmp(key, "search_index_reclaimable_memory") == 0) {
-                    *search_reclaimable = atoll(value);
-                } else if (strcmp(key, "search_total_indexed_documents") == 0) {
-                    *search_total_docs = atoll(value);
-                } else if (strcmp(key, "search_ingest_field_vector") == 0) {
-                    *search_ingest_field_vector = atoll(value);
-                } else if (strcmp(key, "search_background_indexing_status") == 0) {
-                    *search_background_indexing_status = atoll(value);
+    /* Query each primary node */
+    for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
+        clusterNode *node = config.cluster_primary_nodes[node_idx];
+        if (!node) {
+            nodes_unreachable++;
+            continue;
+        }
+        
+        valkeyContext *ctx = getValkeyContext(config.ct, node->ip, node->port);
+        if (!ctx) {
+            fprintf(stderr, "WARNING: Failed to connect to node %s:%d for search info.\n", 
+                    node->ip, node->port);
+            nodes_unreachable++;
+            continue;
+        }
+        
+        valkeyReply *reply = valkeyCommand(ctx, "INFO SEARCH");
+        if (!reply || reply->type != VALKEY_REPLY_STRING) {
+            if (reply && reply->type == VALKEY_REPLY_ERROR) {
+                fprintf(stderr, "WARNING: Node %s:%d - Error: %s\n", 
+                        node->ip, node->port, reply->str);
+            } else {
+                fprintf(stderr, "WARNING: Failed to get search info from node %s:%d\n", 
+                        node->ip, node->port);
+            }
+            if (reply) freeReplyObject(reply);
+            valkeyFree(ctx);
+            nodes_unreachable++;
+            continue;
+        }
+        
+        /* Parse per-node INFO SEARCH response */
+        long long node_memory = 0;
+        long long node_reclaimable = 0;
+        long long node_total_docs = 0;
+        long long node_ingest_field_vector = 0;
+        long long node_background_indexing = 0;
+        
+        char *info = strdup(reply->str);
+        if (!info) {
+            freeReplyObject(reply);
+            valkeyFree(ctx);
+            continue;
+        }
+        
+        char *line = strtok(info, "\r\n");
+        while (line != NULL) {
+            if (*line && *line != '#') {
+                char *colon = strchr(line, ':');
+                if (colon) {
+                    *colon = '\0';
+                    char *key = line;
+                    char *value = colon + 1;
+                    
+                    if (strcmp(key, "search_used_memory_bytes") == 0) {
+                        node_memory = atoll(value);
+                        *search_memory += node_memory;
+                    } else if (strcmp(key, "search_index_reclaimable_memory") == 0) {
+                        node_reclaimable = atoll(value);
+                        *search_reclaimable += node_reclaimable;
+                    } else if (strcmp(key, "search_total_indexed_documents") == 0) {
+                        node_total_docs = atoll(value);
+                        *search_total_docs += node_total_docs;
+                    } else if (strcmp(key, "search_ingest_field_vector") == 0) {
+                        node_ingest_field_vector = atoll(value);
+                        *search_ingest_field_vector += node_ingest_field_vector;
+                    } else if (strcmp(key, "search_background_indexing_status") == 0) {
+                        node_background_indexing = atoll(value);
+                        *search_background_indexing_status += node_background_indexing;
+                    }
                 }
             }
+            line = strtok(NULL, "\r\n");
         }
-        line = strtok(NULL, "\r\n");
+        
+        nodes_with_search++;
+        
+        /* Print per-node statistics */
+        printf("Node %s:%d:\n", node->ip, node->port);
+        printf("  Memory: %lld MB, Reclaimable: %lld MB\n", 
+               node_memory / (1024 * 1024), node_reclaimable / (1024 * 1024));
+        printf("  Documents: %lld, Ingest vectors: %lld\n", 
+               node_total_docs, node_ingest_field_vector);
+        if (node_background_indexing > 0) {
+            printf("  Background indexing: %lld\n", node_background_indexing);
+        }
+        
+        free(info);
+        freeReplyObject(reply);
+        valkeyFree(ctx);
     }
-
-    free(info);
-    freeReplyObject(reply);
-    valkeyFree(ctx);
-    getSearchIndexInfo(config.search.name, NULL); /* Fetch index info after getting search info */
+    
+    /* Print aggregated statistics */
+    printf("\n========================================\n");
+    printf("Cluster Aggregate Search Statistics:\n");
+    printf("========================================\n");
+    printf("Nodes with search info: %d/%d\n", 
+           nodes_with_search, config.cluster_primary_node_count);
+    if (nodes_unreachable > 0) {
+        printf("Unreachable nodes: %d\n", nodes_unreachable);
+    }
+    
+    if (nodes_with_search > 0) {
+        printf("\nTotal across cluster:\n");
+        printf("  Search memory: %lld MB\n", *search_memory / (1024 * 1024));
+        printf("  Reclaimable memory: %lld MB\n", *search_reclaimable / (1024 * 1024));
+        printf("  Total indexed documents: %lld\n", *search_total_docs);
+        printf("  Total ingest field vectors: %lld\n", *search_ingest_field_vector);
+        if (*search_background_indexing_status > 0) {
+            printf("  Nodes with background indexing: %lld\n", *search_background_indexing_status);
+        }
+        
+        /* Distribution metrics */
+        if (nodes_with_search > 1) {
+            printf("\nAverage per node:\n");
+            printf("  Memory: %lld MB\n", 
+                   (*search_memory / nodes_with_search) / (1024 * 1024));
+            printf("  Documents: %lld\n", *search_total_docs / nodes_with_search);
+        }
+    }
+    
+    printf("========================================\n\n");
+    
+    /* Call the index info function */
+    getSearchIndexInfo(config.search.name, NULL);
 }
 
 int isSelected(int is_primary) {
@@ -892,7 +1724,7 @@ static void initBaseVector(int dim) {
     
     if (!base_vector) {
         base_vector_dim = dim;
-        base_vector = zmalloc(sizeof(float) * dim);
+        base_vector = zcalloc(sizeof(float) * dim);
         
         /* Initialize with random values */
         init_genrand64(42); /* Fixed seed for reproducibility */
@@ -903,14 +1735,6 @@ static void initBaseVector(int dim) {
         }
     }
 }
-
-/* Convert float array to binary format for vector search queries */
-static sds vectorToBinary(float *vector, int dim) {
-    sds result = sdsnewlen(NULL, dim * sizeof(float));
-    memcpy(result, vector, dim * sizeof(float));
-    return result;
-}
-static void *searchPrefillWorkerThreadCluster(void *arg) ;
 
 static sds getVectorKey(void) {
     sds key;
@@ -926,36 +1750,36 @@ static sds getVectorKey(void) {
 
 /* Benchmark function for vector operations with cluster awareness */
 static int createVectorInsertCmdTemplate(char **cmd) {
-    int len;    
+    int len;   
     /* Generate key with appropriate cluster tag */
     sds key = getVectorKey();
     /* Validation checks */
-    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim < VECTOR_NUM_RAND_DIM);    
+    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim > VECTOR_NUM_RAND_DIM);    
     /* Build vector data: fixed part + placeholder */
-    sds vector_data = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32)); // "someusername" as base
+    sds vector_binary = createVectorTemplate(0x736f6d6575736572); // "someusername" as base
 
     
     /* Build HSET command */
     if (config.search.tag_field && config.search.curr_conf.tag_dists) {
         sds selected_tag = selectTagByDistribution();
-        len = valkeyFormatCommand(&cmd, 
+        len = valkeyFormatCommand(cmd, 
             "HSET %b %s %b %s %s", 
             key, sdslen(key), 
             config.search.vector_field,
-            vector_data, sdslen(vector_data),
+            vector_binary, sdslen(vector_binary),
             config.search.tag_field, 
             selected_tag ? selected_tag : "");
         if (selected_tag) sdsfree(selected_tag);
     } else {
-        len = valkeyFormatCommand(&cmd, 
+        len = valkeyFormatCommand(cmd, 
             "HSET %b %s %b", 
             key, sdslen(key), 
             config.search.vector_field,
-            vector_data, sdslen(vector_data));
+            vector_binary, sdslen(vector_binary));
     }
     
     sdsfree(key);
-    sdsfree(vector_data);            
+    sdsfree(vector_binary);
     return len;
 }
 
@@ -963,9 +1787,13 @@ static int createVectorInsertCmdTemplate(char **cmd) {
 static int createSearchCmdTemplate(char **cmd) {
     int len;
     /* Validation checks */
-    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim < VECTOR_NUM_RAND_DIM);    
+    printf("Creating FT.SEARCH command template for index '%s' dimension %d/%ld k %d ef_search %d vector_field %s tag_field %s tag_filter %s nocontent %d\n", 
+        config.search.name, config.search.vector_dim, VECTOR_NUM_RAND_DIM, 
+        config.search.k, config.search.ef_search, config.search.vector_field, 
+        config.search.tag_field, config.search.curr_conf.tag_filter, config.search.nocontent);
+    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim > VECTOR_NUM_RAND_DIM);    
     /* Build vector data: fixed part + placeholder */
-    sds vector_data = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32)); // "someusername" as base
+    sds vector_binary = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32)); // "someusername" as base
     
     /* Build KNN query */
     sds query;
@@ -987,13 +1815,13 @@ static int createSearchCmdTemplate(char **cmd) {
     
     /* Build FT.SEARCH command */
     if (config.search.nocontent) {
-        len = valkeyFormatCommand(&cmd, 
+        len = valkeyFormatCommand(cmd, 
             "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b DIALECT 2", 
             config.search.name, sdslen(config.search.name), 
             query, sdslen(query), 
             vector_binary, sdslen(vector_binary));
     } else {
-        len = valkeyFormatCommand(&cmd,
+        len = valkeyFormatCommand(cmd,
             "FT.SEARCH %b %b PARAMS 2 query_vector %b DIALECT 2", 
             config.search.name, sdslen(config.search.name),
             query, sdslen(query), 
@@ -1002,319 +1830,57 @@ static int createSearchCmdTemplate(char **cmd) {
     
     sdsfree(query);
     sdsfree(vector_binary);
-    zfree(vector);
     return len;
 }
 
-/* Non-cluster prefill worker thread */
-static void *searchPrefillWorkerThread(void *arg) {    
-    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim < VECTOR_NUM_RAND_DIM);    
-    prefillThreadData *data = (prefillThreadData *)arg;
-    
-    /* Connect to single node */
-    const char *ip = config.conn_info.hostip;
-    int port = config.conn_info.hostport;
-    
-    valkeyContext *ctx = getValkeyContext(config.ct, ip, port);
-    if (!ctx) {
-        fprintf(stderr, "Thread %d: Failed to connect to %s:%d\n", 
-                data->thread_id, ip, port);
-        return NULL;
-    }
-
-    int vec_dim = config.search.vector_dim;
-    float *vector = zmalloc(vec_dim * sizeof(float));
-    
-    /* Use pipelining to batch commands */
-    int pipeline_size = 4;
-    int pipeline_count = 0;
-    
-    for (int i = data->start_index; i <= data->end_index; i++) {
-        /* Simple key without cluster tags */
-        sds key = getVectorKey();
-        
-        /* Validation checks */
-        /* Build vector data: fixed part + placeholder */
-        sds vector_binary = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32) + i); // "someusername" as base
-        
-        /* Use pipelining for better throughput */
-        if (config.search.tag_field && config.search.curr_conf.tag_dists) {
-            sds selected_tag = selectTagByDistribution();
-            valkeyAppendCommand(ctx, "HSET %b %s %b %s %s", 
-                               key, sdslen(key), 
-                               config.search.vector_field, 
-                               vector_binary, sdslen(vector_binary),
-                               config.search.tag_field, 
-                               selected_tag ? selected_tag : "");
-            if (selected_tag) sdsfree(selected_tag);
-        } else {
-            valkeyAppendCommand(ctx, "HSET %b %s %b", 
-                               key, sdslen(key), 
-                               config.search.vector_field, 
-                               vector_binary, sdslen(vector_binary));
-        }
-        
-        pipeline_count++;
-        
-        /* Process pipeline when full or at end */
-        if (pipeline_count >= pipeline_size || i == data->end_index) {
-            for (int j = 0; j < pipeline_count; j++) {
-                void *reply = NULL;
-                if (valkeyGetReply(ctx, &reply) == VALKEY_OK) {
-                    valkeyReply *r = (valkeyReply *)reply;
-                    if (r && r->type == VALKEY_REPLY_ERROR) {
-                        fprintf(stderr, "Thread %d: Error: %s\n", 
-                               data->thread_id, r->str);
-                    }
-                    if (reply) freeReplyObject(reply);
-                } else {
-                    fprintf(stderr, "Thread %d: Failed to get reply\n", 
-                           data->thread_id);
-                    /* Reconnect on connection errors */
-                    valkeyFree(ctx);
-                    ctx = getValkeyContext(config.ct, ip, port);
-                    if (!ctx) break;
-                }
-            }
-            
-            /* Update progress */
-            atomic_fetch_add_explicit(&prefill_state.progress, pipeline_count, memory_order_relaxed);
-            pipeline_count = 0;
-        }
-        
-        sdsfree(key);
-        sdsfree(vector_binary);
-    }
-    
-    zfree(vector);
-    if (ctx) valkeyFree(ctx);
-    return NULL;
-}
-
-/* Updated prefillVectorIndex to choose the right worker function */
-static void prefillVectorIndex(int count) {
-    assert(config.search.vector_dim > 0 && config.use_search);
-    if (count <= 0) return;
-    int vec_dim = config.search.vector_dim;
-    
-    /* Ensure base vector is initialized */
-    if (!base_vector) {
-        initBaseVector(vec_dim);
-    }
-    
-    /* Determine number of threads to use */
-    int num_threads = (config.num_threads > 0) ? config.num_threads : 1;
-    if (count < num_threads) {
-        num_threads = count;
-    }
-    
-    printf("Prefilling index with %d vectors using %d thread(s)...\n", count, num_threads);
-    
-    /* Use multithreaded approach */
-    pthread_t *threads = zmalloc(num_threads * sizeof(pthread_t));
-    prefillThreadData *thread_data = zmalloc(num_threads * sizeof(prefillThreadData));
-    
-    long long start_time = mstime();
-    prefill_state.start = mstime();
-    int progress_interval = count >= 10000 ? 1000 : (count >= 1000 ? 100 : 10);
-    
-    /* Calculate work distribution */
-    int vectors_per_thread = count / num_threads;
-    int remaining_vectors = count % num_threads;
-    
-    /* Create and start threads */
-    int current_start = 1;
-    for (int i = 0; i < num_threads; i++) {
-        thread_data[i].thread_id = i;
-        thread_data[i].start_index = current_start;
-        thread_data[i].end_index = current_start + vectors_per_thread - 1;
-        
-        /* Distribute remaining vectors to first few threads */
-        if (i < remaining_vectors) {
-            thread_data[i].end_index++;
-        }
-        
-        thread_data[i].total_count = count;
-        
-        current_start = thread_data[i].end_index + 1;
-        
-        /* Choose the right worker function based on cluster mode */
-        void *(*worker_func)(void *) = config.cluster_mode ? 
-            searchPrefillWorkerThreadCluster : searchPrefillWorkerThread;
-        
-        if (pthread_create(&threads[i], NULL, worker_func, &thread_data[i])) {
-            fprintf(stderr, "Failed to create prefill thread %d\n", i);
-            exit(1);
-        }
-    }
-    
-    /* Rest of the function remains the same... */
-    /* Monitor progress while threads are working */
-    int last_progress = 0;
-    int current_progress = atomic_load(&prefill_state.progress);
-    while (current_progress < count) {
-        usleep(100000); /* Sleep 100ms */
-        current_progress = atomic_load(&prefill_state.progress);
-        if (current_progress >= last_progress + progress_interval || current_progress == count) {
-            float progress = (float)current_progress / count * 100.0f;
-            printf("Prefilled %d vectors (%.1f%%)...\n", current_progress, progress);
-            last_progress = current_progress;
-        }
-    }
-    
-    /* Wait for all threads to complete */
-    for (int i = 0; i < num_threads; i++) {
-        pthread_join(threads[i], NULL);
-    }
-    
-    long long elapsed_ms = mstime() - start_time;
-    float rate = elapsed_ms > 0 ? (float)count / elapsed_ms * 1000.0f : 0.0f;
-    prefill_state.done = 1;
-    prefill_state.end = mstime();
-    printf("Prefilled %d vectors in %.2f seconds (%.0f vectors/sec) using %d threads\n\n", 
-            count, elapsed_ms / 1000.0f, rate, num_threads);
-    
-    zfree(threads);
-    zfree(thread_data);
-}
-#if 1
-/* Enhanced prefill for cluster mode with proper slot distribution */
-static void *searchPrefillWorkerThreadCluster(void *arg) {
-    assert(config.use_search);
-    prefillThreadData *data = (prefillThreadData *)arg;
-    
-    /* In cluster mode, connect to a specific node based on thread ID */
-    const char *ip = config.conn_info.hostip;
-    int port = config.conn_info.hostport;
-    int node_idx = -1;
-    clusterNode *node = NULL;
-    if (config.cluster_mode) {
-        assert(config.cluster_primary_node_count > 0);
-        /* Distribute threads across cluster nodes */
-        int i = 0;
-        do {
-            assert(i < config.cluster_primary_node_count); /* Prevent infinite loop */
-            node_idx = (data->thread_id + i) % config.cluster_primary_node_count;
-            node = config.cluster_primary_nodes[node_idx];
-            assert(node);
-            i++;            
-        } while (node->slots_count == 0);
-        ip = node->ip;
-        port = node->port;        
-    }
-    valkeyContext *ctx = getValkeyContext(config.ct, ip, port);
-    if (!ctx) {
-        fprintf(stderr, "Thread %d: Failed to connect to %s:%d\n", 
-                data->thread_id, ip, port);
-        return NULL;
-    }
-    
-    /* Use pipelining to batch commands */
-    int pipeline_size = 4;
-    int pipeline_count = 0;
-    
-    for (int i = data->start_index; i <= data->end_index; i++) {
-        sds key = getVectorKey();
-        
-        /* Generate unique vector deterministically based on key index */
-        sds vector_binary = createVectorTemplate(0x736f6d6575736572 ^ ((uint64_t)pthread_self() << 32) + i); // "someusername" as base
-        
-        /* Use pipelining for better throughput */
-        if (config.search.tag_field && config.search.curr_conf.tag_dists) {
-            sds selected_tag = selectTagByDistribution();
-            valkeyAppendCommand(ctx, "HSET %b %s %b %s %s", 
-                               key, sdslen(key), 
-                               config.search.vector_field, 
-                               vector_binary, sdslen(vector_binary),
-                               config.search.tag_field, 
-                               selected_tag ? selected_tag : "");
-            if (selected_tag) sdsfree(selected_tag);
-        } else {
-            valkeyAppendCommand(ctx, "HSET %b %s %b", 
-                               key, sdslen(key), 
-                               config.search.vector_field, 
-                               vector_binary, sdslen(vector_binary));
-        }
-        
-        pipeline_count++;
-        
-        /* Process pipeline when full or at end */
-        if (pipeline_count >= pipeline_size || i == data->end_index) {
-            for (int j = 0; j < pipeline_count; j++) {
-                void *reply = NULL;
-                if (valkeyGetReply(ctx, &reply) == VALKEY_OK) {
-                    valkeyReply *r = (valkeyReply *)reply;
-                    
-                    /* Handle MOVED errors silently - they're expected in cluster */
-                    if (r && r->type == VALKEY_REPLY_ERROR) {
-                        if (strncmp(r->str, "MOVED", 5) != 0 && 
-                            strncmp(r->str, "ASK", 3) != 0) {
-                            /* Only log non-redirect errors */
-                            fprintf(stderr, "Thread %d: Error: %s\n", 
-                                   data->thread_id, r->str);
-                        }
-                    }
-                    if (reply) freeReplyObject(reply);
-                } else {
-                    fprintf(stderr, "Thread %d: Failed to get reply\n", 
-                           data->thread_id);
-                    /* Reconnect on connection errors */
-                    valkeyFree(ctx);
-                    ctx = getValkeyContext(config.ct, ip, port);
-                    if (!ctx) break;
-                }
-            }
-            
-            /* Update progress */
-            atomic_fetch_add_explicit(&prefill_state.progress, pipeline_count, memory_order_relaxed);
-
-            pipeline_count = 0;
-        }
-        
-        sdsfree(key);
-        sdsfree(vector_binary);
-    }
-    
-    if (ctx) valkeyFree(ctx);
-    return NULL;
-}
-#endif
-/* Fix the setClusterKeyHashTag to work with vector placeholders */
-static void setClusterKeyHashTagForVectors(client c) {
+static void replacePlaceholderClusterTag(client c, const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter) {
     assert(c->thread_id >= 0);
     clusterNode *node = c->cluster_node;
     assert(node);
-    
     int is_updating_slots = atomic_load_explicit(&config.is_updating_slots, 
-                                                 memory_order_relaxed);
+                                                 memory_order_relaxed);                                                 
     if (is_updating_slots) updateClusterSlotsConfiguration();
-    
+    // update key with counter to ensure different keys
+    uint64_t key_idx = atomic_fetch_add_explicit(key_counter, 1, memory_order_relaxed);
+    assert(node->slots_count > 0);
     /* Select a random slot from this node */
-    int slot = node->slots[rand() % node->slots_count];
+    int slot = node->slots[key_idx % node->slots_count];
     const char *tag = crc16_slot_table[slot];
     int taglen = strlen(tag);
+    assert(taglen <= 3); /* Ensure tag fits within placeholder */
     
-    /* Update all {tag} placeholders in the command buffer */
-    char *p = c->obuf + c->prefixlen;
-    char *end = c->obuf + sdslen(c->obuf);
-    
-    while ((p = strstr(p, "{tag}")) != NULL && p < end) {
-        /* Replace {tag} with actual slot tag */
-        memmove(p + 1 + taglen + 1, p + 5, end - (p + 5));
-        p[0] = '{';
-        memcpy(p + 1, tag, taglen);
-        p[1 + taglen] = '}';
-        
-        /* Adjust buffer length if tag is shorter than "tag" */
-        if (taglen < 3) {
-            int diff = 3 - taglen;
-            sdsrange(c->obuf, 0, sdslen(c->obuf) - diff - 1);
-            end -= diff;
+    /* Replace all occurrences in-place (exactly 8 bytes) */
+    for (size_t j = 0; j < count; j++) {
+        char *placeholder = cmd + indices[j];    
+        // write tag with surrounding {} in place of placeholder, pad with random bytes if needed. This is not vector, we replace the {tag} part in key to actual tag value by the crc16 slot
+        // first offset by 1 byte for '{', then copy tag, then offset by 1 byte for '}', then pad with random bytes if needed
+        // print debug if not starting with '{'
+        if (placeholder[0] != '{') {
+            // print command, count, indices, j and placeholder
+            fprintf(stderr, "Command: %s\n", cmd);
+            fprintf(stderr, "Count: %zu, Indices: ", count);
+            for (size_t k = 0; k < count; k++) {
+                fprintf(stderr, "%zu ", indices[k]);
+            }
+            fprintf(stderr, "\nCurrent index: %zu\n", j);
+            fprintf(stderr, "Error: placeholder does not start with '{': %.8s\n", placeholder);
+            exit(1);
         }
-        
-        p += taglen + 2; /* Move past the replaced tag */
+        assert(placeholder[0] == '{');
+        // for (int k = 0; k < taglen; k++) {
+        //     placeholder[k+1] = tag[k]; // Clear existing placeholder
+        // }
+        memcpy(placeholder + 1, tag, taglen);  // Copy tag
+        placeholder[1 + taglen] = '}';         // Closing brace
+        // Pad remaining bytes with random data if tag is shorter than 3 bytes
+        if (taglen < 3) {
+            for (int k = 0; k < 3 - taglen; k++) {
+                placeholder[1 + taglen + 1 + k] = 'a' + (rand() % 26); // Random lowercase letter
+            }
+        }
     }
 }
+
 
 // TODO: If index already exists, we shuld check if it matches the current configuration.
 // If it does not match, we should drop the index and recreate it.
@@ -1341,6 +1907,8 @@ static void createDefaultSearchIndexes(void) {
             printf("found index '%s' ", list_reply->element[j]->str);
             if (strcmp(list_reply->element[j]->str, config.search.name) == 0) {
                 index_exists = 1;
+                // print index info
+                getSearchIndexInfo(config.search.name, NULL);
             }            
         }
         printf("\n");
@@ -1469,6 +2037,19 @@ void resetPlaceholders(void) {
     if (placeholders.index_data)
         zfree(placeholders.index_data); /* indices are a single contiguous allocation */
     memset(&placeholders, 0, sizeof(placeholders));
+    for (size_t placeholder = 0; placeholder < PLACEHOLDER_NUM_OF; placeholder++) {
+        placeholders.indices[placeholder] = NULL;
+        placeholders.count[placeholder] = 0;
+        /* Move past the placeholder - vector placeholder has different length */
+        if (placeholder >= VECTOR_PLACEHOLDER_INDEX) {
+            placeholders.len[placeholder] = VECTOR_PLACEHOLDER_LEN;
+        } else if (placeholder == CLUSTER_PLACEHOLDER_INDEX) {
+            placeholders.len[placeholder] = CLUSTER_PLACEHOLDER_LEN;
+        } else {
+            placeholders.len[placeholder] = PLACEHOLDER_NORMAL_LEN;
+        }
+               
+    }
 }
 
 void initPlaceholders(const char *cmd, size_t cmd_len) {
@@ -1477,13 +2058,13 @@ void initPlaceholders(const char *cmd, size_t cmd_len) {
 
     /* store placeholder locations in temp arrays */
     size_t total_count = 0;
-    size_t *temp_indices[PLACEHOLDER_COUNT];
-    for (size_t placeholder = 0; placeholder < PLACEHOLDER_COUNT; placeholder++) {
+    size_t *temp_indices[PLACEHOLDER_NUM_OF];
+    for (size_t placeholder = 0; placeholder < PLACEHOLDER_NUM_OF; placeholder++) {
         size_t *count = &placeholders.count[placeholder];
         *count = 0;
 
         size_t temp_size = RANDPTR_INITIAL_SIZE;
-        temp_indices[placeholder] = zmalloc(sizeof(size_t) * temp_size);
+        temp_indices[placeholder] = zcalloc(sizeof(size_t) * temp_size);
         const char *p = cmd;
         const char *end = cmd + cmd_len;
         while ((p = strstr(p, PLACEHOLDERS[placeholder])) != NULL && p < end) {
@@ -1496,18 +2077,14 @@ void initPlaceholders(const char *cmd, size_t cmd_len) {
             (*count)++;
             total_count++;
             /* Move past the placeholder - vector placeholder has different length */
-            if (placeholder >= VECTOR_PLACEHOLDER_INDEX) {
-                p += VECTOR_PLACEHOLDER_LEN;
-            } else {
-                p += PLACEHOLDER_LEN;
-            }
+            p += placeholders.len[placeholder];
         }
     }
 
     /* consolidate temp data into contiguous allocation */
-    placeholders.index_data = zmalloc(sizeof(size_t) * total_count);
+    placeholders.index_data = zcalloc(sizeof(size_t) * total_count);
     size_t overall_index = 0;
-    for (size_t placeholder = 0; placeholder < PLACEHOLDER_COUNT; placeholder++) {
+    for (size_t placeholder = 0; placeholder < PLACEHOLDER_NUM_OF; placeholder++) {
         placeholders.indices[placeholder] = placeholders.index_data + overall_index;
 
         const size_t count = placeholders.count[placeholder];
@@ -1517,7 +2094,6 @@ void initPlaceholders(const char *cmd, size_t cmd_len) {
 
         zfree(temp_indices[placeholder]);
     }
-    return;
 }
 
 static void replacePlaceholder(const size_t *indices, const size_t count, char *cmd, _Atomic uint64_t *key_counter, unsigned placeholder_len) {
@@ -1592,17 +2168,13 @@ static void replacePlaceholderVector(const size_t *indices, const size_t count,
     
     /* Replace all occurrences in-place (exactly 8 bytes) */
     for (size_t j = 0; j < count; j++) {
-        char *placeholder = cmd + indices[j];
-        
-        /* Self-check: verify we're replacing "__v_rd__" */
-        assert(memcmp(placeholder, VECTOR_PLACEHOLDER, VECTOR_PLACEHOLDER_LEN) == 0);
-        
-        memcpy(placeholder, vector, 8);  // Exactly 8 bytes replacement
+        char *placeholder = cmd + indices[j];        
+        memcpy(placeholder, vector, VECTOR_PLACEHOLDER_LEN);  // Exactly 8 bytes replacement
     }
 }
 
-static void replacePlaceholders(char *cmd_data, int cmd_count) {
-    static _Atomic uint64_t seq_key[PLACEHOLDER_COUNT] = {0};
+static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
+    static _Atomic uint64_t seq_key[PLACEHOLDER_NUM_OF] = {0};
 
     for (int cmd_index = 0; cmd_index < cmd_count; cmd_index++) {
         char *cmd = cmd_data + cmd_index * placeholders.cmd_len;
@@ -1611,17 +2183,22 @@ static void replacePlaceholders(char *cmd_data, int cmd_count) {
         size_t *indices = placeholders.indices[0];
         _Atomic uint64_t *key_counter = &seq_key[0];
         for (size_t i = 0; i < placeholders.count[0]; i++) {
-            replacePlaceholder(indices + i, 1, cmd, key_counter, PLACEHOLDER_LEN);
+            replacePlaceholder(indices + i, 1, cmd, key_counter, placeholders.len[0]);
         }
 
         /* Handle other regular placeholders */
-        for (size_t placeholder = 1; placeholder < VECTOR_PLACEHOLDER_INDEX; placeholder++) {
+        for (size_t placeholder = 1; placeholder < PLACEHOLDER_NORMAL_NUM_OF; placeholder++) {
             indices = placeholders.indices[placeholder];
             size_t count = placeholders.count[placeholder];
             key_counter = &seq_key[placeholder];
-            replacePlaceholder(indices, count, cmd, key_counter, PLACEHOLDER_LEN);
+            replacePlaceholder(indices, count, cmd, key_counter, placeholders.len[placeholder]);
         }
-        
+        if (placeholders.count[CLUSTER_PLACEHOLDER_INDEX] > 0) {
+            indices = placeholders.indices[CLUSTER_PLACEHOLDER_INDEX];
+            size_t count = placeholders.count[CLUSTER_PLACEHOLDER_INDEX];
+            replacePlaceholderClusterTag(c, indices, count, cmd, 
+                                   &seq_key[CLUSTER_PLACEHOLDER_INDEX]);
+        }
         /* Handle vector placeholder */
         if (config.use_search && placeholders.count[VECTOR_PLACEHOLDER_INDEX] > 0) {
             indices = placeholders.indices[VECTOR_PLACEHOLDER_INDEX];
@@ -1970,8 +2547,8 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
 
         /* Really initialize: replace keys and set start time. */
-        if (config.replace_placeholders) replacePlaceholders(c->obuf + c->prefixlen, config.pipeline);
-        if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTagForVectors(c);
+        if (config.replace_placeholders) replacePlaceholders(c, c->obuf + c->prefixlen, config.pipeline);
+        // if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
         c->start = ustime();
         c->latency = -1;
@@ -2025,7 +2602,7 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  * Even when cloning another client, prefix commands are applied if needed.*/
 static client createClient(char *cmd, int len, int seqlen, client from, int thread_id) {
     int is_cluster_client = (config.cluster_mode && thread_id >= 0);
-    client c = zmalloc(sizeof(struct _client));
+    client c = zcalloc(sizeof(struct _client));
 
     const char *ip = NULL;
     int port = 0;
@@ -2037,11 +2614,11 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         port = config.conn_info.hostport;
     } else {
         int node_idx = 0;
-        if (config.num_threads < config.cluster_node_count)
-            node_idx = config.liveclients % config.cluster_node_count;
+        if (config.num_threads < config.cluster_primary_node_count)
+            node_idx = config.liveclients % config.cluster_primary_node_count;
         else
-            node_idx = thread_id % config.cluster_node_count;
-        clusterNode *node = config.cluster_nodes[node_idx];
+            node_idx = thread_id % config.cluster_primary_node_count;
+        clusterNode *node = config.cluster_primary_nodes[node_idx];
         assert(node != NULL);
         ip = (const char *)node->ip;
         port = node->port;
@@ -2145,7 +2722,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         if (from) {
             c->staglen = from->staglen;
             c->stagfree = 0;
-            c->stagptr = zmalloc(sizeof(char *) * c->staglen);
+            c->stagptr = zcalloc(sizeof(char *) * c->staglen);
             /* copy the offsets. */
             for (size_t j = 0; j < c->staglen; j++) {
                 c->stagptr[j] = c->obuf + (from->stagptr[j] - from->obuf);
@@ -2157,7 +2734,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
 
             c->staglen = 0;
             c->stagfree = RANDPTR_INITIAL_SIZE;
-            c->stagptr = zmalloc(sizeof(char *) * c->stagfree);
+            c->stagptr = zcalloc(sizeof(char *) * c->stagfree);
             while ((p = strstr(p, "{tag}")) != NULL) {
                 if (c->stagfree == 0) {
                     c->stagptr = zrealloc(c->stagptr, sizeof(char *) * c->staglen * 2);
@@ -2319,7 +2896,7 @@ static void showLatencyReport(void) {
 static void initBenchmarkThreads(void) {
     int i;
     if (config.threads) freeBenchmarkThreads();
-    config.threads = zmalloc(config.num_threads * sizeof(benchmarkThread *));
+    config.threads = zcalloc(config.num_threads * sizeof(benchmarkThread *));
     for (i = 0; i < config.num_threads; i++) {
         benchmarkThread *thread = createBenchmarkThread(i);
         config.threads[i] = thread;
@@ -2392,7 +2969,7 @@ static void benchmark(const char *title, char *cmd, int len) {
 /* Thread functions. */
 
 static benchmarkThread *createBenchmarkThread(int index) {
-    benchmarkThread *thread = zmalloc(sizeof(*thread));
+    benchmarkThread *thread = zcalloc(sizeof(*thread));
     if (thread == NULL) return NULL;
     thread->index = index;
     thread->el = aeCreateEventLoop(1024 * 10);
@@ -2426,7 +3003,7 @@ static void *execBenchmarkThread(void *ptr) {
 /* Cluster helper functions. */
 
 static clusterNode *createClusterNode(char *ip, int port) {
-    clusterNode *node = zmalloc(sizeof(*node));
+    clusterNode *node = zcalloc(sizeof(*node));
     if (!node) return NULL;
     node->ip = ip;
     node->port = port;
@@ -2434,7 +3011,7 @@ static clusterNode *createClusterNode(char *ip, int port) {
     node->flags = 0;
     node->replicate = NULL;
     node->replicas_count = 0;
-    node->slots = zmalloc(CLUSTER_SLOTS * sizeof(int));
+    node->slots = zcalloc(CLUSTER_SLOTS * sizeof(int));
     node->slots_count = 0;
     node->updated_slots = NULL;
     node->updated_slots_count = 0;
@@ -3004,7 +3581,7 @@ static void parseTagDistributions(const char *distributions_str) {
     sdsfree(temp);
     
     /* Allocate array */
-    config.search.curr_conf.tag_dists = zmalloc(sizeof(tagDistribution) * count);
+    config.search.curr_conf.tag_dists = zcalloc(sizeof(tagDistribution) * count);
     config.search.curr_conf.n_dists = count;
     
     /* Second pass: parse distributions */
@@ -3252,20 +3829,7 @@ int parseOptions(int argc, char **argv) {
             // TODO: Is search is enabled and -t is not, do not run default tests
             config.use_search = 1;
         } else if (!strcmp(argv[i], "--search-print-results")) {
-            config.print_search_results = 1;
-        } else if (!strcmp(argv[i], "--search-prefill")) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "Missing argument for --search-prefill\n");
-                exit(1);
-            }
-            // TODO: verify that prefill is a valid integer
-            config.search.curr_conf.n_prefill = atoi(argv[++i]);
-            if (config.search.curr_conf.n_prefill < 0) {
-                fprintf(stderr, "Invalid prefill count: %d\n", config.search.curr_conf.n_prefill);
-                exit(1);
-            }
-            /* Enable search indexes automatically when prefill is used */
-            config.use_search = 1;           
+            config.print_search_results = 1;          
         } else if (!strcmp(argv[i], "--search-prefix")) {
             if (lastarg) goto invalid;
             if (config.search.prefix) sdsfree(config.search.prefix);
@@ -3537,10 +4101,9 @@ usage:
         "                    Set tag filter pattern for vec-query operations (e.g., 'category_*').\n"
         " --search-tags <distribution>\n"
         "                    Comma-separated tag:percentage pairs for vec-insert operations.\n"
-        "                    Example: 'fruits:8.5,vegetables:7.2,dairy:32.1,meat:52.2'\n"
-        " --vprefill <count>  Prefill vector index with <count> vectors before benchmarking.\n",
+        "                    Example: 'fruits:8.5,vegetables:7.2,dairy:32.1,meat:52.2'\n",
         tls_usage,
-        rdma_usage,
+        rdma_usage,        
         " --mptcp            Enable an MPTCP connection.\n"
         " --help             Output this help and exit.\n"
         " --version          Output version and exit.\n\n"
@@ -3561,7 +4124,7 @@ usage:
         "   $ valkey-benchmark -- multi ';' set key:__rand_int__ __data__ ';' \\\n"
         "                         incr counter ';' exec\n\n"
         " Search index tests:\n"
-        "   $ valkey-benchmark --search  --search-prefill 1000   --search-name grocery_products --vector-dim 768 "
+        "   $ valkey-benchmark --search  --search-name grocery_products --vector-dim 768 "
         "--tag-field \"category\" --search-tags 'fruits:100,vegetables:100,dairy:100,meat:52.2,fruitsppo:99,fruitsppod:99' -t vec-insert -n 100 -r 1000\n"
         " Query and filter vector data:\n"
         "   $ valkey-benchmark --search  --search-name grocery_products     --vector-dim 768     --tag-field \"category\"\n"
@@ -3617,7 +4180,7 @@ long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clie
 char *generateFunctionScript(uint32_t num_functions, int with_keys) {
     /* 64K buffer to hold script code */
     const size_t buffer_len = 64 * 1024;
-    char *buffer = zmalloc(buffer_len);
+    char *buffer = zcalloc(buffer_len);
     memset(buffer, 0, buffer_len);
 
     int written = snprintf(buffer, buffer_len, "#!lua name=benchlib\n");
@@ -3686,7 +4249,7 @@ int main(int argc, char **argv) {
     config.keepalive = 1;
     config.datasize = 3;
     config.pipeline = 1;
-    config.replace_placeholders = 0;
+    config.replace_placeholders = 1;
     config.keyspacelen = 0;
     config.sequential_replacement = 0;
     config.quiet = 0;
@@ -3698,7 +4261,6 @@ int main(int argc, char **argv) {
     config.conn_info.hostip = sdsnew("127.0.0.1");
     config.conn_info.hostport = 6379;
     config.use_search = 0;
-    config.search.curr_conf.n_prefill = 0;
     config.print_search_results = 0;
     config.tests = NULL;
     config.conn_info.input_dbnum = 0;
@@ -3876,7 +4438,7 @@ int main(int argc, char **argv) {
             argc++;
         }
         /* Setup argument length */
-        size_t *argvlen = zmalloc(argc * sizeof(size_t));
+        size_t *argvlen = zcalloc(argc * sizeof(size_t));
         for (i = 0; i < argc; i++) argvlen[i] = sdslen(sds_args[i]);
         /* RESP-encode the command(s) given on the syntax
          *
@@ -3942,15 +4504,9 @@ int main(int argc, char **argv) {
     if (config.use_search) {
         printf("Using search indexes for the benchmark.\n");
         createDefaultSearchIndexes();
-        
-        /* Prefill vector index if requested */
-        if (config.search.curr_conf.n_prefill > 0) {
-            prefillVectorIndex(config.search.curr_conf.n_prefill);
-        }
-
     }
     /* Run default benchmark suite. */
-    data = zmalloc(config.datasize + 1);
+    data = zcalloc(config.datasize + 1);
     do {
         genBenchmarkRandomData(data, config.datasize);
         data[config.datasize] = '\0';
@@ -4147,7 +4703,7 @@ int main(int argc, char **argv) {
             valkeyFree(ctx);
             zfree(script);
 
-            char **cmd_argv = zmalloc(sizeof(char *) * (config.num_keys_in_fcall + 3));
+            char **cmd_argv = zcalloc(sizeof(char *) * (config.num_keys_in_fcall + 3));
             int ret = asprintf(&(cmd_argv[0]), "fcall");
             UNUSED(ret);
             ret = asprintf(&(cmd_argv[1]), "foo1");
