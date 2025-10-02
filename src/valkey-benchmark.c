@@ -61,6 +61,7 @@
 #include "hdr_histogram.h"
 #include "cli_common.h"
 #include "mt19937-64.h"
+#include "valkey-benchmark-utils.h"
 
 extern uint16_t crc16(const char *buf, int len);
 #define UNUSED(V) ((void)V)
