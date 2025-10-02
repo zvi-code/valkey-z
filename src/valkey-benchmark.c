@@ -413,10 +413,13 @@ static void createDefaultSearchIndexes(void) {
         config.conn_info.hostip = config.cluster_primary_nodes[0]->ip;
         config.conn_info.hostport = config.cluster_primary_nodes[0]->port;
     }
-    valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+    valkeyContext *ctx = config.conn_ctx;
     if (ctx == NULL) {
-        fprintf(stderr, "Failed to connect to Valkey server for creating search indexes.\n");
-        return;
+        fprintf(stderr, "No existing connection context, creating new\n");
+        ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+        if (ctx == NULL) {
+            exit(1);
+        }
     }
     /* Check if any indexes exist */
     valkeyReply *list_reply = valkeyCommand(ctx, "FT._LIST");
@@ -441,7 +444,6 @@ static void createDefaultSearchIndexes(void) {
     }
     if (index_exists) {
         printf("Index '%s' already exists, skipping creation.\n", config.search.name);
-        valkeyFree(ctx);
         return;
     }
     valkeyReply *reply = NULL;
@@ -469,10 +471,7 @@ static void createDefaultSearchIndexes(void) {
             exit(1);
         }
     }
-    if (reply) freeReplyObject(reply);        
-    
-
-    valkeyFree(ctx);
+    if (reply) freeReplyObject(reply);            
 }
 
 /* Best-effort server config fetch: use INFO; skip CONFIG on managed services */
@@ -1530,7 +1529,9 @@ static clusterNode **addClusterNode(clusterNode *node, int selected) {
     int count = config.cluster_node_count + 1;
     config.cluster_nodes = zrealloc(config.cluster_nodes, count * sizeof(clusterNode *));
     assert(config.cluster_nodes != NULL);
+    node->ctx = getValkeyContext(config.ct, node->ip, node->port);
     config.cluster_nodes[config.cluster_node_count++] = node;
+    
     if (node->replicate == NULL) {
         printf("Adding cluster primary node %s:%d\n", node->ip, node->port);
         config.cluster_primary_nodes = zrealloc(config.cluster_primary_nodes, (config.cluster_primary_node_count + 1) * sizeof(clusterNode *));
@@ -1572,9 +1573,13 @@ static int fetchCMDNodesConfiguration(void) {
     valkeyContext *ctx = NULL;
     valkeyReply *reply = NULL;
     assert(!isElastiCacheEndpoint(config.conn_info.hostip));
-    ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+    ctx = config.conn_ctx;
     if (ctx == NULL) {
-        return 0;
+        fprintf(stderr, "No existing connection context, creating new\n");
+        ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+        if (ctx == NULL) {
+            exit(1);
+        }
     }
 
     /* Detect ElastiCache by trying ROLE first */
@@ -1597,7 +1602,6 @@ static int fetchCMDNodesConfiguration(void) {
 
 cleanup:
     if (reply) freeReplyObject(reply);
-    if (ctx) valkeyFree(ctx);
     
     if (!success && config.cluster_nodes) {
         freeClusterNodes();
@@ -1824,9 +1828,13 @@ static int fetchClusterConfiguration(void) {
     dict *nodes = NULL;
     const char *errmsg = "Failed to fetch cluster configuration";
     size_t i, j;
-    ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+    ctx = config.conn_ctx;
     if (ctx == NULL) {
-        exit(1);
+        fprintf(stderr, "No existing connection context, creating new\n");
+        ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+        if (ctx == NULL) {
+            exit(1);
+        }
     }
 
     reply = valkeyCommand(ctx, "CLUSTER SLOTS");
@@ -1897,7 +1905,6 @@ static int fetchClusterConfiguration(void) {
         sdsfree(primary);
     }
 cleanup:
-    if (ctx) valkeyFree(ctx);
     if (!success) {
         if (config.cluster_nodes) freeClusterNodes();
     }
@@ -1928,16 +1935,16 @@ static int fetchClusterSlotsConfiguration(client c) {
 
     /* printf("[%d] fetchClusterSlotsConfiguration\n", c->thread_id); */
     dict *nodes = dictCreate(&dtype);
-    valkeyContext *ctx = NULL;
+    // valkeyContext *ctx = NULL;
     for (i = 0; i < (size_t)config.cluster_node_count; i++) {
         clusterNode *node = config.cluster_nodes[i];
         assert(node->ip != NULL);
         assert(node->name != NULL);
         assert(node->port);
         /* Use first node as entry point to connect to. */
-        if (ctx == NULL) {
-            ctx = getValkeyContext(config.ct, node->ip, node->port);
-            if (!ctx) {
+        if (node->ctx == NULL) {
+            node->ctx = getValkeyContext(config.ct, node->ip, node->port);
+            if (!node->ctx) {
                 success = 0;
                 goto cleanup;
             }
@@ -1947,7 +1954,7 @@ static int fetchClusterSlotsConfiguration(client c) {
         node->updated_slots_count = 0;
         dictReplace(nodes, node->name, node);
     }
-    reply = valkeyCommand(ctx, "CLUSTER SLOTS");
+    reply = valkeyCommand(config.cluster_nodes[0]->ctx, "CLUSTER SLOTS");
     if (reply == NULL || reply->type == VALKEY_REPLY_ERROR) {
         success = 0;
         if (reply) fprintf(stderr, "%s\nCLUSTER SLOTS ERROR: %s\n", errmsg, reply->str);
@@ -1997,7 +2004,7 @@ static int fetchClusterSlotsConfiguration(client c) {
     updateClusterSlotsConfiguration();
 cleanup:
     freeReplyObject(reply);
-    valkeyFree(ctx);
+    // valkeyFree(ctx);
     dictRelease(nodes);
     atomic_store_explicit(&config.is_fetching_slots, 0, memory_order_relaxed);
     return success;
@@ -3163,9 +3170,13 @@ int main(int argc, char **argv) {
         if (test_is_selected("fcall")) {
             char *script = generateFunctionScript(1, config.num_keys_in_fcall > 0);
 
-            valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+            valkeyContext* ctx = config.conn_ctx;
             if (ctx == NULL) {
-                exit(1);
+                fprintf(stderr, "No existing connection context, creating new\n");
+                ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
+                if (ctx == NULL) {
+                    exit(1);
+                }
             }
 
             assert(ctx != NULL && ctx->err == 0);
@@ -3173,7 +3184,6 @@ int main(int argc, char **argv) {
 
             assert(reply != NULL);
             freeReplyObject(reply);
-            valkeyFree(ctx);
             zfree(script);
 
             char **cmd_argv = zcalloc(sizeof(char *) * (config.num_keys_in_fcall + 3));
