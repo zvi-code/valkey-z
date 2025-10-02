@@ -622,7 +622,7 @@ static void display_rejected(const char *field_name, void *opaque, int node_coun
 static void display_integer(const char *field_name, void *opaque, int node_count) {
     UNUSED(node_count);
     if (!opaque) return;
-    printf("  %s: %lld\n", field_name, *(long long *)opaque);
+    printf("%s: %lld\n", field_name, *(long long *)opaque);
 }
 
 /* Display memory in MB */
@@ -630,7 +630,7 @@ static void display_memory_mb(const char *field_name, void *opaque, int node_cou
     UNUSED(node_count);
     if (!opaque) return;
     long long bytes = *(long long *)opaque;
-    printf("  %s: %.2f MB\n", field_name, (double)bytes / (1024.0 * 1024.0));
+    printf("%s: %.2f MB\n", field_name, (double)bytes / (1024.0 * 1024.0));
 }
 
 /* Display memory in human-readable format */
@@ -648,7 +648,7 @@ static void display_memory_human(const char *field_name, void *opaque, int node_
         unit_idx++;
     }
     
-    printf("  %s: %.2f %s\n", field_name, size, units[unit_idx]);
+    printf("%s: %.2f %s\n", field_name, size, units[unit_idx]);
 }
 
 /* Display percentage (from fixed-point value scaled by 1000) */
@@ -656,7 +656,7 @@ static void display_percentage(const char *field_name, void *opaque, int node_co
     UNUSED(node_count);
     if (!opaque) return;
     long long fixed_val = *(long long *)opaque;
-    printf("  %s: %.3f%%\n", field_name, (double)fixed_val / 1000.0);
+    printf("%s: %.3f%%\n", field_name, (double)fixed_val / 1000.0);
 }
 
 /* Display floating point value (from fixed-point scaled by 1000) */
@@ -664,7 +664,7 @@ static void display_float(const char *field_name, void *opaque, int node_count) 
     UNUSED(node_count);
     if (!opaque) return;
     long long fixed_val = *(long long *)opaque;
-    printf("  %s: %.3f\n", field_name, (double)fixed_val / 1000.0);
+    printf("%s: %.3f\n", field_name, (double)fixed_val / 1000.0);
 }
 
 /* Display min/max range */
@@ -681,9 +681,9 @@ static void display_minmax(const char *field_name, void *opaque, int node_count)
     minmax_state_t *state = (minmax_state_t *)opaque;
     if (state->initialized) {
         if (state->min_val == state->max_val) {
-            printf("  %s: %lld\n", field_name, state->min_val);
+            printf("%s: %lld\n", field_name, state->min_val);
         } else {
-            printf("  %s: %lld - %lld\n", field_name, state->min_val, state->max_val);
+            printf("%s: %lld - %lld\n", field_name, state->min_val, state->max_val);
         }
     }
 }
@@ -693,7 +693,7 @@ static void display_latency_usec(const char *field_name, void *opaque, int node_
     UNUSED(node_count);
     if (!opaque) return;
     long long usec = *(long long *)opaque;
-    printf("  %s: %.2f us\n", field_name, (double)usec / 1000.0);
+    printf("%s: %.2f us\n", field_name, (double)usec / 1000.0);
 }
 
 /* Calculate rate per second */
@@ -707,7 +707,7 @@ static void diff_rate_per_second(const char *field_name, fieldSnapshot *old,
         /* Cluster-wide rate */
         long long delta = new_snap->value - old->value;
         double rate = (double)delta / ((double)time_delta_ms / 1000.0);
-        printf("  %s/sec: %.2f (delta: %lld)\n", field_name, rate, delta);
+        printf("%s/sec: %.2f (delta: %lld)\n", field_name, rate, delta);
     } else {
         /* Per-node rate */
         if (old->per_node_values && new_snap->per_node_values &&
@@ -715,7 +715,7 @@ static void diff_rate_per_second(const char *field_name, fieldSnapshot *old,
             long long node_delta = new_snap->per_node_values[node_idx] - 
                                    old->per_node_values[node_idx];
             double node_rate = (double)node_delta / ((double)time_delta_ms / 1000.0);
-            printf("    Node %d: %.2f/sec (delta: %lld)\n", node_idx, node_rate, node_delta);
+            printf("Node %d: %.2f/sec (delta: %lld)\n", node_idx, node_rate, node_delta);
         }
     }
 }
@@ -731,7 +731,7 @@ static void diff_memory_growth(const char *field_name, fieldSnapshot *old,
     double mb_per_sec = (double)(delta / (1024 * 1024)) / ((double)time_delta_ms / 1000.0);
     
     if (node_idx < 0) {
-        printf("  %s growth: %.2f MB/sec (total delta: %lld MB)\n", 
+        printf("%s growth: %.2f MB/sec (total delta: %lld MB)\n", 
                field_name, mb_per_sec, delta / (1024 * 1024));
     } else {
         if (old->per_node_values && new_snap->per_node_values &&
@@ -740,7 +740,7 @@ static void diff_memory_growth(const char *field_name, fieldSnapshot *old,
                                    old->per_node_values[node_idx];
             double node_mb_per_sec = (double)(node_delta / (1024 * 1024)) / 
                                      ((double)time_delta_ms / 1000.0);
-            printf("    Node %d: %.2f MB/sec (delta: %lld MB)\n", 
+            printf("Node %d: %.2f MB/sec (delta: %lld MB)\n", 
                    node_idx, node_mb_per_sec, node_delta / (1024 * 1024));
         }
     }
@@ -757,11 +757,11 @@ static void diff_percentage_change(const char *field_name, fieldSnapshot *old,
     
     if (node_idx < 0) {
         if (old->value == 0) {
-            printf("  %s: N/A (initial value was 0)\n", field_name);
+            printf("%s: N/A (initial value was 0)\n", field_name);
         } else {
             long long delta = new_snap->value - old->value;
             double pct_change = ((double)delta / (double)old->value) * 100.0;
-            printf("  %s change: %.2f%% (from %lld to %lld)\n", 
+            printf("%s change: %.2f%% (from %lld to %lld)\n", 
                    field_name, pct_change, old->value, new_snap->value);
         }
     }
@@ -780,7 +780,7 @@ static void diff_latency_change(const char *field_name, fieldSnapshot *old,
     if (node_idx < 0) {
         long long delta_usec = new_snap->value - old->value;
         double delta_ms = (double)delta_usec / 1000.0;
-        printf("  %s delta: %.2f ms (from %.2f to %.2f ms)\n", 
+        printf("%s delta: %.2f ms (from %.2f to %.2f ms)\n", 
                field_name, delta_ms, 
                (double)old->value / 1000.0, 
                (double)new_snap->value / 1000.0);
@@ -867,7 +867,7 @@ static void diff_cmdstat_latency(const char *field_name, fieldSnapshot *old_call
     double usec_per_call_interval = (calls_diff > 0) ? 
         (double)usec_diff / (double)calls_diff : 0.0;
     
-    printf("  %s:\n", field_name);
+    printf("%s:\n", field_name);
     printf("    Calls/sec: %.2f (total: %lld)\n", calls_per_sec, calls_diff);
     printf("    Avg latency (interval): %.2f usec\n", usec_per_call_interval);
     
@@ -875,7 +875,7 @@ static void diff_cmdstat_latency(const char *field_name, fieldSnapshot *old_call
     if (old_calls->per_node_values && new_calls->per_node_values &&
         old_usec->per_node_values && new_usec->per_node_values) {
         
-        printf("    Per-node distribution:\n");
+        printf("   Per-node distribution:\n");
         
         /* Calculate per-node metrics */
         typedef struct {
@@ -1337,7 +1337,6 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
         
         if (is_ftinfo && reply->type == VALKEY_REPLY_ARRAY) {
             lines = convertFtInfoToLines(reply, NULL);
-            // printf("~~~~~~ZZZZZZZZZZZZZZZZZZZ\nNew ft.info lines:\n%s\n", lines);
         } else if (reply->type == VALKEY_REPLY_STRING) {
             lines = sdsnew(reply->str);
         }
@@ -1499,7 +1498,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
         } else {
             /* Simple delta display */
             long long delta = new_field->value - old_field->value;
-            printf("  %s delta: %lld\n", old_field->field_name, delta);
+            printf("%s delta: %lld\n", old_field->field_name, delta);
         }
     }
     
@@ -1540,7 +1539,6 @@ void getAggregatedClusterStats(const char *command, int num_fields,
         
         if (is_ftinfo && reply->type == VALKEY_REPLY_ARRAY) {
             lines = convertFtInfoToLines(reply, NULL);
-            // printf("~~~~~~ZZZZZZZZZZZZZZZZZZZ\nNew ft.info lines:\n%s\n", lines);
         } else if (reply->type == VALKEY_REPLY_STRING) {
             lines = sdsnew(reply->str);
         }
@@ -1567,7 +1565,7 @@ void getAggregatedClusterStats(const char *command, int num_fields,
                             char *colon = strchr(line, ':');
                             if (colon) {
                                 long long value = field->parse(colon + 1);
-                                // printf("  %s: %lld\n", field->prefix_match, value);
+                                // printf("%s: %lld\n", field->prefix_match, value);
                                 
                                 int is_last = (node_idx == config.cluster_primary_node_count - 1);
                                 field->agg(&field_opaques[field_idx], value, 

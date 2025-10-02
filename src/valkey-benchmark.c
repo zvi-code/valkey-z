@@ -373,24 +373,7 @@ static void replacePlaceholderClusterTag(client c, const size_t *indices, const 
     /* Replace all occurrences in-place (exactly 8 bytes) */
     for (size_t j = 0; j < count; j++) {
         char *placeholder = cmd + indices[j];    
-        // write tag with surrounding {} in place of placeholder, pad with random bytes if needed. This is not vector, we replace the {tag} part in key to actual tag value by the crc16 slot
-        // first offset by 1 byte for '{', then copy tag, then offset by 1 byte for '}', then pad with random bytes if needed
-        // print debug if not starting with '{'
-        if (placeholder[0] != '{') {
-            // print command, count, indices, j and placeholder
-            fprintf(stderr, "Command: %s\n", cmd);
-            fprintf(stderr, "Count: %zu, Indices: ", count);
-            for (size_t k = 0; k < count; k++) {
-                fprintf(stderr, "%zu ", indices[k]);
-            }
-            fprintf(stderr, "\nCurrent index: %zu\n", j);
-            fprintf(stderr, "Error: placeholder does not start with '{': %.8s\n", placeholder);
-            exit(1);
-        }
         assert(placeholder[0] == '{');
-        // for (int k = 0; k < taglen; k++) {
-        //     placeholder[k+1] = tag[k]; // Clear existing placeholder
-        // }
         memcpy(placeholder + 1, tag, taglen);  // Copy tag
         placeholder[1 + taglen] = '}';         // Closing brace
         // Pad remaining bytes with random data if tag is shorter than 3 bytes
@@ -1075,26 +1058,23 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
     int is_cluster_client = (config.cluster_mode && thread_id >= 0);
     client c = zcalloc(sizeof(struct _client));
 
-    const char *ip = NULL;
-    int port = 0;
+    const char *ip = config.conn_info.hostip;
+    int port = config.conn_info.hostport;
     struct timeval tv = {0};
     c->cluster_node = NULL;
-
-    if (!is_cluster_client) {
-        ip = config.conn_info.hostip;
-        port = config.conn_info.hostport;
-    } else {
+    if (config.selected_node_count > 0) {
+        /* If the user specified a list of nodes, use them in a round-robin
+         * fashion. */
         int node_idx = 0;
-        if (config.num_threads < config.cluster_primary_node_count)
-            node_idx = config.liveclients % config.cluster_primary_node_count;
+        if (config.num_threads < config.selected_node_count)
+            node_idx = config.liveclients % config.selected_node_count;
         else
-            node_idx = thread_id % config.cluster_primary_node_count;
-        clusterNode *node = config.cluster_primary_nodes[node_idx];
+            node_idx = thread_id % config.selected_node_count;
+        clusterNode *node = config.selected_nodes[node_idx];
         assert(node != NULL);
-        ip = (const char *)node->ip;
+        ip = node->ip;
         port = node->port;
-        c->cluster_node = node;
-    }
+    } 
 
     c->context = valkeyConnectWrapper(config.ct, ip, port, tv, 1, config.mptcp);
     if (c->context->err) {
