@@ -726,6 +726,75 @@ static void display_latency_usec(const char *field_name, void *opaque, int node_
     }
 }
 
+/* Format large number with M/G suffix and comma separators */
+static void format_large_number(char *buf, size_t buf_size, long long value) {
+    if (value >= 1000000000LL) {
+        /* Billions */
+        double val = (double)value / 1000000000.0;
+        if (val >= 100.0) {
+            snprintf(buf, buf_size, "%.0fG", val);
+        } else if (val >= 10.0) {
+            snprintf(buf, buf_size, "%.1fG", val);
+        } else {
+            snprintf(buf, buf_size, "%.2fG", val);
+        }
+    } else if (value >= 1000000LL) {
+        /* Millions */
+        double val = (double)value / 1000000.0;
+        if (val >= 100.0) {
+            snprintf(buf, buf_size, "%.0fM", val);
+        } else if (val >= 10.0) {
+            snprintf(buf, buf_size, "%.1fM", val);
+        } else {
+            snprintf(buf, buf_size, "%.2fM", val);
+        }
+    } else if (value >= 10000LL) {
+        /* Thousands with comma separator */
+        if (value >= 1000000LL) {
+            snprintf(buf, buf_size, "%lld,%03lld,%03lld", 
+                    value / 1000000, (value / 1000) % 1000, value % 1000);
+        } else {
+            snprintf(buf, buf_size, "%lld,%03lld", value / 1000, value % 1000);
+        }
+    } else {
+        /* Small numbers - no formatting needed */
+        snprintf(buf, buf_size, "%lld", value);
+    }
+}
+
+/* Format rate with appropriate precision */
+static void format_rate(char *buf, size_t buf_size, double rate) {
+    if (rate >= 1000000.0) {
+        /* Millions */
+        double val = rate / 1000000.0;
+        if (val >= 100.0) {
+            snprintf(buf, buf_size, "%.0fM", val);
+        } else if (val >= 10.0) {
+            snprintf(buf, buf_size, "%.1fM", val);
+        } else {
+            snprintf(buf, buf_size, "%.2fM", val);
+        }
+    } else if (rate >= 10000.0) {
+        /* Thousands */
+        double val = rate / 1000.0;
+        if (val >= 100.0) {
+            snprintf(buf, buf_size, "%.0fK", val);
+        } else if (val >= 10.0) {
+            snprintf(buf, buf_size, "%.1fK", val);
+        } else {
+            snprintf(buf, buf_size, "%.2fK", val);
+        }
+    } else if (rate >= 10.0) {
+        snprintf(buf, buf_size, "%.0f", rate);
+    } else if (rate >= 1.0) {
+        snprintf(buf, buf_size, "%.1f", rate);
+    } else if (rate > 0.0) {
+        snprintf(buf, buf_size, "%.2f", rate);
+    } else {
+        snprintf(buf, buf_size, "0");
+    }
+}
+
 /* Calculate rate per second */
 static void diff_rate_per_second(const char *field_name, fieldSnapshot *old, 
                                  fieldSnapshot *new_snap, long long time_delta_ms, int node_idx) {
@@ -738,7 +807,13 @@ static void diff_rate_per_second(const char *field_name, fieldSnapshot *old,
         /* Cluster-wide rate */
         long long delta = new_snap->value - old->value;
         double rate = (double)delta / ((double)time_delta_ms / 1000.0);
-        printf("%.2f/sec (delta: %lld)", rate, delta);
+        
+        char rate_str[64];
+        char delta_str[64];
+        format_rate(rate_str, sizeof(rate_str), rate);
+        format_large_number(delta_str, sizeof(delta_str), delta);
+        
+        printf("%s/sec (Δ %s)", rate_str, delta_str);
     } else {
         /* Per-node rate */
         if (old->per_node_values && new_snap->per_node_values &&
@@ -746,7 +821,13 @@ static void diff_rate_per_second(const char *field_name, fieldSnapshot *old,
             long long node_delta = new_snap->per_node_values[node_idx] - 
                                    old->per_node_values[node_idx];
             double node_rate = (double)node_delta / ((double)time_delta_ms / 1000.0);
-            printf("%.2f/sec (delta: %lld)", node_rate, node_delta);
+            
+            char rate_str[64];
+            char delta_str[64];
+            format_rate(rate_str, sizeof(rate_str), node_rate);
+            format_large_number(delta_str, sizeof(delta_str), node_delta);
+            
+            printf("%s/sec (Δ %s)", rate_str, delta_str);
         }
     }
 }
@@ -761,10 +842,15 @@ static void diff_memory_growth(const char *field_name, fieldSnapshot *old,
     
     long long delta = new_snap->value - old->value;
     double mb_per_sec = (double)(delta / (1024 * 1024)) / ((double)time_delta_ms / 1000.0);
+    long long delta_mb = delta / (1024 * 1024);
     
     if (node_idx < 0) {
-        printf("%.2f MB/sec (delta: %lld MB)", 
-               mb_per_sec, delta / (1024 * 1024));
+        char rate_str[64];
+        char delta_str[64];
+        format_rate(rate_str, sizeof(rate_str), mb_per_sec);
+        format_large_number(delta_str, sizeof(delta_str), delta_mb);
+        
+        printf("%s MB/sec (Δ %s MB)", rate_str, delta_str);
     } else {
         if (old->per_node_values && new_snap->per_node_values &&
             node_idx < old->node_count && node_idx < new_snap->node_count) {
@@ -772,8 +858,14 @@ static void diff_memory_growth(const char *field_name, fieldSnapshot *old,
                                    old->per_node_values[node_idx];
             double node_mb_per_sec = (double)(node_delta / (1024 * 1024)) / 
                                      ((double)time_delta_ms / 1000.0);
-            printf("%.2f MB/sec (delta: %lld MB)", 
-                   node_mb_per_sec, node_delta / (1024 * 1024));
+            long long node_delta_mb = node_delta / (1024 * 1024);
+            
+            char rate_str[64];
+            char delta_str[64];
+            format_rate(rate_str, sizeof(rate_str), node_mb_per_sec);
+            format_large_number(delta_str, sizeof(delta_str), node_delta_mb);
+            
+            printf("%s MB/sec (Δ %s MB)", rate_str, delta_str);
         }
     }
 }
@@ -794,8 +886,22 @@ static void diff_percentage_change(const char *field_name, fieldSnapshot *old,
         } else {
             long long delta = new_snap->value - old->value;
             double pct_change = ((double)delta / (double)old->value) * 100.0;
-            printf("%.2f%% change (from %lld to %lld)", 
-                   pct_change, old->value, new_snap->value);
+            
+            char old_str[64];
+            char new_str[64];
+            format_large_number(old_str, sizeof(old_str), old->value);
+            format_large_number(new_str, sizeof(new_str), new_snap->value);
+            
+            /* Smart precision for percentage */
+            if (pct_change == 0.0) {
+                printf("0%% change (from %s to %s)", old_str, new_str);
+            } else if (fabs(pct_change) >= 10.0) {
+                printf("%.0f%% change (from %s to %s)", pct_change, old_str, new_str);
+            } else if (fabs(pct_change) >= 1.0) {
+                printf("%.1f%% change (from %s to %s)", pct_change, old_str, new_str);
+            } else {
+                printf("%.2f%% change (from %s to %s)", pct_change, old_str, new_str);
+            }
         }
     }
 }
@@ -814,10 +920,45 @@ static void diff_latency_change(const char *field_name, fieldSnapshot *old,
     if (node_idx < 0) {
         long long delta_usec = new_snap->value - old->value;
         double delta_ms = (double)delta_usec / 1000.0;
-        printf("%.2f ms delta (from %.2f to %.2f ms)", 
-               delta_ms, 
-               (double)old->value / 1000.0, 
-               (double)new_snap->value / 1000.0);
+        double old_ms = (double)old->value / 1000.0;
+        double new_ms = (double)new_snap->value / 1000.0;
+        
+        /* Smart precision for milliseconds */
+        char delta_str[64];
+        char old_str[64];
+        char new_str[64];
+        
+        if (delta_ms == 0.0) {
+            snprintf(delta_str, sizeof(delta_str), "Δ 0 ms");
+        } else if (fabs(delta_ms) >= 10.0) {
+            snprintf(delta_str, sizeof(delta_str), "Δ %.0f ms", delta_ms);
+        } else if (fabs(delta_ms) >= 1.0) {
+            snprintf(delta_str, sizeof(delta_str), "Δ %.1f ms", delta_ms);
+        } else {
+            snprintf(delta_str, sizeof(delta_str), "Δ %.2f ms", delta_ms);
+        }
+        
+        if (old_ms == 0.0) {
+            snprintf(old_str, sizeof(old_str), "0");
+        } else if (old_ms >= 10.0) {
+            snprintf(old_str, sizeof(old_str), "%.0f", old_ms);
+        } else if (old_ms >= 1.0) {
+            snprintf(old_str, sizeof(old_str), "%.1f", old_ms);
+        } else {
+            snprintf(old_str, sizeof(old_str), "%.2f", old_ms);
+        }
+        
+        if (new_ms == 0.0) {
+            snprintf(new_str, sizeof(new_str), "0");
+        } else if (new_ms >= 10.0) {
+            snprintf(new_str, sizeof(new_str), "%.0f", new_ms);
+        } else if (new_ms >= 1.0) {
+            snprintf(new_str, sizeof(new_str), "%.1f", new_ms);
+        } else {
+            snprintf(new_str, sizeof(new_str), "%.2f", new_ms);
+        }
+        
+        printf("%s (from %s to %s ms)", delta_str, old_str, new_str);
     }
 }
 
