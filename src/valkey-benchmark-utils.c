@@ -348,6 +348,7 @@ static struct config {
     int use_search; /* Use search indexes */
     searchIndex search;
     int print_search_results; /* Print FT.SEARCH results */
+    int search_debug;
 } config;
 
 
@@ -578,154 +579,6 @@ static void aggregate_max(void **opaque, long long value, int node_idx, int is_l
     UNUSED(is_last_node);
 }
 
-/* Display integer value */
-static void display_cmdstat(const char *field_name, const char* cmdstat, void *opaque, int node_count) {
-    UNUSED(node_count);
-    UNUSED(cmdstat);
-    if (!opaque) return;
-    if (field_name && strlen(field_name) > 0) {
-        printf("%s: %lld", field_name, *(long long *)opaque);
-    } else {
-        printf("%lld", *(long long *)opaque);
-    }
-}
-
-static void display_calls(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    UNUSED(field_name);
-    display_cmdstat(field_name, "calls", opaque, node_count);
-}
-static void display_usec(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    UNUSED(field_name);
-    display_cmdstat(field_name, "usec", opaque, node_count);
-}
-static void display_usec_per_call(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    UNUSED(field_name);
-    display_cmdstat(field_name, "usec_per_call", opaque, node_count);
-}
-static void display_failed(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    UNUSED(field_name);
-    display_cmdstat(field_name, "failed", opaque, node_count);
-}
-static void display_rejected(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    UNUSED(field_name);
-    display_cmdstat(field_name, "rejected", opaque, node_count);
-}
-
-/* Display integer value */
-static void display_integer(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    if (!opaque) return;
-    if (field_name && strlen(field_name) > 0) {
-        printf("%s: %lld", field_name, *(long long *)opaque);
-    } else {
-        printf("%lld", *(long long *)opaque);
-    }
-}
-
-/* Display memory in MB */
-static void display_memory_mb(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    if (!opaque) return;
-    long long bytes = *(long long *)opaque;
-    if (field_name && strlen(field_name) > 0) {
-        printf("%s: %.2f MB", field_name, (double)bytes / (1024.0 * 1024.0));
-    } else {
-        printf("%.2f MB", (double)bytes / (1024.0 * 1024.0));
-    }
-}
-
-/* Display memory in human-readable format */
-static void display_memory_human(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    if (!opaque) return;
-    long long bytes = *(long long *)opaque;
-    
-    const char *units[] = {"B", "KB", "MB", "GB", "TB"};
-    int unit_idx = 0;
-    double size = (double)bytes;
-    
-    while (size >= 1024.0 && unit_idx < 4) {
-        size /= 1024.0;
-        unit_idx++;
-    }
-    
-    if (field_name && strlen(field_name) > 0) {
-        printf("%s: %.2f %s", field_name, size, units[unit_idx]);
-    } else {
-        printf("%.2f %s", size, units[unit_idx]);
-    }
-}
-
-/* Display percentage (from fixed-point value scaled by 1000) */
-static void display_percentage(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    if (!opaque) return;
-    long long fixed_val = *(long long *)opaque;
-    if (field_name && strlen(field_name) > 0) {
-        printf("%s: %.3f%%", field_name, (double)fixed_val / 1000.0);
-    } else {
-        printf("%.3f%%", (double)fixed_val / 1000.0);
-    }
-}
-
-/* Display floating point value (from fixed-point scaled by 1000) */
-static void display_float(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    if (!opaque) return;
-    long long fixed_val = *(long long *)opaque;
-    if (field_name && strlen(field_name) > 0) {
-        printf("%s: %.3f", field_name, (double)fixed_val / 1000.0);
-    } else {
-        printf("%.3f", (double)fixed_val / 1000.0);
-    }
-}
-
-/* Display min/max range */
-static void display_minmax(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    if (!opaque) return;
-    
-    typedef struct {
-        long long min_val;
-        long long max_val;
-        int initialized;
-    } minmax_state_t;
-    
-    minmax_state_t *state = (minmax_state_t *)opaque;
-    if (state->initialized) {
-        if (state->min_val == state->max_val) {
-            if (field_name && strlen(field_name) > 0) {
-                printf("%s: %lld", field_name, state->min_val);
-            } else {
-                printf("%lld", state->min_val);
-            }
-        } else {
-            if (field_name && strlen(field_name) > 0) {
-                printf("%s: %lld - %lld", field_name, state->min_val, state->max_val);
-            } else {
-                printf("%lld - %lld", state->min_val, state->max_val);
-            }
-        }
-    }
-}
-
-/* Display latency in microseconds */
-static void display_latency_usec(const char *field_name, void *opaque, int node_count) {
-    UNUSED(node_count);
-    if (!opaque) return;
-    long long usec = *(long long *)opaque;
-    if (field_name && strlen(field_name) > 0) {
-        printf("%s: %.2f us", field_name, (double)usec / 1000.0);
-    } else {
-        printf("%.2f us", (double)usec / 1000.0);
-    }
-}
-
 /* Format large number with M/G suffix and comma separators */
 static void format_large_number(char *buf, size_t buf_size, long long value) {
     if (value >= 1000000000LL) {
@@ -792,6 +645,242 @@ static void format_rate(char *buf, size_t buf_size, double rate) {
         snprintf(buf, buf_size, "%.2f", rate);
     } else {
         snprintf(buf, buf_size, "0");
+    }
+}
+
+/* Display integer value */
+static void display_cmdstat(const char *field_name, const char* cmdstat, void *opaque, int node_count) {
+    UNUSED(node_count);
+    UNUSED(cmdstat);
+    if (!opaque) return;
+    long long value = *(long long *)opaque;
+    
+    char buf[64];
+    format_large_number(buf, sizeof(buf), value);
+    
+    if (field_name && strlen(field_name) > 0) {
+        printf("%s: %s", field_name, buf);
+    } else {
+        printf("%s", buf);
+    }
+}
+
+static void display_calls(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    UNUSED(field_name);
+    display_cmdstat(field_name, "calls", opaque, node_count);
+}
+static void display_usec(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    UNUSED(field_name);
+    display_cmdstat(field_name, "usec", opaque, node_count);
+}
+static void display_usec_per_call(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    UNUSED(field_name);
+    display_cmdstat(field_name, "usec_per_call", opaque, node_count);
+}
+static void display_failed(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    UNUSED(field_name);
+    display_cmdstat(field_name, "failed", opaque, node_count);
+}
+static void display_rejected(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    UNUSED(field_name);
+    display_cmdstat(field_name, "rejected", opaque, node_count);
+}
+
+/* Display integer value */
+static void display_integer(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) return;
+    long long value = *(long long *)opaque;
+    
+    char buf[64];
+    format_large_number(buf, sizeof(buf), value);
+    
+    if (field_name && strlen(field_name) > 0) {
+        printf("%s: %s", field_name, buf);
+    } else {
+        printf("%s", buf);
+    }
+}
+
+/* Display memory in MB */
+static void display_memory_mb(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) return;
+    long long bytes = *(long long *)opaque;
+    double mb = (double)bytes / (1024.0 * 1024.0);
+    
+    char buf[64];
+    if (mb == 0.0) {
+        snprintf(buf, sizeof(buf), "0 MB");
+    } else if (mb >= 1000.0) {
+        /* Use GB for large values */
+        double gb = mb / 1024.0;
+        if (gb >= 10.0) {
+            snprintf(buf, sizeof(buf), "%.0f GB", gb);
+        } else {
+            snprintf(buf, sizeof(buf), "%.2f GB", gb);
+        }
+    } else if (mb >= 10.0) {
+        snprintf(buf, sizeof(buf), "%.0f MB", mb);
+    } else if (mb >= 1.0) {
+        snprintf(buf, sizeof(buf), "%.1f MB", mb);
+    } else {
+        snprintf(buf, sizeof(buf), "%.2f MB", mb);
+    }
+    
+    if (field_name && strlen(field_name) > 0) {
+        printf("%s: %s", field_name, buf);
+    } else {
+        printf("%s", buf);
+    }
+}
+
+/* Display memory in human-readable format */
+static void display_memory_human(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) return;
+    long long bytes = *(long long *)opaque;
+    
+    const char *units[] = {"B", "KB", "MB", "GB", "TB"};
+    int unit_idx = 0;
+    double size = (double)bytes;
+    
+    while (size >= 1024.0 && unit_idx < 4) {
+        size /= 1024.0;
+        unit_idx++;
+    }
+    
+    char buf[64];
+    if (size == 0.0) {
+        snprintf(buf, sizeof(buf), "0 %s", units[unit_idx]);
+    } else if (size >= 100.0) {
+        snprintf(buf, sizeof(buf), "%.0f %s", size, units[unit_idx]);
+    } else if (size >= 10.0) {
+        snprintf(buf, sizeof(buf), "%.1f %s", size, units[unit_idx]);
+    } else {
+        snprintf(buf, sizeof(buf), "%.2f %s", size, units[unit_idx]);
+    }
+    
+    if (field_name && strlen(field_name) > 0) {
+        printf("%s: %s", field_name, buf);
+    } else {
+        printf("%s", buf);
+    }
+}
+
+/* Display percentage (from fixed-point value scaled by 1000) */
+static void display_percentage(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) return;
+    long long fixed_val = *(long long *)opaque;
+    double pct = (double)fixed_val / 1000.0;
+    
+    char buf[64];
+    if (pct == 0.0) {
+        snprintf(buf, sizeof(buf), "0%%");
+    } else if (fabs(pct) >= 10.0) {
+        snprintf(buf, sizeof(buf), "%.0f%%", pct);
+    } else if (fabs(pct) >= 1.0) {
+        snprintf(buf, sizeof(buf), "%.1f%%", pct);
+    } else {
+        snprintf(buf, sizeof(buf), "%.3f%%", pct);
+    }
+    
+    if (field_name && strlen(field_name) > 0) {
+        printf("%s: %s", field_name, buf);
+    } else {
+        printf("%s", buf);
+    }
+}
+
+/* Display floating point value (from fixed-point scaled by 1000) */
+static void display_float(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) return;
+    long long fixed_val = *(long long *)opaque;
+    double val = (double)fixed_val / 1000.0;
+    
+    char buf[64];
+    if (val == 0.0) {
+        snprintf(buf, sizeof(buf), "0");
+    } else if (fabs(val) >= 1000.0) {
+        format_rate(buf, sizeof(buf), val);
+    } else if (fabs(val) >= 100.0) {
+        snprintf(buf, sizeof(buf), "%.0f", val);
+    } else if (fabs(val) >= 10.0) {
+        snprintf(buf, sizeof(buf), "%.1f", val);
+    } else {
+        snprintf(buf, sizeof(buf), "%.3f", val);
+    }
+    
+    if (field_name && strlen(field_name) > 0) {
+        printf("%s: %s", field_name, buf);
+    } else {
+        printf("%s", buf);
+    }
+}
+
+/* Display min/max range */
+static void display_minmax(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) return;
+    
+    typedef struct {
+        long long min_val;
+        long long max_val;
+        int initialized;
+    } minmax_state_t;
+    
+    minmax_state_t *state = (minmax_state_t *)opaque;
+    if (state->initialized) {
+        char min_buf[64];
+        char max_buf[64];
+        format_large_number(min_buf, sizeof(min_buf), state->min_val);
+        format_large_number(max_buf, sizeof(max_buf), state->max_val);
+        
+        if (state->min_val == state->max_val) {
+            if (field_name && strlen(field_name) > 0) {
+                printf("%s: %s", field_name, min_buf);
+            } else {
+                printf("%s", min_buf);
+            }
+        } else {
+            if (field_name && strlen(field_name) > 0) {
+                printf("%s: %s - %s", field_name, min_buf, max_buf);
+            } else {
+                printf("%s - %s", min_buf, max_buf);
+            }
+        }
+    }
+}
+
+/* Display latency in microseconds */
+static void display_latency_usec(const char *field_name, void *opaque, int node_count) {
+    UNUSED(node_count);
+    if (!opaque) return;
+    long long usec = *(long long *)opaque;
+    double ms = (double)usec / 1000.0;
+    
+    char buf[64];
+    if (ms == 0.0) {
+        snprintf(buf, sizeof(buf), "0 us");
+    } else if (ms >= 10.0) {
+        snprintf(buf, sizeof(buf), "%.0f us", ms);
+    } else if (ms >= 1.0) {
+        snprintf(buf, sizeof(buf), "%.1f us", ms);
+    } else {
+        snprintf(buf, sizeof(buf), "%.2f us", ms);
+    }
+    
+    if (field_name && strlen(field_name) > 0) {
+        printf("%s: %s", field_name, buf);
+    } else {
+        printf("%s", buf);
     }
 }
 
@@ -2026,14 +2115,14 @@ infoFieldType search_info_fields[] = {
 
     /* Latencies */
     {"search_hnsw_vector_index_search_latency_usec", "p50", exact_field_matcher, 
-     parse_percentile_p50, aggregate_average, display_latency_usec, diff_latency_change, 1, FROM_ALL, 1},
+     parse_percentile_p50, aggregate_average, display_latency_usec, NULL, 1, FROM_ALL, 1},
     {"search_hnsw_vector_index_search_latency_usec", "p99", exact_field_matcher, 
-     parse_percentile_p99, aggregate_average, display_latency_usec, diff_latency_change, 1, FROM_ALL, 1},
+     parse_percentile_p99, aggregate_average, display_latency_usec, NULL, 1, FROM_ALL, 1},
     {"search_hnsw_vector_index_search_latency_usec", "p999", exact_field_matcher, 
-     parse_percentile_p999, aggregate_max, display_latency_usec, diff_latency_change, 1, FROM_ALL, 1},
+     parse_percentile_p999, aggregate_max, display_latency_usec, NULL, 1, FROM_ALL, 1},
     {"search_coordinator_server_search_index_partition_success_latency_usec", "p99",
      exact_field_matcher, parse_percentile_p99, aggregate_average, display_latency_usec, 
-     diff_latency_change, 1, FROM_ALL, 1},
+     NULL, 1, FROM_ALL, 1},
     /* Error rates */
     {"search_hnsw_add_exceptions_count", "", exact_field_matcher, 
      parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
