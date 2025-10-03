@@ -921,6 +921,42 @@ static void diff_rate_per_second(const char *field_name, fieldSnapshot *old,
     }
 }
 
+/* Calculate rate per second */
+static void diff_us_rate_per_second(const char *field_name, fieldSnapshot *old, 
+                                 fieldSnapshot *new_snap, long long time_delta_ms, int node_idx) {
+    UNUSED(field_name);
+    if (!old || !new_snap || !old->valid || !new_snap->valid || time_delta_ms <= 0) {
+        return;
+    }
+    
+    if (node_idx < 0) {
+        /* Cluster-wide rate */
+        long long delta = new_snap->value - old->value;
+        double rate = (double)delta / ((double)time_delta_ms / 1000.0) / 1000.0 / 1000.0;
+        
+        char rate_str[64];
+        char delta_str[64];
+        format_rate(rate_str, sizeof(rate_str), rate);
+        format_large_number(delta_str, sizeof(delta_str), delta);
+        
+        printf("%s/sec (Δ %s)", rate_str, delta_str);
+    } else {
+        /* Per-node rate */
+        if (old->per_node_values && new_snap->per_node_values &&
+            node_idx < old->node_count && node_idx < new_snap->node_count) {
+            long long node_delta = new_snap->per_node_values[node_idx] - 
+                                   old->per_node_values[node_idx];
+            double node_rate = (double)node_delta / ((double)time_delta_ms / 1000.0) / 1000.0 / 1000.0;
+            
+            char rate_str[64];
+            char delta_str[64];
+            format_rate(rate_str, sizeof(rate_str), node_rate);
+            format_large_number(delta_str, sizeof(delta_str), node_delta);
+            
+            printf("%s/sec (Δ %s)", rate_str, delta_str);
+        }
+    }
+}
 /* Calculate memory growth rate */
 static void diff_memory_growth(const char *field_name, fieldSnapshot *old, 
                                fieldSnapshot *new_snap, long long time_delta_ms, int node_idx) {
@@ -2434,7 +2470,8 @@ infoFieldType search_info_fields[] = {
     /* Indexing rates */
     {"search_total_indexed_documents", "", exact_field_matcher, 
      parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
-
+    {"search_total_active_write_threads", "", exact_field_matcher, 
+     parse_integer_value, aggregate_minmax, display_integer, NULL, 1, FROM_ALL, 1},
     /* CPU usage */
     {"search_read_cpu_time_sec", "", exact_field_matcher, 
      parse_float_as_fixed, aggregate_sum, display_float, diff_rate_per_second, 1, FROM_ALL, 1},
@@ -2516,7 +2553,7 @@ infoFieldType info_fields[] = {
     {"cmdstat_FT.SEARCH", "calls", prefix_field_matcher, 
      parse_cmdstat_calls, aggregate_sum, display_calls, diff_rate_per_second, 1, FROM_ALL, 0},
     {"cmdstat_FT.SEARCH", "usec", prefix_field_matcher, 
-     parse_cmdstat_usec, aggregate_sum, display_usec, diff_rate_per_second, 1, FROM_ALL, 0},
+     parse_cmdstat_usec, aggregate_sum, display_usec, diff_us_rate_per_second, 1, FROM_ALL, 0},
     {"cmdstat_FT.SEARCH", "usec_per_call", prefix_field_matcher, 
      parse_cmdstat_usec_per_call, aggregate_average, display_usec_per_call, NULL, 1, FROM_ALL, 0},
     {"cmdstat_FT.SEARCH", "rejected", prefix_field_matcher, 
@@ -2526,7 +2563,7 @@ infoFieldType info_fields[] = {
     {"cmdstat_hset", "calls", prefix_field_matcher, 
      parse_cmdstat_calls, aggregate_sum, display_calls, diff_rate_per_second, 1, FROM_PRIMARY_ONLY, 0},
     {"cmdstat_hset", "usec", prefix_field_matcher, 
-     parse_cmdstat_usec, aggregate_sum, display_usec, diff_rate_per_second, 1, FROM_PRIMARY_ONLY, 0},
+     parse_cmdstat_usec, aggregate_sum, display_usec, diff_us_rate_per_second, 1, FROM_PRIMARY_ONLY, 0},
     {"cmdstat_hset", "usec_per_call", prefix_field_matcher, 
      parse_cmdstat_usec_per_call, aggregate_average, display_usec_per_call, NULL, 1, FROM_PRIMARY_ONLY, 0},
     {"cmdstat_hset", "rejected", prefix_field_matcher, 

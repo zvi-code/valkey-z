@@ -1349,7 +1349,9 @@ static void startBenchmarkThreads(void) {
     }
     for (i = 0; i < config.num_threads; i++) pthread_join(config.threads[i]->thread, NULL);
 }
-
+static clusterSnapshot* last_search_info = NULL;
+static clusterSnapshot* last_ftinfo = NULL;
+static clusterSnapshot* last_info_all = NULL;
 /* Benchmark a sequence of commands. The cmd is RESP encoded of length len and
  * seqlen is the number of commands included in cmd. */
 static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen) {
@@ -1382,24 +1384,6 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     long long after_search_total_docs = 0;
     long long after_search_ingest_field_vector = 0;
     long long after_search_background_indexing_status = 0;
-    clusterSnapshot* before_search_info = NULL;
-    clusterSnapshot* before_ftinfo = NULL;
-    clusterSnapshot* before_info_all = NULL;
-    clusterSnapshot* after_search_info = NULL;
-    clusterSnapshot* after_ftinfo = NULL;
-    clusterSnapshot* after_info_all = NULL;
-    if (config.use_search) {
-        before_search_info = getSearchInfo(&search_memory, &search_reclaimable, &search_total_docs,
-                            &search_ingest_field_vector, &search_background_indexing_status);
-        before_ftinfo = getFtInfoStatistics(config.search.name);
-        before_info_all = getInfoCluster();
-        // printf("  Search index memory: %lld MB\n", search_memory/ (1024 * 1024));
-        // printf("  Search index reclaimable: %lld MB\n", search_reclaimable/ (1024 * 1024));
-        // printf("  Search total documents: %lld\n", search_total_docs);
-        // printf("  Search ingest field vector: %lld\n", search_ingest_field_vector);
-        // printf("  Search background indexing status: %lld\n", search_background_indexing_status);
-        getFullInfo(config.search.name);
-    }
     
     if (config.rps > 0) {
         config.time_per_token = 1000000000 / config.rps;
@@ -1419,22 +1403,29 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     config.totlatency = mstime() - config.start;
     if (config.use_search) {
         getFullInfo(config.search.name);
+        clusterSnapshot* after_search_info = NULL;
+        clusterSnapshot* after_ftinfo = NULL;
+        clusterSnapshot* after_info_all = NULL;
         after_search_info = getSearchInfo(&after_search_memory, &after_search_reclaimable, &after_search_total_docs,
                             &after_search_ingest_field_vector, &after_search_background_indexing_status);
         after_ftinfo = getFtInfoStatistics(config.search.name);
         after_info_all = getInfoCluster();
-        compareInfoSnapshots(before_info_all, after_info_all, before_ftinfo, after_ftinfo, before_search_info, after_search_info);
-        // if (after_search_memory != search_memory)
-        //     printf("search_memory: %lld MB -> %lld MB\n", search_memory / (1024 * 1024), after_search_memory / (1024 * 1024));
-        // if (after_search_reclaimable != search_reclaimable)
-        //     printf("search_reclaimable: %lld MB -> %lld MB\n", search_reclaimable / (1024 * 1024), after_search_reclaimable / (1024 * 1024));
-        // if (after_search_total_docs != search_total_docs)
-        //     printf("search_total_docs: %lld -> %lld\n", search_total_docs, after_search_total_docs);
-        // if (after_search_ingest_field_vector != search_ingest_field_vector)
-        //     printf("search_ingest_field_vector: %lld -> %lld\n", search_ingest_field_vector, after_search_ingest_field_vector);
-        // if (after_search_background_indexing_status != search_background_indexing_status)
-        //     printf("search_background_indexing_status: %lld -> %lld\n", search_background_indexing_status, after_search_background_indexing_status);
-
+        compareInfoSnapshots(last_info_all, after_info_all, last_ftinfo, after_ftinfo, last_search_info, after_search_info);
+        freeClusterSnapshot(last_search_info);
+        freeClusterSnapshot(last_ftinfo);
+        freeClusterSnapshot(last_info_all);
+        last_search_info = after_search_info;
+        last_ftinfo = after_ftinfo;
+        last_info_all = after_info_all;
+        printf("Search memory usage: before=%lld after=%lld (diff=%+lld), reclaimable: before=%lld after=%lld (diff=%+lld)\n",
+               search_memory, after_search_memory, after_search_memory - search_memory,
+               search_reclaimable, after_search_reclaimable, after_search_reclaimable - search_reclaimable);
+        printf("Search total docs: before=%lld after=%lld (diff=%+lld)\n",
+               search_total_docs, after_search_total_docs, after_search_total_docs - search_total_docs);
+        printf("Search ingest field vector: before=%lld after=%lld (diff=%+lld)\n",
+               search_ingest_field_vector, after_search_ingest_field_vector, after_search_ingest_field_vector - search_ingest_field_vector);
+        printf("Search background indexing status: before=%lld after=%lld (diff=%+lld)\n",
+               search_background_indexing_status, after_search_background_indexing_status, after_search_background_indexing_status - search_background_indexing_status);
     }
     showLatencyReport();
     freeAllClients();
@@ -2996,6 +2987,15 @@ int main(int argc, char **argv) {
     if (config.use_search) {
         printf("Using search indexes for the benchmark.\n");
         createDefaultSearchIndexes();
+        long long search_memory = 0;
+        long long search_reclaimable = 0;
+        long long search_total_docs = 0;
+        long long search_ingest_field_vector = 0;
+        long long search_background_indexing_status = 0;
+        last_search_info = getSearchInfo(&search_memory, &search_reclaimable, &search_total_docs,
+                    &search_ingest_field_vector, &search_background_indexing_status);
+        last_ftinfo = getFtInfoStatistics(config.search.name);
+        last_info_all = getInfoCluster();
     }
     /* Run default benchmark suite. */
     data = zcalloc(config.datasize + 1);
