@@ -9,7 +9,6 @@ typedef struct fieldSnapshot {
     char* value_str;
     long long value;
     long long*  per_node_values;  /* Array of per-node values */
-    char** per_node_values_strs;  /* Array of per-node values */
     int node_count;
     int valid;
 } fieldSnapshot;

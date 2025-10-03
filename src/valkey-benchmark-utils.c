@@ -1674,7 +1674,7 @@ void getFullInfo(const char *index_name) {
     long long search_reclaimable = 0;
     long long search_total_docs = 0;
     long long search_ingest_field_vector = 0;
-    printf("\n------>\n");
+    // printf("\n------>\n");
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
     int ftinfo_num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
@@ -1697,25 +1697,25 @@ void getFullInfo(const char *index_name) {
             } else if (sdscmp(search_info_snapshot->fields[i].field_name, "search_ingest_field_vector") == 0) {
                 search_ingest_field_vector = search_info_snapshot->fields[i].value;
             } 
-            printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
+            // printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
         }        
     }
-    printf("> search_memory: %f MB, search_total_indexed_documents: %lld, search_reclaimable: %f MB, search_ingest_field_vector: %lld\n", search_memory / (1024.0 * 1024.0), search_total_docs, search_reclaimable / (1024.0 * 1024.0), search_ingest_field_vector);
+    printf("search_memory: %f MB, search_total_indexed_documents: %lld, search_reclaimable: %f MB, search_ingest_field_vector: %lld\n", search_memory / (1024.0 * 1024.0), search_total_docs, search_reclaimable / (1024.0 * 1024.0), search_ingest_field_vector);
 
-    for (int i = 0; i < info_snapshot->num_fields; i++) {
-        if (info_snapshot->fields[i].valid) {
-            printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
-        }
-    }
-    for (int i = 0; i < ftinfo_snapshot->num_fields; i++) {
-        if (ftinfo_snapshot->fields[i].valid) {
-            printf("> %s:%lld\n", ftinfo_snapshot->fields[i].field_name, ftinfo_snapshot->fields[i].value);
-        }
-    }
+    // for (int i = 0; i < info_snapshot->num_fields; i++) {
+    //     if (info_snapshot->fields[i].valid) {
+    //         printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
+    //     }
+    // }
+    // for (int i = 0; i < ftinfo_snapshot->num_fields; i++) {
+    //     if (ftinfo_snapshot->fields[i].valid) {
+    //         printf("> %s:%lld\n", ftinfo_snapshot->fields[i].field_name, ftinfo_snapshot->fields[i].value);
+    //     }
+    // }
     freeClusterSnapshot(ftinfo_snapshot);
     freeClusterSnapshot(search_info_snapshot);
     freeClusterSnapshot(info_snapshot);
-    printf("------>\n");
+    // printf("------>\n");
 }
 
 clusterSnapshot* getSearchInfo(long long *search_memory, long long *search_reclaimable, 
