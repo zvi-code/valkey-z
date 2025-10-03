@@ -173,12 +173,6 @@ typedef struct searchFtInfoResponse {
 
 } searchFtInfoResponse;
 
-/* Read from replica options */
-typedef enum readFromReplica {
-    FROM_PRIMARY_ONLY = 0, /* default option */
-    FROM_REPLICA_ONLY,
-    FROM_ALL
-} readFromReplica;
 
 /* Tag distribution structure */
 typedef struct tagDistribution {
@@ -506,7 +500,7 @@ static void aggregate_sum(void **opaque, long long value, int node_idx, int is_l
     UNUSED(node_idx);
     
     if (!*opaque) {
-        *opaque = zmalloc(sizeof(long long));
+        *opaque = zcalloc(sizeof(long long));
         *(long long *)*opaque = 0;
     }
     
@@ -522,7 +516,7 @@ static void aggregate_average(void **opaque, long long value, int node_idx, int 
     } avg_state_t;
     
     if (!*opaque) {
-        *opaque = zmalloc(sizeof(avg_state_t));
+        *opaque = zcalloc(sizeof(avg_state_t));
         ((avg_state_t *)*opaque)->sum = 0;
         ((avg_state_t *)*opaque)->count = 0;
     }
@@ -549,7 +543,7 @@ static void aggregate_minmax(void **opaque, long long value, int node_idx, int i
     } minmax_state_t;
     
     if (!*opaque) {
-        *opaque = zmalloc(sizeof(minmax_state_t));
+        *opaque = zcalloc(sizeof(minmax_state_t));
         ((minmax_state_t *)*opaque)->initialized = 0;
     }
     
@@ -571,7 +565,7 @@ static void aggregate_minmax(void **opaque, long long value, int node_idx, int i
 /* Maximum aggregation */
 static void aggregate_max(void **opaque, long long value, int node_idx, int is_last_node) {
     if (!*opaque) {
-        *opaque = zmalloc(sizeof(long long));
+        *opaque = zcalloc(sizeof(long long));
         *(long long *)*opaque = value;
     } else {
         long long *max_val = (long long *)*opaque;
@@ -589,7 +583,7 @@ static void display_cmdstat(const char *field_name, const char* cmdstat, void *o
     UNUSED(node_count);
     UNUSED(cmdstat);
     if (!opaque) return;
-    printf("%s: %lld\n", field_name, *(long long *)opaque);
+    printf("%s: %lld", field_name, *(long long *)opaque);
 }
 
 static void display_calls(const char *field_name, void *opaque, int node_count) {
@@ -622,7 +616,7 @@ static void display_rejected(const char *field_name, void *opaque, int node_coun
 static void display_integer(const char *field_name, void *opaque, int node_count) {
     UNUSED(node_count);
     if (!opaque) return;
-    printf("%s: %lld\n", field_name, *(long long *)opaque);
+    printf("%s: %lld", field_name, *(long long *)opaque);
 }
 
 /* Display memory in MB */
@@ -630,7 +624,7 @@ static void display_memory_mb(const char *field_name, void *opaque, int node_cou
     UNUSED(node_count);
     if (!opaque) return;
     long long bytes = *(long long *)opaque;
-    printf("%s: %.2f MB\n", field_name, (double)bytes / (1024.0 * 1024.0));
+    printf("%s: %.2f MB", field_name, (double)bytes / (1024.0 * 1024.0));
 }
 
 /* Display memory in human-readable format */
@@ -648,7 +642,7 @@ static void display_memory_human(const char *field_name, void *opaque, int node_
         unit_idx++;
     }
     
-    printf("%s: %.2f %s\n", field_name, size, units[unit_idx]);
+    printf("%s: %.2f %s", field_name, size, units[unit_idx]);
 }
 
 /* Display percentage (from fixed-point value scaled by 1000) */
@@ -656,7 +650,7 @@ static void display_percentage(const char *field_name, void *opaque, int node_co
     UNUSED(node_count);
     if (!opaque) return;
     long long fixed_val = *(long long *)opaque;
-    printf("%s: %.3f%%\n", field_name, (double)fixed_val / 1000.0);
+    printf("%s: %.3f%%", field_name, (double)fixed_val / 1000.0);
 }
 
 /* Display floating point value (from fixed-point scaled by 1000) */
@@ -664,7 +658,7 @@ static void display_float(const char *field_name, void *opaque, int node_count) 
     UNUSED(node_count);
     if (!opaque) return;
     long long fixed_val = *(long long *)opaque;
-    printf("%s: %.3f\n", field_name, (double)fixed_val / 1000.0);
+    printf("%s: %.3f", field_name, (double)fixed_val / 1000.0);
 }
 
 /* Display min/max range */
@@ -681,9 +675,9 @@ static void display_minmax(const char *field_name, void *opaque, int node_count)
     minmax_state_t *state = (minmax_state_t *)opaque;
     if (state->initialized) {
         if (state->min_val == state->max_val) {
-            printf("%s: %lld\n", field_name, state->min_val);
+            printf("%s: %lld", field_name, state->min_val);
         } else {
-            printf("%s: %lld - %lld\n", field_name, state->min_val, state->max_val);
+            printf("%s: %lld - %lld", field_name, state->min_val, state->max_val);
         }
     }
 }
@@ -693,7 +687,7 @@ static void display_latency_usec(const char *field_name, void *opaque, int node_
     UNUSED(node_count);
     if (!opaque) return;
     long long usec = *(long long *)opaque;
-    printf("%s: %.2f us\n", field_name, (double)usec / 1000.0);
+    printf("%s: %.2f us", field_name, (double)usec / 1000.0);
 }
 
 /* Calculate rate per second */
@@ -707,7 +701,7 @@ static void diff_rate_per_second(const char *field_name, fieldSnapshot *old,
         /* Cluster-wide rate */
         long long delta = new_snap->value - old->value;
         double rate = (double)delta / ((double)time_delta_ms / 1000.0);
-        printf("%s/sec: %.2f (delta: %lld)\n", field_name, rate, delta);
+        printf("%s/sec: %.2f (delta: %lld)", field_name, rate, delta);
     } else {
         /* Per-node rate */
         if (old->per_node_values && new_snap->per_node_values &&
@@ -715,7 +709,7 @@ static void diff_rate_per_second(const char *field_name, fieldSnapshot *old,
             long long node_delta = new_snap->per_node_values[node_idx] - 
                                    old->per_node_values[node_idx];
             double node_rate = (double)node_delta / ((double)time_delta_ms / 1000.0);
-            printf("Node %d: %.2f/sec (delta: %lld)\n", node_idx, node_rate, node_delta);
+            printf("Node %d: %.2f/sec (delta: %lld)", node_idx, node_rate, node_delta);
         }
     }
 }
@@ -731,7 +725,7 @@ static void diff_memory_growth(const char *field_name, fieldSnapshot *old,
     double mb_per_sec = (double)(delta / (1024 * 1024)) / ((double)time_delta_ms / 1000.0);
     
     if (node_idx < 0) {
-        printf("%s growth: %.2f MB/sec (total delta: %lld MB)\n", 
+        printf("%s growth: %.2f MB/sec (total delta: %lld MB)", 
                field_name, mb_per_sec, delta / (1024 * 1024));
     } else {
         if (old->per_node_values && new_snap->per_node_values &&
@@ -740,7 +734,7 @@ static void diff_memory_growth(const char *field_name, fieldSnapshot *old,
                                    old->per_node_values[node_idx];
             double node_mb_per_sec = (double)(node_delta / (1024 * 1024)) / 
                                      ((double)time_delta_ms / 1000.0);
-            printf("Node %d: %.2f MB/sec (delta: %lld MB)\n", 
+            printf("Node %d: %.2f MB/sec (delta: %lld MB)", 
                    node_idx, node_mb_per_sec, node_delta / (1024 * 1024));
         }
     }
@@ -757,11 +751,11 @@ static void diff_percentage_change(const char *field_name, fieldSnapshot *old,
     
     if (node_idx < 0) {
         if (old->value == 0) {
-            printf("%s: N/A (initial value was 0)\n", field_name);
+            printf("%s: N/A (initial value was 0)", field_name);
         } else {
             long long delta = new_snap->value - old->value;
             double pct_change = ((double)delta / (double)old->value) * 100.0;
-            printf("%s change: %.2f%% (from %lld to %lld)\n", 
+            printf("%s change: %.2f%% (from %lld to %lld)", 
                    field_name, pct_change, old->value, new_snap->value);
         }
     }
@@ -780,7 +774,7 @@ static void diff_latency_change(const char *field_name, fieldSnapshot *old,
     if (node_idx < 0) {
         long long delta_usec = new_snap->value - old->value;
         double delta_ms = (double)delta_usec / 1000.0;
-        printf("%s delta: %.2f ms (from %.2f to %.2f ms)\n", 
+        printf("%s delta: %.2f ms (from %.2f to %.2f ms)", 
                field_name, delta_ms, 
                (double)old->value / 1000.0, 
                (double)new_snap->value / 1000.0);
@@ -855,7 +849,15 @@ static void diff_cmdstat_latency(const char *field_name, fieldSnapshot *old_call
     if (!old_calls || !new_calls || !old_usec || !new_usec || 
         !old_calls->valid || !new_calls->valid || 
         !old_usec->valid || !new_usec->valid || time_delta_ms <= 0) {
-        return;
+        // print full detailed debug info and exit
+        // print all details about old calls and new calls and time delta
+        printf("%s: insufficient data for latency calculation\n", field_name);
+        printf("  old_calls valid: %d, value: %lld\n", old_calls ? old_calls->valid : 0, old_calls ? old_calls->value : 0);
+        printf("  new_calls valid: %d, value: %lld\n", new_calls ? new_calls->valid : 0, new_calls ? new_calls->value : 0);
+        printf("  old_usec valid: %d, value: %lld\n", old_usec ? old_usec->valid : 0, old_usec ? old_usec->value : 0);
+        printf("  new_usec valid: %d, value: %lld\n", new_usec ? new_usec->valid : 0, new_usec ? new_usec->value : 0);
+        printf("  time_delta_ms: %lld\n", time_delta_ms);
+        return;      
     }
     
     long long calls_diff = new_calls->value - old_calls->value;
@@ -1284,18 +1286,13 @@ search_network_bytes_out:0
 search_network_bytes_in:0
 */
 clusterSnapshot* createClusterSnapshot(const char *command, int num_fields, 
-                                       infoFieldType *fields) {
-    if (!config.cluster_mode || !config.cluster_primary_nodes) {
-        fprintf(stderr, "Cluster mode not enabled.\n");
-        return NULL;
-    }
-    
-    clusterSnapshot *snapshot = zmalloc(sizeof(clusterSnapshot));
+                                       infoFieldType *fields, int print_info) {
+    clusterSnapshot *snapshot = zcalloc(sizeof(clusterSnapshot));
     snapshot->timestamp_ms = ustime() / 1000;
     snapshot->num_fields = num_fields;
     snapshot->fields = zcalloc(num_fields * sizeof(fieldSnapshot));
-    snapshot->num_nodes = config.cluster_primary_node_count;
-    snapshot->node_identifiers = zmalloc(snapshot->num_nodes * sizeof(sds));
+    snapshot->num_nodes = config.cluster_node_count;
+    snapshot->node_identifiers = zcalloc(snapshot->num_nodes * sizeof(sds));
     
     /* Initialize fields */
     for (int i = 0; i < num_fields; i++) {
@@ -1312,39 +1309,38 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
     
     /* Temporary storage for aggregation */
     void **field_opaques = zcalloc(num_fields * sizeof(void *));
-    
+    int *field_node_counts = zcalloc(num_fields * sizeof(int));
+
     /* Detect command type */
     int is_ftinfo = (strncasecmp(command, "FT.INFO", 7) == 0);
     // printf("Collecting data using command: %s is_ftinfo %s\n", command, is_ftinfo ? " (FT.INFO mode)" : "");
     /* Query each node */
-    for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
-        clusterNode *node = config.cluster_primary_nodes[node_idx];
-        if (!node) continue;
-        
+    for (int node_idx = 0; node_idx < config.cluster_node_count; node_idx++) {
+        clusterNode *node = config.cluster_nodes[node_idx];
+        assert(node != NULL);
+        int is_replica = node->replicate == NULL ? 0 : 1;
         /* Store node identifier */
         snapshot->node_identifiers[node_idx] = sdscatprintf(sdsempty(), 
                                                             "%s:%d", node->ip, node->port);
         
         valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(config.ct, node->ip, node->port);
-        if (!ctx) continue;
+        assert(ctx != NULL);
         
         valkeyReply *reply = valkeyCommand(ctx, command);
-        if (!reply) {
-            continue;
-        }
+        assert(reply != NULL);
         
         sds lines = NULL;
         
         if (is_ftinfo && reply->type == VALKEY_REPLY_ARRAY) {
             lines = convertFtInfoToLines(reply, NULL);
-        } else if (reply->type == VALKEY_REPLY_STRING) {
+        } else if (reply->type == VALKEY_REPLY_STRING || reply->type == VALKEY_REPLY_STATUS) {
             lines = sdsnew(reply->str);
         }
         
         if (lines) {
             char *lines_copy = strdup(lines);
             char *saveptr;
-            char *line = strtok_r(lines_copy, "\r\n", &saveptr);
+            char *line = strtok_r(lines_copy, "\n", &saveptr);
             
             while (line != NULL) {
                 /* Skip empty lines and comments */
@@ -1365,16 +1361,24 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
                                 }
                                 
                                 /* Aggregate */
-                                int is_last_node = (node_idx == config.cluster_primary_node_count - 1);
-                                field->agg(&field_opaques[field_idx], parsed_value, 
-                                          node_idx, is_last_node);
+                                int is_last_node = (node_idx == config.cluster_node_count - 1);
+                                if ((field->nodes_to_aggregate == FROM_ALL) || 
+                                    (field->nodes_to_aggregate == FROM_PRIMARY_ONLY && !is_replica) || 
+                                    (field->nodes_to_aggregate == FROM_REPLICA_ONLY && is_replica)) {
+                                    field->agg(&field_opaques[field_idx], parsed_value, 
+                                              node_idx, is_last_node);
+                                    field_node_counts[field_idx]++;
+                                }
+                                
                                 snapshot->fields[field_idx].valid = 1;
                             }
-                            break;
+                            if (field->is_last) {
+                                break; /* No need to check other fields */
+                            }
                         }
                     }
                 }
-                line = strtok_r(NULL, "\r\n", &saveptr);
+                line = strtok_r(NULL, "\n", &saveptr);
             }
             
             free(lines_copy);
@@ -1406,11 +1410,48 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
                 snapshot->fields[field_idx].value = state->max_val;  /* Store max for diff */
             } else {
                 snapshot->fields[field_idx].value = *(long long *)field_opaques[field_idx];
-            }
-            zfree(field_opaques[field_idx]);
+            }            
         }
     }
-    
+    if (print_info) {
+        /* Display aggregated results */
+        printf("\n========================================\n");
+        printf("Cluster Aggregate: %s num_fields: %d\n", command, num_fields);
+        printf("========================================\n");
+        
+        for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+            sds display_name = sdsempty();
+            if (strcmp(fields[field_idx].name, "") == 0) {
+                display_name = sdscatprintf(display_name, "%s", 
+                                        fields[field_idx].prefix_match);
+            } else {
+                display_name = sdscatprintf(display_name, "%s.%s", 
+                                        fields[field_idx].prefix_match, fields[field_idx].name);
+            }            
+            fields[field_idx].disp(display_name, 
+                                    field_opaques[field_idx],
+                                    snapshot->fields[field_idx].node_count);
+            // print the distribution per-node if tracked using snapshot->fields[field_idx].per_node_values[node_idx]
+            // show as single line distribution accross nodes
+            if (fields[field_idx].track_per_node && snapshot->fields[field_idx].per_node_values) {
+                printf(" | "); 
+                printf("DIST:");
+                for (int node_idx = 0; node_idx < snapshot->num_nodes; node_idx++) {                    
+                    printf("[");
+                    fields[field_idx].disp(snapshot->node_identifiers[node_idx], 
+                                            &snapshot->fields[field_idx].per_node_values[node_idx],
+                                            field_node_counts[field_idx]);
+                    printf("]");
+                }               
+            } 
+            printf("\n");
+            sdsfree(display_name);
+            
+            if (field_opaques[field_idx]) {
+                zfree(field_opaques[field_idx]);
+            }
+        }
+    }
     zfree(field_opaques);
     return snapshot;
 }
@@ -1505,186 +1546,75 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     printf("========================================\n\n");
 }
 
-/* Get aggregated statistics without temporal tracking */
-void getAggregatedClusterStats(const char *command, int num_fields, 
-                              infoFieldType *fields) {
-    if (!config.cluster_mode || !config.cluster_primary_nodes) {
-        fprintf(stderr, "Cluster mode not enabled.\n");
-        return;
-    }
-    
-    void **field_opaques = zcalloc(num_fields * sizeof(void *));
-    int *field_node_counts = zcalloc(num_fields * sizeof(int));
-    
-    int is_ftinfo = (strncasecmp(command, "FT.INFO", 7) == 0);
-    printf("Collecting data using command: %s is_ftinfo %s\n", command, is_ftinfo ? " (FT.INFO mode)" : "");
-
-    printf("\n========================================\n");
-    printf("Cluster Statistics: %s\n", command);
-    printf("========================================\n");
-    
-    for (int node_idx = 0; node_idx < config.cluster_primary_node_count; node_idx++) {
-        clusterNode *node = config.cluster_primary_nodes[node_idx];
-        if (!node) continue;
-        
-        valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(config.ct, node->ip, node->port);
-        if (!ctx) continue;
-        
-        valkeyReply *reply = valkeyCommand(ctx, command);
-        if (!reply) {
-            continue;
-        }
-        
-        sds lines = NULL;
-        
-        if (is_ftinfo && reply->type == VALKEY_REPLY_ARRAY) {
-            lines = convertFtInfoToLines(reply, NULL);
-        } else if (reply->type == VALKEY_REPLY_STRING) {
-            lines = sdsnew(reply->str);
-        }
-        
-        if (lines) {
-            printf("Node %s:%d:\n", node->ip, node->port);
-            
-            char *lines_copy = strdup(lines);
-            char *saveptr;
-            char *line = strtok_r(lines_copy, "\n", &saveptr);
-            
-            while (line != NULL) {
-                if (*line && *line != '#') {
-                    for (int field_idx = 0; field_idx < num_fields; field_idx++) {
-                        infoFieldType *field = &fields[field_idx];
-                        // if line starts with cmdstat_ split into miltiple line by ,
-                        // so cmdstat_FT.SEARCH:calls=2858704123,usec=275125382879,usec_per_call=96.24,rejected_calls=0,failed_calls=0
-                        // cmdstat_FT.SEARCH:calls=2858704123
-                        // cmdstat_FT.SEARCH:usec=275125382879
-                        // cmdstat_FT.SEARCH:usec_per_call=96.24
-                        // cmdstat_FT.SEARCH:rejected_calls=0
-                        // cmdstat_FT.SEARCH:failed_calls=0
-                        if (field->match(line, field->prefix_match)) {
-                            char *colon = strchr(line, ':');
-                            if (colon) {
-                                long long value = field->parse(colon + 1);
-                                // printf("%s: %lld\n", field->prefix_match, value);
-                                
-                                int is_last = (node_idx == config.cluster_primary_node_count - 1);
-                                field->agg(&field_opaques[field_idx], value, 
-                                          node_idx, is_last);
-                                field_node_counts[field_idx]++;
-                            }
-                        }
-                    }
-                }
-                line = strtok_r(NULL, "\r\n", &saveptr);
-            }
-            
-            free(lines_copy);
-            sdsfree(lines);
-        }
-        
-        freeReplyObject(reply);
-    }
-    
-    /* Display aggregated results */
-    printf("\n========================================\n");
-    printf("Cluster Aggregate: %s\n", command);
-    printf("========================================\n");
-    
-    for (int field_idx = 0; field_idx < num_fields; field_idx++) {
-        if (field_node_counts[field_idx] > 0) {
-            sds display_name = sdsempty();
-            if (strcmp(fields[field_idx].name, "") == 0) {
-                display_name = sdscatprintf(display_name, "%s", 
-                                           fields[field_idx].prefix_match);
-            } else {
-                display_name = sdscatprintf(display_name, "%s.%s", 
-                                           fields[field_idx].prefix_match, fields[field_idx].name);
-            }
-            fields[field_idx].disp(display_name, 
-                                    field_opaques[field_idx],
-                                    field_node_counts[field_idx]);
-            sdsfree(display_name);
-
-        }
-        if (field_opaques[field_idx]) {
-            zfree(field_opaques[field_idx]);
-        }
-    }
-    
-    zfree(field_opaques);
-    zfree(field_node_counts);
-    printf("========================================\n\n");
-}
-
 /* INFO SEARCH fields with temporal tracking */
 infoFieldType search_info_fields[] = {
     /* Request rates */
     {"search_successful_requests_count", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
     {"search_failure_requests_count", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
     {"search_hybrid_requests_count", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
-    
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
+
     /* Memory growth */
     {"search_used_memory_bytes", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0},
+     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0, FROM_PRIMARY_ONLY, 1},
     {"search_index_reclaimable_memory", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0},     
+     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0, FROM_PRIMARY_ONLY, 1},
     /* Memory growth */
     {"search_ingest_field_vector", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0},
+     parse_integer_value, aggregate_sum, display_memory_mb, diff_memory_growth, 0, FROM_PRIMARY_ONLY, 1},
     /* Indexing rates */
     {"search_total_indexed_documents", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
-    
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
+
     /* CPU usage */
     {"search_read_cpu_time_sec", "", exact_field_matcher, 
-     parse_float_as_fixed, aggregate_sum, display_float, diff_rate_per_second, 1},
+     parse_float_as_fixed, aggregate_sum, display_float, diff_rate_per_second, 1, FROM_ALL, 1},
     {"search_write_cpu_time_sec", "", exact_field_matcher, 
-     parse_float_as_fixed, aggregate_sum, display_float, diff_rate_per_second, 1},
+     parse_float_as_fixed, aggregate_sum, display_float, diff_rate_per_second, 1, FROM_PRIMARY_ONLY, 1},
     
     /* Queue sizes */
     {"search_query_queue_size", "", exact_field_matcher, 
-     parse_integer_value, aggregate_average, display_integer, NULL, 1},
+     parse_integer_value, aggregate_average, display_integer, NULL, 1, FROM_ALL, 1},
     {"search_writer_queue_size", "", exact_field_matcher, 
-     parse_integer_value, aggregate_average, display_integer, NULL, 1},
-    
+     parse_integer_value, aggregate_average, display_integer, NULL, 1, FROM_PRIMARY_ONLY, 1},
+
     /* Latencies */
     {"search_hnsw_vector_index_search_latency_usec", "p50", exact_field_matcher, 
-     parse_percentile_p50, aggregate_average, display_latency_usec, diff_latency_change, 1},
+     parse_percentile_p50, aggregate_average, display_latency_usec, diff_latency_change, 1, FROM_ALL, 1},
     {"search_hnsw_vector_index_search_latency_usec", "p99", exact_field_matcher, 
-     parse_percentile_p99, aggregate_average, display_latency_usec, diff_latency_change, 1},
+     parse_percentile_p99, aggregate_average, display_latency_usec, diff_latency_change, 1, FROM_ALL, 1},
     {"search_hnsw_vector_index_search_latency_usec", "p999", exact_field_matcher, 
-     parse_percentile_p999, aggregate_max, display_latency_usec, diff_latency_change, 1},
+     parse_percentile_p999, aggregate_max, display_latency_usec, diff_latency_change, 1, FROM_ALL, 1},
     {"search_coordinator_server_search_index_partition_success_latency_usec", "p99",
      exact_field_matcher, parse_percentile_p99, aggregate_average, display_latency_usec, 
-     diff_latency_change, 1},    
+     diff_latency_change, 1, FROM_ALL, 1},
     /* Error rates */
     {"search_hnsw_add_exceptions_count", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
     {"search_bounds_check_errors", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
     {"search_num_hnsw_edges", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, NULL, 0},
+     parse_integer_value, aggregate_sum, display_integer, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"search_successful_requests_count", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, NULL, 0},
+     parse_integer_value, aggregate_sum, display_integer, NULL, 0, FROM_ALL, 1},
     {"search_number_of_indexes", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, NULL, 0},
+     parse_integer_value, aggregate_sum, display_integer, NULL, 0, FROM_PRIMARY_ONLY, 1},
     /* Track node count changes */
     {"search_num_hnsw_nodes", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_percentage_change, 0},
+     parse_integer_value, aggregate_sum, display_integer, diff_percentage_change, 0, FROM_PRIMARY_ONLY, 1},
     {"search_used_read_cpu", "", exact_field_matcher, 
-     parse_float_as_fixed, aggregate_average, display_percentage, NULL, 1},
+     parse_float_as_fixed, aggregate_average, display_percentage, NULL, 1, FROM_ALL, 1},
     {"search_used_write_cpu", "", exact_field_matcher, 
-     parse_float_as_fixed, aggregate_average, display_percentage, NULL, 1},
+     parse_float_as_fixed, aggregate_average, display_percentage, NULL, 1, FROM_PRIMARY_ONLY, 1},
     {"search_vectors_bytes", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_memory_human, NULL, 0},
+     parse_integer_value, aggregate_sum, display_memory_human, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"search_interned_strings_memory", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_memory_human, NULL, 0},
+     parse_integer_value, aggregate_sum, display_memory_human, NULL, 0, FROM_PRIMARY_ONLY, 1},
     /* Track maximum queue depth seen across nodes */
     {"search_query_queue_size", "", exact_field_matcher, 
-     parse_integer_value, aggregate_max, display_integer, NULL, 0}
+     parse_integer_value, aggregate_max, display_integer, NULL, 0, FROM_ALL, 1}
 };
 
 
@@ -1692,50 +1622,50 @@ infoFieldType search_info_fields[] = {
 /* FT.INFO fields with temporal tracking */
 infoFieldType ftinfo_fields[] = {
     {"num_docs", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_PRIMARY_ONLY, 1},
     {"hash_indexing_failures", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1},
+     parse_integer_value, aggregate_sum, display_integer, diff_rate_per_second, 1, FROM_ALL, 1},
     {"mutation_queue_size", "", exact_field_matcher, 
-     parse_integer_value, aggregate_average, display_integer, NULL, 1},   
+     parse_integer_value, aggregate_average, display_integer, NULL, 1, FROM_PRIMARY_ONLY, 1},   
     {"num_records", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, NULL, 0},
+     parse_integer_value, aggregate_sum, display_integer, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"attributes.dim", "", exact_field_matcher, 
-     parse_integer_value, aggregate_minmax, display_minmax, NULL, 0},
+     parse_integer_value, aggregate_minmax, display_minmax, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"attributes.M", "", exact_field_matcher, 
-     parse_integer_value, aggregate_minmax, display_minmax, NULL, 0},
+     parse_integer_value, aggregate_minmax, display_minmax, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"attributes.capacity", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, NULL, 0},
+     parse_integer_value, aggregate_sum, display_integer, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"attributes.size", "", exact_field_matcher, 
-     parse_integer_value, aggregate_sum, display_integer, NULL, 0},
+     parse_integer_value, aggregate_sum, display_integer, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"mutation_queue_size", "", exact_field_matcher, 
-     parse_integer_value, aggregate_average, display_integer, NULL, 0}
+     parse_integer_value, aggregate_average, display_integer, NULL, 0, FROM_PRIMARY_ONLY, 1}
 };
 
 
 infoFieldType info_fields[] = {
     /* If output were like "used_memory:1.5G" */
     {"used_memory", "", exact_field_matcher, 
-     parse_memory_value, aggregate_sum, display_memory_mb, NULL, 0},
+     parse_memory_value, aggregate_sum, display_memory_mb, NULL, 0, FROM_PRIMARY_ONLY, 1},
     {"cmdstat_FT.SEARCH", "calls", prefix_field_matcher, 
-     parse_cmdstat_calls, aggregate_sum, display_calls, diff_ftsearch_performance, 1},
+     parse_cmdstat_calls, aggregate_sum, display_calls, diff_ftsearch_performance, 1, FROM_ALL, 0},
     {"cmdstat_FT.SEARCH", "usec", prefix_field_matcher, 
-     parse_cmdstat_usec, aggregate_sum, display_usec, diff_ftsearch_performance, 1},
+     parse_cmdstat_usec, aggregate_sum, display_usec, diff_ftsearch_performance, 1, FROM_ALL, 0},
     {"cmdstat_FT.SEARCH", "usec_per_call", prefix_field_matcher, 
-     parse_cmdstat_usec_per_call, aggregate_average, display_usec_per_call, NULL, 1},
+     parse_cmdstat_usec_per_call, aggregate_average, display_usec_per_call, NULL, 1, FROM_ALL, 0},
     {"cmdstat_FT.SEARCH", "rejected", prefix_field_matcher, 
-     parse_cmdstat_rejected, aggregate_sum, display_rejected, diff_rate_per_second, 1},
+     parse_cmdstat_rejected, aggregate_sum, display_rejected, diff_rate_per_second, 1, FROM_ALL, 0},
     {"cmdstat_FT.SEARCH", "failed", prefix_field_matcher, 
-     parse_cmdstat_failed, aggregate_sum, display_failed, diff_rate_per_second, 1},
+     parse_cmdstat_failed, aggregate_sum, display_failed, diff_rate_per_second, 1, FROM_ALL, 1},
     {"cmdstat_hset", "calls", prefix_field_matcher, 
-     parse_cmdstat_calls, aggregate_sum, display_calls, diff_ftsearch_performance, 1},
+     parse_cmdstat_calls, aggregate_sum, display_calls, diff_ftsearch_performance, 1, FROM_PRIMARY_ONLY, 0},
     {"cmdstat_hset", "usec", prefix_field_matcher, 
-     parse_cmdstat_usec, aggregate_sum, display_usec, diff_ftsearch_performance, 1},
+     parse_cmdstat_usec, aggregate_sum, display_usec, diff_ftsearch_performance, 1, FROM_PRIMARY_ONLY, 0},
     {"cmdstat_hset", "usec_per_call", prefix_field_matcher, 
-     parse_cmdstat_usec_per_call, aggregate_average, display_usec_per_call, NULL, 1},
+     parse_cmdstat_usec_per_call, aggregate_average, display_usec_per_call, NULL, 1, FROM_PRIMARY_ONLY, 0},
     {"cmdstat_hset", "rejected", prefix_field_matcher, 
-     parse_cmdstat_rejected, aggregate_sum, display_rejected, diff_rate_per_second, 1},
+     parse_cmdstat_rejected, aggregate_sum, display_rejected, diff_rate_per_second, 1, FROM_PRIMARY_ONLY, 0},
     {"cmdstat_hset", "failed", prefix_field_matcher, 
-     parse_cmdstat_failed, aggregate_sum, display_failed, diff_rate_per_second, 1}
+     parse_cmdstat_failed, aggregate_sum, display_failed, diff_rate_per_second, 1, FROM_PRIMARY_ONLY, 1}
 };
 
 // getMemoryInfoClusterGeneric();
@@ -1748,13 +1678,13 @@ void getFullInfo(const char *index_name) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
     int ftinfo_num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
-    clusterSnapshot* ftinfo_snapshot = createClusterSnapshot(cmd, ftinfo_num_fields, ftinfo_fields);
+    clusterSnapshot* ftinfo_snapshot = createClusterSnapshot(cmd, ftinfo_num_fields, ftinfo_fields, 1);
 
     int search_num_fields = sizeof(search_info_fields) / sizeof(search_info_fields[0]);
-    clusterSnapshot* search_info_snapshot = createClusterSnapshot("INFO SEARCH", search_num_fields, search_info_fields);
+    clusterSnapshot* search_info_snapshot = createClusterSnapshot("INFO SEARCH", search_num_fields, search_info_fields, 1);
 
     int info_num_fields = sizeof(info_fields) / sizeof(info_fields[0]);
-    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", info_num_fields, info_fields);
+    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", info_num_fields, info_fields, 1);
 
     for (int i = 0; i < search_info_snapshot->num_fields; i++) {
         if (search_info_snapshot->fields[i].valid) {
@@ -1782,27 +1712,17 @@ void getFullInfo(const char *index_name) {
             printf("> %s:%lld\n", ftinfo_snapshot->fields[i].field_name, ftinfo_snapshot->fields[i].value);
         }
     }
-    printf("\n------>\n");
-    getAggregatedClusterStats(cmd, ftinfo_num_fields, ftinfo_fields);
-    getAggregatedClusterStats("INFO SEARCH", search_num_fields, search_info_fields);
-    getAggregatedClusterStats("INFO ALL", info_num_fields, info_fields);
-    // getSearchInfo(&search_memory, &search_reclaimable, &search_total_docs, &search_ingest_field_vector, &search_background_indexing_status);
-    // printf("> search_memory: %f MB\n", search_memory / (1024.0 * 1024.0));
-    // printf("> search_reclaimable: %f MB\n", search_reclaimable / (1024.0 * 1024.0));
-    // printf("> search_total_docs: %lld\n", search_total_docs);
-    // printf("> search_ingest_field_vector: %lld bytes\n", search_ingest_field_vector);
-    // printf("> search_background_indexing_status: %lld\n", search_background_indexing_status);
-    // getInfoCluster();
-    // getFtInfoStatistics(index_name); // Replace "myIndex" with your actual index name
+    freeClusterSnapshot(ftinfo_snapshot);
+    freeClusterSnapshot(search_info_snapshot);
+    freeClusterSnapshot(info_snapshot);
     printf("------>\n");
 }
 
-void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+clusterSnapshot* getSearchInfo(long long *search_memory, long long *search_reclaimable, 
                    long long *search_total_docs, long long *search_ingest_field_vector, 
                    long long *search_background_indexing_status) {
     int num_fields = sizeof(search_info_fields) / sizeof(search_info_fields[0]);
-    getAggregatedClusterStats("INFO SEARCH", num_fields, search_info_fields);
-    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO SEARCH", num_fields, search_info_fields);
+    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO SEARCH", num_fields, search_info_fields, 0);
     /* Initialize aggregated values */
     *search_memory = 0;
     *search_reclaimable = 0;
@@ -1827,39 +1747,39 @@ void getSearchInfo(long long *search_memory, long long *search_reclaimable,
         }
 
     }
-    freeClusterSnapshot(info_snapshot);
+    return info_snapshot;
 }
 
-void getInfoCluster(void) {
+clusterSnapshot* getInfoCluster(void) {
     int num_fields = sizeof(info_fields) / sizeof(info_fields[0]);
-    getAggregatedClusterStats("INFO ALL", num_fields, info_fields);
-    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", num_fields, info_fields);
+    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", num_fields, info_fields, 0);
     // print the values in the snapshot
     assert(info_snapshot); 
-    // for (int i = 0; i < info_snapshot->num_fields; i++) {
-    //     if (info_snapshot->fields[i].valid) {
-    //         printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
-    //     }
-    // }
-    freeClusterSnapshot(info_snapshot);
+    return info_snapshot;
 }
 
 /* Example 4: Get current FT.INFO statistics */
-void getFtInfoStatistics(const char *index_name) {
+clusterSnapshot* getFtInfoStatistics(const char *index_name) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
     int num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
-    getAggregatedClusterStats(cmd, num_fields, ftinfo_fields);
-    clusterSnapshot* info_snapshot = createClusterSnapshot(cmd, num_fields, ftinfo_fields);
+    // getAggregatedClusterStats(cmd, num_fields, ftinfo_fields);
+    clusterSnapshot* info_snapshot = createClusterSnapshot(cmd, num_fields, ftinfo_fields, 0);
     assert(info_snapshot); 
     for (int i = 0; i < info_snapshot->num_fields; i++) {
         if (info_snapshot->fields[i].valid) {
-            printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
+            printf("> %s:%lld", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
         }
     }
-    freeClusterSnapshot(info_snapshot);
-    
-    // getAggregatedClusterStats(cmd, num_fields, ftinfo_fields);
-    
-    // sdsfree(cmd);
+    return info_snapshot;
+}
+
+void* compareInfoSnapshots(clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch) {
+    int ftinfo_num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
+    int search_num_fields = sizeof(search_info_fields) / sizeof(search_info_fields[0]);
+    int info_num_fields = sizeof(info_fields) / sizeof(info_fields[0]);
+    compareClusterSnapshots(old_infoall, new_snap_infoall, info_num_fields, info_fields);
+    compareClusterSnapshots(old_ftinfo, new_snap_ftinfo, ftinfo_num_fields, ftinfo_fields);
+    compareClusterSnapshots(old_infosearch, new_snap_infosearch, search_num_fields, search_info_fields);
+    return NULL;
 }

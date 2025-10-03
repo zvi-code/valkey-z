@@ -1001,8 +1001,7 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
 
         /* Really initialize: replace keys and set start time. */
-        if (config.replace_placeholders) replacePlaceholders(c, c->obuf + c->prefixlen, config.pipeline);
-        // if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
+        replacePlaceholders(c, c->obuf + c->prefixlen, config.pipeline);
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
         c->start = ustime();
         c->latency = -1;
@@ -1061,7 +1060,6 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
     const char *ip = config.conn_info.hostip;
     int port = config.conn_info.hostport;
     struct timeval tv = {0};
-    c->cluster_node = NULL;
     if (config.selected_node_count > 0) {
         /* If the user specified a list of nodes, use them in a round-robin
          * fashion. */
@@ -1074,6 +1072,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         assert(node != NULL);
         ip = node->ip;
         port = node->port;
+        c->cluster_node = node;
     } 
 
     c->context = valkeyConnectWrapper(config.ct, ip, port, tv, 1, config.mptcp);
@@ -1244,26 +1243,10 @@ static void showLatencyReport(void) {
     const float p99 = hdr_value_at_percentile(config.latency_histogram, 99.0) / 1000.0f;
     const float p100 = ((float)hdr_max(config.latency_histogram)) / 1000.0f;
     const float avg = hdr_mean(config.latency_histogram) / 1000.0f;
-    long long search_memory = 0;
-    long long search_reclaimable = 0;
-    long long search_total_docs = 0;
-    long long search_ingest_field_vector = 0;
-    long long search_background_indexing_status = 0;
-    if (config.use_search) {
-        getSearchInfo(&search_memory, &search_reclaimable, &search_total_docs, 
-                        &search_ingest_field_vector, &search_background_indexing_status);
-        getFullInfo(config.search.name);
-    }
+
     if (!config.quiet && !config.csv) {
         printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
-        printf("====== %s ======\n", config.title);
-        if (config.use_search) {
-            printf("  Search index memory: %lld MB\n", search_memory/ (1024 * 1024));
-            printf("  Search index reclaimable: %lld MB\n", search_reclaimable/ (1024 * 1024));
-            printf("  Search total documents: %lld\n", search_total_docs);
-            printf("  Search ingest field vector: %lld\n", search_ingest_field_vector);
-            printf("  Search background indexing status: %lld\n", search_background_indexing_status);
-        }
+        printf("====== %s ======\n", config.title);      
         printf("  %d requests completed in %.2f seconds\n", config.requests_finished, (float)config.totlatency / 1000);
         printf("  %d parallel clients\n", config.numclients);
         printf("  %d bytes payload\n", config.datasize);
@@ -1389,6 +1372,34 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     initPlaceholders(cmd, len);
     if (config.num_threads) initBenchmarkThreads();
 
+    long long search_memory = 0;
+    long long search_reclaimable = 0;
+    long long search_total_docs = 0;
+    long long search_ingest_field_vector = 0;
+    long long search_background_indexing_status = 0;
+    long long after_search_memory = 0;
+    long long after_search_reclaimable = 0;
+    long long after_search_total_docs = 0;
+    long long after_search_ingest_field_vector = 0;
+    long long after_search_background_indexing_status = 0;
+    clusterSnapshot* before_search_info = NULL;
+    clusterSnapshot* before_ftinfo = NULL;
+    clusterSnapshot* before_info_all = NULL;
+    clusterSnapshot* after_search_info = NULL;
+    clusterSnapshot* after_ftinfo = NULL;
+    clusterSnapshot* after_info_all = NULL;
+    if (config.use_search) {
+        before_search_info = getSearchInfo(&search_memory, &search_reclaimable, &search_total_docs,
+                            &search_ingest_field_vector, &search_background_indexing_status);
+        before_ftinfo = getFtInfoStatistics(config.search.name);
+        before_info_all = getInfoCluster();
+        // printf("  Search index memory: %lld MB\n", search_memory/ (1024 * 1024));
+        // printf("  Search index reclaimable: %lld MB\n", search_reclaimable/ (1024 * 1024));
+        // printf("  Search total documents: %lld\n", search_total_docs);
+        // printf("  Search ingest field vector: %lld\n", search_ingest_field_vector);
+        // printf("  Search background indexing status: %lld\n", search_background_indexing_status);
+
+    }
     if (config.rps > 0) {
         config.time_per_token = 1000000000 / config.rps;
         config.time_per_burst = config.time_per_token * config.rps;
@@ -1405,7 +1416,24 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     else
         startBenchmarkThreads();
     config.totlatency = mstime() - config.start;
+    if (config.use_search) {
+        after_search_info = getSearchInfo(&after_search_memory, &after_search_reclaimable, &after_search_total_docs,
+                            &after_search_ingest_field_vector, &after_search_background_indexing_status);
+        after_ftinfo = getFtInfoStatistics(config.search.name);
+        after_info_all = getInfoCluster();
+        compareInfoSnapshots(before_info_all, after_info_all, before_ftinfo, after_ftinfo, before_search_info, after_search_info);
+        if (after_search_memory != search_memory)
+            printf("search_memory: %lld MB -> %lld MB\n", search_memory / (1024 * 1024), after_search_memory / (1024 * 1024));
+        if (after_search_reclaimable != search_reclaimable)
+            printf("search_reclaimable: %lld MB -> %lld MB\n", search_reclaimable / (1024 * 1024), after_search_reclaimable / (1024 * 1024));
+        if (after_search_total_docs != search_total_docs)
+            printf("search_total_docs: %lld -> %lld\n", search_total_docs, after_search_total_docs);
+        if (after_search_ingest_field_vector != search_ingest_field_vector)
+            printf("search_ingest_field_vector: %lld -> %lld\n", search_ingest_field_vector, after_search_ingest_field_vector);
+        if (after_search_background_indexing_status != search_background_indexing_status)
+            printf("search_background_indexing_status: %lld -> %lld\n", search_background_indexing_status, after_search_background_indexing_status);
 
+    }
     showLatencyReport();
     freeAllClients();
     if (config.threads) freeBenchmarkThreads();
@@ -1474,6 +1502,7 @@ static clusterNode *createClusterNode(char *ip, int port) {
 static void freeClusterNode(clusterNode *node) {
     if (node->name) sdsfree(node->name);
     if (node->replicate) sdsfree(node->replicate);
+    if (node->ctx) valkeyFree(node->ctx);
     /* If the node is not the reference node, that uses the address from
      * config.conn_info.hostip and config.conn_info.hostport, then the node ip has been
      * allocated by fetchClusterConfiguration, so it must be freed. */
@@ -1840,7 +1869,7 @@ static int fetchClusterConfiguration(void) {
 
             int is_primary = (j == 2);
             if (is_primary) primary = sdsnew(nr->element[2]->str);
-
+            printf("Node %s:%lld is %s\n", nr->element[0]->str, nr->element[1]->integer, is_primary ? "primary" : "replica");
 
             sds ip = sdsnew(nr->element[0]->str);
             sds name = sdsnew(nr->element[2]->str);
@@ -2140,7 +2169,7 @@ void setDefaultSearchConfig(void) {
     config.search.curr_conf.tag_filter = NULL;
     config.search.metric = sdsnew("L2");
     config.search.algorithm = sdsnew("hnsw"); // Default algorithm
-    config.search.nocontent = 0; // exclude content by default
+    config.search.nocontent = 1; // exclude content by default
 }
 /* Returns number of consumed options. */
 int parseOptions(int argc, char **argv) {

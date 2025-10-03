@@ -6,8 +6,10 @@
 /* Field snapshot for temporal diff calculations */
 typedef struct fieldSnapshot {
     sds field_name;
+    char* value_str;
     long long value;
-    long long *per_node_values;  /* Array of per-node values */
+    long long*  per_node_values;  /* Array of per-node values */
+    char** per_node_values_strs;  /* Array of per-node values */
     int node_count;
     int valid;
 } fieldSnapshot;
@@ -30,23 +32,33 @@ typedef void (*displayCallBack)(const char *field_name, void *opaque, int node_c
 typedef void (*diffCallBack)(const char *field_name, fieldSnapshot *old, 
                              fieldSnapshot *new_snap, long long time_delta_ms, int node_idx);
 
+/* Read from replica options */
+typedef enum readFromReplica {
+    FROM_PRIMARY_ONLY = 0, /* default option */
+    FROM_REPLICA_ONLY,
+    FROM_ALL
+} readFromReplica;
+
 /* Extended field type with temporal diff support */
 typedef struct infoFieldType {
     char* prefix_match;
-    char* name;
+    char* name;    
     matcherCallBack match;
     parseCallBack parse;
     clusterAggregationCallBack agg;
     displayCallBack disp;
     diffCallBack diff;           /* Calculate and display diff */
     int track_per_node;          /* Whether to store per-node values */
+    readFromReplica nodes_to_aggregate; /* Whether to read from replicas */
+    int is_last; /* Whether we should re-process this line for next field, or stop */
 } infoFieldType;
 
 // getMemoryInfoClusterGeneric();
-void getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+clusterSnapshot* getSearchInfo(long long *search_memory, long long *search_reclaimable, 
                    long long *search_total_docs, long long *search_ingest_field_vector, 
                    long long *search_background_indexing_status);
-void getInfoCluster(void);
-void getFtInfoStatistics(const char *index_name);
+clusterSnapshot* getInfoCluster(void);
+clusterSnapshot* getFtInfoStatistics(const char *index_name);
 void getFullInfo(const char *index_name);
+void* compareInfoSnapshots(clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch);
 #endif /* __VALKEY_BENCHMARK_UTILS_H */
