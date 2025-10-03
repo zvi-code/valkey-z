@@ -1371,7 +1371,7 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
 
     initPlaceholders(cmd, len);
     if (config.num_threads) initBenchmarkThreads();
-
+    getFullInfo(config.search.name);
     long long search_memory = 0;
     long long search_reclaimable = 0;
     long long search_total_docs = 0;
@@ -1398,8 +1398,9 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
         // printf("  Search total documents: %lld\n", search_total_docs);
         // printf("  Search ingest field vector: %lld\n", search_ingest_field_vector);
         // printf("  Search background indexing status: %lld\n", search_background_indexing_status);
-
+        getFullInfo(config.search.name);
     }
+    
     if (config.rps > 0) {
         config.time_per_token = 1000000000 / config.rps;
         config.time_per_burst = config.time_per_token * config.rps;
@@ -1417,21 +1418,22 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
         startBenchmarkThreads();
     config.totlatency = mstime() - config.start;
     if (config.use_search) {
+        getFullInfo(config.search.name);
         after_search_info = getSearchInfo(&after_search_memory, &after_search_reclaimable, &after_search_total_docs,
                             &after_search_ingest_field_vector, &after_search_background_indexing_status);
         after_ftinfo = getFtInfoStatistics(config.search.name);
         after_info_all = getInfoCluster();
         compareInfoSnapshots(before_info_all, after_info_all, before_ftinfo, after_ftinfo, before_search_info, after_search_info);
-        if (after_search_memory != search_memory)
-            printf("search_memory: %lld MB -> %lld MB\n", search_memory / (1024 * 1024), after_search_memory / (1024 * 1024));
-        if (after_search_reclaimable != search_reclaimable)
-            printf("search_reclaimable: %lld MB -> %lld MB\n", search_reclaimable / (1024 * 1024), after_search_reclaimable / (1024 * 1024));
-        if (after_search_total_docs != search_total_docs)
-            printf("search_total_docs: %lld -> %lld\n", search_total_docs, after_search_total_docs);
-        if (after_search_ingest_field_vector != search_ingest_field_vector)
-            printf("search_ingest_field_vector: %lld -> %lld\n", search_ingest_field_vector, after_search_ingest_field_vector);
-        if (after_search_background_indexing_status != search_background_indexing_status)
-            printf("search_background_indexing_status: %lld -> %lld\n", search_background_indexing_status, after_search_background_indexing_status);
+        // if (after_search_memory != search_memory)
+        //     printf("search_memory: %lld MB -> %lld MB\n", search_memory / (1024 * 1024), after_search_memory / (1024 * 1024));
+        // if (after_search_reclaimable != search_reclaimable)
+        //     printf("search_reclaimable: %lld MB -> %lld MB\n", search_reclaimable / (1024 * 1024), after_search_reclaimable / (1024 * 1024));
+        // if (after_search_total_docs != search_total_docs)
+        //     printf("search_total_docs: %lld -> %lld\n", search_total_docs, after_search_total_docs);
+        // if (after_search_ingest_field_vector != search_ingest_field_vector)
+        //     printf("search_ingest_field_vector: %lld -> %lld\n", search_ingest_field_vector, after_search_ingest_field_vector);
+        // if (after_search_background_indexing_status != search_background_indexing_status)
+        //     printf("search_background_indexing_status: %lld -> %lld\n", search_background_indexing_status, after_search_background_indexing_status);
 
     }
     showLatencyReport();
