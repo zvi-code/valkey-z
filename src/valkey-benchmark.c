@@ -1065,9 +1065,9 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
          * fashion. */
         int node_idx = 0;
         if (config.num_threads < config.selected_node_count)
-            node_idx = config.liveclients % config.selected_node_count;
+            node_idx = (config.liveclients + 10007) % config.selected_node_count;
         else
-            node_idx = thread_id % config.selected_node_count;
+            node_idx = (ustime() + thread_id) % config.selected_node_count;
         clusterNode *node = config.selected_nodes[node_idx];
         assert(node != NULL);
         ip = node->ip;
@@ -1525,7 +1525,7 @@ static void freeClusterNodes(void) {
 }
 
 static clusterNode **addClusterNode(clusterNode *node, int selected) {
-    printf("Adding cluster node %s:%d\n", node->ip, node->port);
+    printf("Adding cluster node %s %s:%d\n", node->name, node->ip, node->port);    
     // verify node ip + port is unique
     for (int i = 0; i < config.cluster_node_count; i++) {
         clusterNode *n = config.cluster_nodes[i];
