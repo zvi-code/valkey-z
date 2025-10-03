@@ -1671,7 +1671,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     /* Calculate maximum field name length for alignment */
     int max_field_name_len = 0;
     for (int field_idx = 0; field_idx < num_fields; field_idx++) {
-        if (field_idx >= old->num_fields || field_idx >= new_snap->num_fields) continue;
+        if (!fields[field_idx].diff || field_idx >= old->num_fields || field_idx >= new_snap->num_fields) continue;
         
         fieldSnapshot *old_field = &old->fields[field_idx];
         fieldSnapshot *new_field = &new_snap->fields[field_idx];
@@ -1702,7 +1702,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     /* Check if we have per-node data */
     int has_per_node_data = 0;
     for (int field_idx = 0; field_idx < num_fields; field_idx++) {
-        if (field_idx >= old->num_fields || field_idx >= new_snap->num_fields) continue;
+        if (!fields[field_idx].diff || field_idx >= old->num_fields || field_idx >= new_snap->num_fields) continue;
         fieldSnapshot *old_field = &old->fields[field_idx];
         if (fields[field_idx].track_per_node && old_field->per_node_values) {
             has_per_node_data = 1;
@@ -1737,7 +1737,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     
     /* Compare each field */
     for (int field_idx = 0; field_idx < num_fields; field_idx++) {
-        if (field_idx >= old->num_fields || field_idx >= new_snap->num_fields) {
+        if (!fields[field_idx].diff || field_idx >= old->num_fields || field_idx >= new_snap->num_fields) {
             continue;
         }
         
