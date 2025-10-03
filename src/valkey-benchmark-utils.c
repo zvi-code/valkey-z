@@ -585,21 +585,21 @@ static void format_large_number(char *buf, size_t buf_size, long long value) {
         /* Billions */
         double val = (double)value / 1000000000.0;
         if (val >= 100.0) {
-            snprintf(buf, buf_size, "%.0fG", val);
-        } else if (val >= 10.0) {
-            snprintf(buf, buf_size, "%.1fG", val);
-        } else {
             snprintf(buf, buf_size, "%.2fG", val);
+        } else if (val >= 10.0) {
+            snprintf(buf, buf_size, "%.3fG", val);
+        } else {
+            snprintf(buf, buf_size, "%.4fG", val);
         }
     } else if (value >= 1000000LL) {
         /* Millions */
         double val = (double)value / 1000000.0;
         if (val >= 100.0) {
-            snprintf(buf, buf_size, "%.0fM", val);
-        } else if (val >= 10.0) {
-            snprintf(buf, buf_size, "%.1fM", val);
-        } else {
             snprintf(buf, buf_size, "%.2fM", val);
+        } else if (val >= 10.0) {
+            snprintf(buf, buf_size, "%.3fM", val);
+        } else {
+            snprintf(buf, buf_size, "%.4fM", val);
         }
     } else if (value >= 10000LL) {
         /* Thousands with comma separator */
@@ -1724,28 +1724,46 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
             return snapshot;
         }
         
-        printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
-        printf("║                           AGGREGATE STATS                                    ║\n");
-        printf("╠══════════════════════════════════════════════════════════════════════════════╣\n");
-        printf("║ Time: %s | Command: %-30s | Fields: %-4d ║\n", time_buffer, command, num_fields);
-        printf("╚══════════════════════════════════════════════════════════════════════════════╝\n");
-        
         /* First pass: determine the maximum field name length for alignment */
+        /* Only consider fields that will actually be printed (non-zero values) */
         int max_field_name_len = 0;
         for (int field_idx = 0; field_idx < num_fields; field_idx++) {
-            sds temp_name = sdsempty();
-            if (strcmp(fields[field_idx].name, "") == 0) {
-                temp_name = sdscatprintf(temp_name, "%s", 
-                                        fields[field_idx].prefix_match);
-            } else {
-                temp_name = sdscatprintf(temp_name, "%s.%s", 
-                                        fields[field_idx].prefix_match, fields[field_idx].name);
+            /* Check if this row will be printed (same logic as later) */
+            int will_print = 1;
+            if (!config.search_debug && snapshot->fields[field_idx].valid) {
+                int all_values_zero = (snapshot->fields[field_idx].value == 0);
+                
+                if (all_values_zero && fields[field_idx].track_per_node && 
+                    snapshot->fields[field_idx].per_node_values) {
+                    for (int node_idx = 0; node_idx < snapshot->num_nodes; node_idx++) {
+                        if (snapshot->fields[field_idx].per_node_values[node_idx] != 0) {
+                            all_values_zero = 0;
+                            break;
+                        }
+                    }
+                }
+                
+                if (all_values_zero) {
+                    will_print = 0;
+                }
             }
-            int len = sdslen(temp_name);
-            if (len > max_field_name_len) {
-                max_field_name_len = len;
+            
+            /* Only include this field in max length calculation if it will be printed */
+            if (will_print) {
+                sds temp_name = sdsempty();
+                if (strcmp(fields[field_idx].name, "") == 0) {
+                    temp_name = sdscatprintf(temp_name, "%s", 
+                                            fields[field_idx].prefix_match);
+                } else {
+                    temp_name = sdscatprintf(temp_name, "%s.%s", 
+                                            fields[field_idx].prefix_match, fields[field_idx].name);
+                }
+                int len = sdslen(temp_name);
+                if (len > max_field_name_len) {
+                    max_field_name_len = len;
+                }
+                sdsfree(temp_name);
             }
-            sdsfree(temp_name);
         }
         
         /* Ensure minimum width and add some padding */
@@ -1753,10 +1771,10 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
         max_field_name_len += 2; /* Add padding */
         
         /* Calculate column widths for alignment */
-        int aggregate_col_width = 20; /* Width for aggregate values */
-        int node_col_width = 18;      /* Width for each node column */
+        int aggregate_col_width = 26; /* Width for aggregate values (increased for formatted numbers) */
+        int node_col_width = 26;      /* Width for each node column (increased for formatted numbers) */
         
-        /* Print header if we have per-node data */
+        /* Check if we have per-node data */
         int has_per_node_data = 0;
         for (int field_idx = 0; field_idx < num_fields; field_idx++) {
             if (fields[field_idx].track_per_node && snapshot->fields[field_idx].per_node_values) {
@@ -1765,14 +1783,53 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
             }
         }
         
+        /* Calculate total table width */
+        int total_width = 2 + max_field_name_len + 2; /* "  METRIC  " */
+        total_width += aggregate_col_width + 2;        /* "  AGGREGATE" */
+        if (has_per_node_data) {
+            total_width += snapshot->num_nodes * (node_col_width + 2); /* "  NODE" per node */
+        }
+        
+        /* Print centered header */
+        printf("╔");
+        for (int i = 0; i < total_width; i++) printf("═");
+        printf("╗\n");
+        
+        /* Center "AGGREGATE STATS" text */
+        const char *title = "AGGREGATE STATS";
+        int title_len = strlen(title);
+        int left_padding = (total_width - title_len) / 2;
+        int right_padding = total_width - title_len - left_padding;
+        
+        printf("║");
+        for (int i = 0; i < left_padding; i++) printf(" ");
+        printf("%s", title);
+        for (int i = 0; i < right_padding; i++) printf(" ");
+        printf("║\n");
+        
+        printf("╠");
+        for (int i = 0; i < total_width; i++) printf("═");
+        printf("╣\n");
+        
+        /* Print info line */
+        printf("║ Time: %s | Command: %-30s | Fields: %-4d", time_buffer, command, num_fields);
+        int info_len = 7 + 19 + 11 + 30 + 10 + 4; /* Approximate length of info line content */
+        for (int i = info_len; i < total_width; i++) printf(" ");
+        printf("║\n");
+        
+        printf("╚");
+        for (int i = 0; i < total_width; i++) printf("═");
+        printf("╝\n");
+        
+        /* Print column headers if we have per-node data */
         if (has_per_node_data) {
             printf("\n");
-            printf("  %-*s  %-*s", max_field_name_len, "METRIC", aggregate_col_width, "AGGREGATE");
+            printf("  %-*s  %*s", max_field_name_len, "METRIC", aggregate_col_width, "AGGREGATE");
             for (int node_idx = 0; node_idx < snapshot->num_nodes; node_idx++) {
                 /* Truncate node identifier if too long */
                 char node_header[20];
                 snprintf(node_header, sizeof(node_header), "%.17s", snapshot->node_identifiers[node_idx]);
-                printf("  %-*s", node_col_width, node_header);
+                printf("  %*s", node_col_width, node_header);
             }
             printf("\n");
             
@@ -1850,8 +1907,8 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
                 }
             }
             
-            /* Print aggregate value with fixed width */
-            printf("%-*s", aggregate_col_width, aggregate_buffer);
+            /* Print aggregate value with fixed width - RIGHT ALIGNED for numbers */
+            printf("%*s", aggregate_col_width, aggregate_buffer);
             
             /* Print per-node values in columns if tracked */
             if (fields[field_idx].track_per_node && snapshot->fields[field_idx].per_node_values) {
@@ -1873,12 +1930,12 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
                             node_buffer[--len] = '\0';
                         }
                     }
-                    printf("  %-*s", node_col_width, node_buffer);
+                    printf("  %*s", node_col_width, node_buffer);
                 }
             } else if (has_per_node_data) {
                 /* Fill empty columns for fields without per-node data */
                 for (int node_idx = 0; node_idx < snapshot->num_nodes; node_idx++) {
-                    printf("  %-*s", node_col_width, "");
+                    printf("  %*s", node_col_width, "");
                 }
             }
             
@@ -2044,15 +2101,8 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
         return;
     }
     
-    printf("\n");
-    printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                           CLUSTER STATISTICS DELTA                          ║\n");
-    printf("╠══════════════════════════════════════════════════════════════════════════════╣\n");
-    printf("║ Time Interval: %.2f sec | From: %s to %s                        ║\n", 
-           (double)time_delta_ms / 1000.0, old_time_str, new_time_str);
-    printf("╚══════════════════════════════════════════════════════════════════════════════╝\n");
-    
     /* Calculate maximum field name length for alignment */
+    /* Only consider fields that will actually be printed (non-zero deltas) */
     int max_field_name_len = 0;
     for (int field_idx = 0; field_idx < num_fields; field_idx++) {
         if (!fields[field_idx].diff || field_idx >= old->num_fields || field_idx >= new_snap->num_fields) continue;
@@ -2062,6 +2112,49 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
         
         if (!old_field->valid || !new_field->valid) continue;
         if (strcmp(old_field->field_name, new_field->field_name) != 0) continue;
+        
+        /* Check if this row will be printed (same zero-check logic as later) */
+        int will_print = 1;
+        if (!config.search_debug) {
+            long long delta = new_field->value - old_field->value;
+            
+            int all_deltas_zero;
+            if (fields[field_idx].diff == diff_memory_growth) {
+                long long delta_mb = delta / (1024 * 1024);
+                all_deltas_zero = (delta_mb == 0);
+            } else {
+                all_deltas_zero = (delta == 0);
+            }
+            
+            if (all_deltas_zero && fields[field_idx].track_per_node && 
+                old_field->per_node_values && new_field->per_node_values) {
+                for (int node_idx = 0; node_idx < old->num_nodes && 
+                     node_idx < new_snap->num_nodes; node_idx++) {
+                    long long node_delta = new_field->per_node_values[node_idx] - 
+                                          old_field->per_node_values[node_idx];
+                    
+                    int node_delta_zero;
+                    if (fields[field_idx].diff == diff_memory_growth) {
+                        long long node_delta_mb = node_delta / (1024 * 1024);
+                        node_delta_zero = (node_delta_mb == 0);
+                    } else {
+                        node_delta_zero = (node_delta == 0);
+                    }
+                    
+                    if (!node_delta_zero) {
+                        all_deltas_zero = 0;
+                        break;
+                    }
+                }
+            }
+            
+            if (all_deltas_zero) {
+                will_print = 0;
+            }
+        }
+        
+        /* Only include this field in max length calculation if it will be printed */
+        if (!will_print) continue;
         
         /* Calculate display name length (prefix.name or just prefix) */
         int len;
@@ -2080,8 +2173,8 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     max_field_name_len += 2;
     
     /* Column widths */
-    int delta_col_width = 25;
-    int node_col_width = 18;
+    int delta_col_width = 28;  /* Width for delta column (increased for formatted numbers) */
+    int node_col_width = 26;   /* Width for each node column (increased for formatted numbers) */
     
     /* Check if we have per-node data */
     int has_per_node_data = 0;
@@ -2094,14 +2187,57 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
         }
     }
     
-    /* Print header */
+    /* Calculate total table width */
+    int total_width = 2 + max_field_name_len + 2; /* "  METRIC  " */
+    total_width += delta_col_width + 2;            /* "  CLUSTER DELTA" */
+    if (has_per_node_data) {
+        total_width += old->num_nodes * (node_col_width + 2); /* "  NODE" per node */
+    }
+    
+    /* Print centered header */
+    printf("\n");
+    printf("╔");
+    for (int i = 0; i < total_width; i++) printf("═");
+    printf("╗\n");
+    
+    /* Center "CLUSTER STATISTICS DELTA" text */
+    const char *title = "CLUSTER STATISTICS DELTA";
+    int title_len = strlen(title);
+    int left_padding = (total_width - title_len) / 2;
+    int right_padding = total_width - title_len - left_padding;
+    
+    printf("║");
+    for (int i = 0; i < left_padding; i++) printf(" ");
+    printf("%s", title);
+    for (int i = 0; i < right_padding; i++) printf(" ");
+    printf("║\n");
+    
+    printf("╠");
+    for (int i = 0; i < total_width; i++) printf("═");
+    printf("╣\n");
+    
+    /* Print time interval info line */
+    char info_line[256];
+    snprintf(info_line, sizeof(info_line), "Time Interval: %.2f sec | From: %s to %s", 
+             (double)time_delta_ms / 1000.0, old_time_str, new_time_str);
+    int info_len = strlen(info_line);
+    
+    printf("║ %s", info_line);
+    for (int i = info_len + 1; i < total_width; i++) printf(" ");
+    printf("║\n");
+    
+    printf("╚");
+    for (int i = 0; i < total_width; i++) printf("═");
+    printf("╝\n");
+    
+    /* Print column headers */
     if (has_per_node_data) {
         printf("\n");
-        printf("  %-*s  %-*s", max_field_name_len, "METRIC", delta_col_width, "CLUSTER DELTA");
+        printf("  %-*s  %*s", max_field_name_len, "METRIC", delta_col_width, "CLUSTER DELTA");
         for (int node_idx = 0; node_idx < old->num_nodes && node_idx < new_snap->num_nodes; node_idx++) {
             char node_header[20];
             snprintf(node_header, sizeof(node_header), "%.17s", old->node_identifiers[node_idx]);
-            printf("  %-*s", node_col_width, node_header);
+            printf("  %*s", node_col_width, node_header);
         }
         printf("\n");
         
@@ -2215,8 +2351,8 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
                 }
             }
             
-            /* Print cluster delta with fixed width */
-            printf("%-*s", delta_col_width, delta_buffer[0] ? delta_buffer : "N/A");
+            /* Print cluster delta with fixed width - RIGHT ALIGNED for numbers */
+            printf("%*s", delta_col_width, delta_buffer[0] ? delta_buffer : "N/A");
             
             /* Display per-node diffs in columns if available */
             if (fields[field_idx].track_per_node && old_field->per_node_values && 
@@ -2242,18 +2378,18 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
                                 node_buffer[--len] = '\0';
                             }
                             
-                            printf("  %-*s", node_col_width, node_buffer);
+                            printf("  %*s", node_col_width, node_buffer);
                         } else {
-                            printf("  %-*s", node_col_width, "");
+                            printf("  %*s", node_col_width, "");
                         }
                     } else {
-                        printf("  %-*s", node_col_width, "");
+                        printf("  %*s", node_col_width, "");
                     }
                 }
             } else if (has_per_node_data) {
                 /* Fill empty columns for fields without per-node data */
                 for (int node_idx = 0; node_idx < old->num_nodes && node_idx < new_snap->num_nodes; node_idx++) {
-                    printf("  %-*s", node_col_width, "");
+                    printf("  %*s", node_col_width, "");
                 }
             }
         } else {
@@ -2261,11 +2397,11 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
             long long delta = new_field->value - old_field->value;
             char delta_str[64];
             snprintf(delta_str, sizeof(delta_str), "Δ %lld", delta);
-            printf("%-*s", delta_col_width, delta_str);
+            printf("%*s", delta_col_width, delta_str);
             
             if (has_per_node_data) {
                 for (int node_idx = 0; node_idx < old->num_nodes && node_idx < new_snap->num_nodes; node_idx++) {
-                    printf("  %-*s", node_col_width, "");
+                    printf("  %*s", node_col_width, "");
                 }
             }
         }
@@ -2401,10 +2537,10 @@ infoFieldType info_fields[] = {
 
 // getMemoryInfoClusterGeneric();
 void getFullInfo(const char *index_name) {
-    long long search_memory = 0;
-    long long search_reclaimable = 0;
-    long long search_total_docs = 0;
-    long long search_ingest_field_vector = 0;
+    // long long search_memory = 0;
+    // long long search_reclaimable = 0;
+    // long long search_total_docs = 0;
+    // long long search_ingest_field_vector = 0;
     // printf("\n------>\n");
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
@@ -2417,21 +2553,21 @@ void getFullInfo(const char *index_name) {
     int info_num_fields = sizeof(info_fields) / sizeof(info_fields[0]);
     clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", info_num_fields, info_fields, 1);
 
-    for (int i = 0; i < search_info_snapshot->num_fields; i++) {
-        if (search_info_snapshot->fields[i].valid) {
-            if (sdscmp(search_info_snapshot->fields[i].field_name, "search_used_memory_bytes") == 0) {
-                search_memory = search_info_snapshot->fields[i].value;
-            } else if (sdscmp(search_info_snapshot->fields[i].field_name, "search_index_reclaimable_memory") == 0) {
-                search_reclaimable = search_info_snapshot->fields[i].value;
-            } else if (sdscmp(search_info_snapshot->fields[i].field_name, "search_total_indexed_documents") == 0) {
-                search_total_docs = search_info_snapshot->fields[i].value;
-            } else if (sdscmp(search_info_snapshot->fields[i].field_name, "search_ingest_field_vector") == 0) {
-                search_ingest_field_vector = search_info_snapshot->fields[i].value;
-            } 
-            // printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
-        }        
-    }
-    printf("search_memory: %f MB, search_total_indexed_documents: %lld, search_reclaimable: %f MB, search_ingest_field_vector: %lld\n", search_memory / (1024.0 * 1024.0), search_total_docs, search_reclaimable / (1024.0 * 1024.0), search_ingest_field_vector);
+    // for (int i = 0; i < search_info_snapshot->num_fields; i++) {
+    //     if (search_info_snapshot->fields[i].valid) {
+    //         if (sdscmp(search_info_snapshot->fields[i].field_name, "search_used_memory_bytes") == 0) {
+    //             search_memory = search_info_snapshot->fields[i].value;
+    //         } else if (sdscmp(search_info_snapshot->fields[i].field_name, "search_index_reclaimable_memory") == 0) {
+    //             search_reclaimable = search_info_snapshot->fields[i].value;
+    //         } else if (sdscmp(search_info_snapshot->fields[i].field_name, "search_total_indexed_documents") == 0) {
+    //             search_total_docs = search_info_snapshot->fields[i].value;
+    //         } else if (sdscmp(search_info_snapshot->fields[i].field_name, "search_ingest_field_vector") == 0) {
+    //             search_ingest_field_vector = search_info_snapshot->fields[i].value;
+    //         } 
+    //         // printf("> %s:%lld\n", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
+    //     }        
+    // }
+    // printf("search_memory: %f MB, search_total_indexed_documents: %lld, search_reclaimable: %f MB, search_ingest_field_vector: %lld\n", search_memory / (1024.0 * 1024.0), search_total_docs, search_reclaimable / (1024.0 * 1024.0), search_ingest_field_vector);
 
     freeClusterSnapshot(ftinfo_snapshot);
     freeClusterSnapshot(search_info_snapshot);
@@ -2487,11 +2623,11 @@ clusterSnapshot* getFtInfoStatistics(const char *index_name) {
     // getAggregatedClusterStats(cmd, num_fields, ftinfo_fields);
     clusterSnapshot* info_snapshot = createClusterSnapshot(cmd, num_fields, ftinfo_fields, 0);
     assert(info_snapshot); 
-    for (int i = 0; i < info_snapshot->num_fields; i++) {
-        if (info_snapshot->fields[i].valid) {
-            printf("> %s:%lld", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
-        }
-    }
+    // for (int i = 0; i < info_snapshot->num_fields; i++) {
+    //     if (info_snapshot->fields[i].valid) {
+    //         printf("> %s:%lld", info_snapshot->fields[i].field_name, info_snapshot->fields[i].value);
+    //     }
+    // }
     return info_snapshot;
 }
 
