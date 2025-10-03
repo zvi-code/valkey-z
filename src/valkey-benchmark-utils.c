@@ -998,6 +998,8 @@ static void diff_percentage_change(const char *field_name, fieldSnapshot *old,
 
 /* Calculate average latency change */
 static void diff_latency_change(const char *field_name, fieldSnapshot *old, 
+                                fieldSnapshot *new_snap, long long time_delta_ms, int node_idx) __attribute__((unused));
+static void diff_latency_change(const char *field_name, fieldSnapshot *old, 
                                 fieldSnapshot *new_snap, long long time_delta_ms, int node_idx) {
     UNUSED(time_delta_ms);
     UNUSED(field_name);
@@ -1683,6 +1685,45 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
         struct tm *tm_info = localtime(&now);
         char time_buffer[26];
         strftime(time_buffer, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+        
+        /* Pre-check: count how many rows will actually be printed */
+        int rows_to_print = 0;
+        if (!config.search_debug) {
+            for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+                if (!snapshot->fields[field_idx].valid) {
+                    continue;
+                }
+                
+                /* Check if this row has all zeros */
+                int all_values_zero = (snapshot->fields[field_idx].value == 0);
+                
+                /* If aggregate is zero, check per-node values too */
+                if (all_values_zero && fields[field_idx].track_per_node && 
+                    snapshot->fields[field_idx].per_node_values) {
+                    for (int node_idx = 0; node_idx < snapshot->num_nodes; node_idx++) {
+                        if (snapshot->fields[field_idx].per_node_values[node_idx] != 0) {
+                            all_values_zero = 0;
+                            break;
+                        }
+                    }
+                }
+                
+                if (!all_values_zero) {
+                    rows_to_print++;
+                }
+            }
+        } else {
+            /* In debug mode, print all rows */
+            rows_to_print = num_fields;
+        }
+        
+        /* If no rows to print, skip the entire table */
+        if (rows_to_print == 0) {
+            zfree(field_opaques);
+            zfree(field_node_counts);
+            return snapshot;
+        }
+        
         printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
         printf("║                           AGGREGATE STATS                                    ║\n");
         printf("╠══════════════════════════════════════════════════════════════════════════════╣\n");
@@ -1750,6 +1791,33 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
         }
         
         for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+            /* Check if we should skip zero-value rows (unless debug mode is on) */
+            int all_values_zero = 0;
+            if (!config.search_debug && snapshot->fields[field_idx].valid) {
+                /* Check if aggregate value is zero */
+                all_values_zero = (snapshot->fields[field_idx].value == 0);
+                
+                /* If aggregate is zero, check per-node values too */
+                if (all_values_zero && fields[field_idx].track_per_node && 
+                    snapshot->fields[field_idx].per_node_values) {
+                    for (int node_idx = 0; node_idx < snapshot->num_nodes; node_idx++) {
+                        if (snapshot->fields[field_idx].per_node_values[node_idx] != 0) {
+                            all_values_zero = 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            /* Skip this row if all values are zero (unless search_debug is enabled) */
+            if (all_values_zero) {
+                if (field_opaques[field_idx]) {
+                    zfree(field_opaques[field_idx]);
+                    field_opaques[field_idx] = NULL;
+                }
+                continue;
+            }
+            
             sds display_name = sdsempty();
             if (strcmp(fields[field_idx].name, "") == 0) {
                 display_name = sdscatprintf(display_name, "%s", 
@@ -1890,6 +1958,92 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     strftime(temp_buf, 26, "%H:%M:%S", &new_tm_copy);
     snprintf(new_time_str, sizeof(new_time_str), "%s.%03d", temp_buf, new_ms);
     
+    /* Pre-check: count how many rows will actually be printed */
+    int rows_to_print = 0;
+    if (!config.search_debug) {
+        for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+            if (!fields[field_idx].diff || field_idx >= old->num_fields || field_idx >= new_snap->num_fields) {
+                continue;
+            }
+            
+            fieldSnapshot *old_field = &old->fields[field_idx];
+            fieldSnapshot *new_field = &new_snap->fields[field_idx];
+            
+            if (!old_field->valid || !new_field->valid) {
+                continue;
+            }
+            
+            if (strcmp(old_field->field_name, new_field->field_name) != 0) {
+                continue;
+            }
+            
+            /* Check if this row has all zero deltas */
+            long long delta = new_field->value - old_field->value;
+            
+            /* For memory growth diff, check if delta in MB is zero */
+            int all_deltas_zero;
+            if (fields[field_idx].diff == diff_memory_growth) {
+                long long delta_mb = delta / (1024 * 1024);
+                all_deltas_zero = (delta_mb == 0);
+            } else {
+                all_deltas_zero = (delta == 0);
+            }
+            
+            /* If cluster delta is zero, check per-node deltas too */
+            if (all_deltas_zero && fields[field_idx].track_per_node && 
+                old_field->per_node_values && new_field->per_node_values) {
+                for (int node_idx = 0; node_idx < old->num_nodes && 
+                     node_idx < new_snap->num_nodes; node_idx++) {
+                    long long node_delta = new_field->per_node_values[node_idx] - 
+                                          old_field->per_node_values[node_idx];
+                    
+                    /* Check based on diff function type */
+                    int node_delta_zero;
+                    if (fields[field_idx].diff == diff_memory_growth) {
+                        long long node_delta_mb = node_delta / (1024 * 1024);
+                        node_delta_zero = (node_delta_mb == 0);
+                    } else {
+                        node_delta_zero = (node_delta == 0);
+                    }
+                    
+                    if (!node_delta_zero) {
+                        all_deltas_zero = 0;
+                        break;
+                    }
+                }
+            }
+            
+            if (!all_deltas_zero) {
+                rows_to_print++;
+            }
+        }
+    } else {
+        /* In debug mode, count all valid rows */
+        for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+            if (!fields[field_idx].diff || field_idx >= old->num_fields || field_idx >= new_snap->num_fields) {
+                continue;
+            }
+            
+            fieldSnapshot *old_field = &old->fields[field_idx];
+            fieldSnapshot *new_field = &new_snap->fields[field_idx];
+            
+            if (!old_field->valid || !new_field->valid) {
+                continue;
+            }
+            
+            if (strcmp(old_field->field_name, new_field->field_name) != 0) {
+                continue;
+            }
+            
+            rows_to_print++;
+        }
+    }
+    
+    /* If no rows to print, skip the entire table */
+    if (rows_to_print == 0) {
+        return;
+    }
+    
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
     printf("║                           CLUSTER STATISTICS DELTA                          ║\n");
@@ -1982,6 +2136,50 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
         if (strcmp(old_field->field_name, new_field->field_name) != 0) {
             fprintf(stderr, "Field mismatch: %s vs %s\n", 
                    old_field->field_name, new_field->field_name);
+            continue;
+        }
+        
+        /* Check if we should skip zero-delta rows (unless debug mode is on) */
+        int all_deltas_zero = 0;
+        if (!config.search_debug) {
+            /* Check if cluster-wide delta is zero */
+            long long delta = new_field->value - old_field->value;
+            
+            /* For memory growth diff, check if delta in MB is zero (since that's what displays) */
+            if (fields[field_idx].diff == diff_memory_growth) {
+                long long delta_mb = delta / (1024 * 1024);
+                all_deltas_zero = (delta_mb == 0);
+            } else {
+                all_deltas_zero = (delta == 0);
+            }
+            
+            /* If cluster delta is zero, check per-node deltas too */
+            if (all_deltas_zero && fields[field_idx].track_per_node && 
+                old_field->per_node_values && new_field->per_node_values) {
+                for (int node_idx = 0; node_idx < old->num_nodes && 
+                     node_idx < new_snap->num_nodes; node_idx++) {
+                    long long node_delta = new_field->per_node_values[node_idx] - 
+                                          old_field->per_node_values[node_idx];
+                    
+                    /* Check based on diff function type */
+                    int node_delta_zero;
+                    if (fields[field_idx].diff == diff_memory_growth) {
+                        long long node_delta_mb = node_delta / (1024 * 1024);
+                        node_delta_zero = (node_delta_mb == 0);
+                    } else {
+                        node_delta_zero = (node_delta == 0);
+                    }
+                    
+                    if (!node_delta_zero) {
+                        all_deltas_zero = 0;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        /* Skip this row if all deltas are zero (unless search_debug is enabled) */
+        if (all_deltas_zero) {
             continue;
         }
         
