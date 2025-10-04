@@ -503,10 +503,7 @@ static void printSearchResults(valkeyReply *reply) {
     }
     
     /* Print ground truth if using vector generator */
-    if (config.is_vector_generator) {
-        extern int vgen_get_ground_truth(uint64_t query_idx, uint64_t *neighbors);
-        extern uint64_t vgen_get_current_query_index(void);
-        
+    if (config.is_vector_generator) {     
         uint64_t neighbors[10]; /* NEIGHBORS_PER_QUERY = 10 */
         uint64_t query_idx = vgen_get_current_query_index();
         int neighbor_count = vgen_get_ground_truth(query_idx, neighbors);
@@ -529,15 +526,13 @@ static void printSearchResults(valkeyReply *reply) {
     if (total_results > 20) {
         printf("  (Showing first 20 of %zu results)\n", total_results);
     }
-    
+    size_t end_index = total_results * 2;
     /* Results come in pairs: key, fields 
      * The score field (__<vector_field>_score) is included in the fields */
-    for (size_t i = 1; i < reply->elements && ((i - 1) / 2) < max_display; i += 2) {
-        if (i + 1 >= reply->elements) break;
-        
-        valkeyReply *keyReply = reply->element[i];
-        valkeyReply *fieldsReply = reply->element[i + 1];
-        
+    for (size_t i = end_index; i > 2 && max_display > 0; i -= 2, max_display--) {
+        valkeyReply *keyReply = reply->element[i - 1];
+        valkeyReply *fieldsReply = reply->element[i];
+
         /* Extract score from fields if available */
         double score = -1.0;
         if (fieldsReply && fieldsReply->type == VALKEY_REPLY_ARRAY) {
@@ -736,12 +731,7 @@ static sds getVectorKey(void) {
         }
         
         /* Append the 16-byte placeholder */
-        key = sdscatlen(key, VGEN_KEY_PLACEHOLDER, 16);
-        
-        /* Append 4 bytes for length - use non-zero pattern to avoid breaking strstr */
-        uint32_t placeholder_len = 0xFFFFFFFF;  /* Will be overwritten by vgen */
-        key = sdscatlen(key, &placeholder_len, 4);
-        
+        key = sdscatlen(key, VGEN_KEY_PLACEHOLDER, 16);        
         return key;
     }
     
@@ -1245,8 +1235,7 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
                 cmd);
         /* Enqueue query index for recall tracking (handles pipelining) */
         if (query_idx != UINT64_MAX) {
-            assert(c->vgen_query_tail < c->vgen_query_capacity);
-            c->vgen_query_indices[c->vgen_query_tail++] = query_idx;
+            c->vgen_query_indices[(c->vgen_query_tail++) % c->vgen_query_capacity] = query_idx;
         }
     }
 }
@@ -1457,7 +1446,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 /* Compute recall if using vector generator */
                 if (config.is_vector_generator && c->vgen_query_head < c->vgen_query_tail) {
                     /* Dequeue the query index for this response */
-                    uint64_t query_idx = c->vgen_query_indices[c->vgen_query_head++];
+                    uint64_t query_idx = c->vgen_query_indices[(c->vgen_query_head++) % c->vgen_query_capacity];
                     vgen_compute_recall(query_idx, reply);
                 }
                 freeReplyObject(reply);
@@ -3280,6 +3269,8 @@ usage:
         "       Max recall: 100.00%%\n\n"
         "   Important: Use --rfr 'no' for write operations (vec-ground-truth, vec-insert)\n"
         "              to send writes only to primary nodes. Replicas don't accept writes.\n\n"
+        "  $ valkey-benchmark -h zvi-1shard-no-tls-0001-001.adsscafsdf.euw1devo.zzz.www.com --cluster --rfr 'no' --use_vgen --vgen-capacity 50000 --vgen-centroids 100 --vgen-radius 1.331 --vgen-sparsity 0.423 --vgen-seed 53427 -t vec-ground-truth,vec-insert --search --vector-dim 256 --search-name new_256 --search-prefix vec_gen_256: -n 100000 -r 1000000 -c 1"
+        "  $ valkey-benchmark -h zvi--1shard-no-tls-0001-001.adsscafsdf.euw1devo.zzz.www.com --cluster --rfr 'no' --use_vgen --vgen-capacity 50000 --vgen-centroids 100 --vgen-radius 1.331 --vgen-sparsity 0.423 --vgen-seed 53427 -t vec-query --search --vector-dim 256 --search-name new_256 --search-prefix vec_gen_256: -n 10 -r 1000000 -c 1 --search-print-results"
         " For more information, see the Valkey documentation at https://valkey.io.\n");
     exit(exit_status);
 }
