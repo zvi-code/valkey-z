@@ -3759,7 +3759,6 @@ int main(int argc, char **argv) {
                 /* Use custom vector benchmark function */
                 len = createVectorInsertCmdTemplate(&cmd);
                 benchmark("VEC-INSERT", cmd, len);
-                free(cmd);
             }
 
             if (test_is_selected("vec-query")) {                

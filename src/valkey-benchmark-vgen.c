@@ -44,15 +44,13 @@ typedef struct {
 typedef struct {
     stored_ground_truth_t *entries;
     uint64_t capacity;
-    uint64_t count;
-    pthread_mutex_t lock;
+    _Atomic uint64_t count;  /* Atomic counter for lock-free access */
 } ground_truth_storage_t;
 
 static ground_truth_storage_t ground_truth = {
     .entries = NULL,
     .capacity = 0,
-    .count = 0,
-    .lock = PTHREAD_MUTEX_INITIALIZER
+    .count = 0
 };
 
 /* Recall tracking structure */
@@ -91,7 +89,7 @@ typedef enum {
  * Design:
  * - Query iterators: One per thread for query workloads
  * - Insert iterators: One per thread for ingestion workloads  
- * - Ground truth iterator: Shared across threads (mutex-protected)
+ * - Lock-free design using atomic flags for slot acquisition
  * 
  * Usage:
  *   VectorGeneratorIterator *iter = vgen_get_thread_iterator(thread_id, ITER_QUERY);
@@ -101,11 +99,9 @@ typedef enum {
 typedef struct {
     vector_iterator_t **query_iterators;   /* Pool for query ops */
     vector_iterator_t **insert_iterators;  /* Pool for insert ops */
-    vector_iterator_t *ground_truth_iter;  /* Single GT iterator */
     int pool_size;                         /* = num_threads or 8 */
     _Atomic int *query_in_use;             /* Track allocation */
     _Atomic int *insert_in_use;            /* Track allocation */
-    pthread_mutex_t pool_lock;             /* Protect pool operations */
 } VgenIteratorPool;
 
 static VgenIteratorPool *iterator_pool = NULL;
@@ -171,11 +167,6 @@ static int vgen_init_iterator_pool(int num_threads) {
         atomic_init(&iterator_pool->query_in_use[i], 0);
         atomic_init(&iterator_pool->insert_in_use[i], 0);
     }
-    
-    /* Create shared ground truth iterator (will be created on first use) */
-    iterator_pool->ground_truth_iter = NULL;
-    
-    pthread_mutex_init(&iterator_pool->pool_lock, NULL);
     
     return 1;
 }
@@ -297,18 +288,11 @@ static void vgen_cleanup_iterator_pool(void) {
         }
     }
     
-    /* Destroy ground truth iterator */
-    if (iterator_pool->ground_truth_iter) {
-        vg_iterator_destroy(iterator_pool->ground_truth_iter);
-        iterator_pool->ground_truth_iter = NULL;
-    }
-    
     /* Free pool resources */
     zfree(iterator_pool->query_iterators);
     zfree(iterator_pool->insert_iterators);
     zfree(iterator_pool->query_in_use);
     zfree(iterator_pool->insert_in_use);
-    pthread_mutex_destroy(&iterator_pool->pool_lock);
     zfree(iterator_pool);
     iterator_pool = NULL;
 }
@@ -388,9 +372,8 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
     }
     
     /* Initialize ground truth storage */
-    pthread_mutex_init(&ground_truth.lock, NULL);
     ground_truth.capacity = MAX_GROUND_TRUTH_ENTRIES;
-    ground_truth.count = 0;
+    atomic_init(&ground_truth.count, 0);
     ground_truth.entries = calloc(ground_truth.capacity, sizeof(stored_ground_truth_t));
     if (ground_truth.entries == NULL) {
         fprintf(stderr, "Error: Failed to allocate ground truth storage\n");
@@ -432,15 +415,12 @@ void vgen_cleanup(void) {
     vgen_cleanup_iterator_pool();
     
     /* Cleanup ground truth storage */
-    pthread_mutex_lock(&ground_truth.lock);
     if (ground_truth.entries) {
         free(ground_truth.entries);
         ground_truth.entries = NULL;
-        ground_truth.count = 0;
+        atomic_store(&ground_truth.count, 0);
         ground_truth.capacity = 0;
     }
-    pthread_mutex_unlock(&ground_truth.lock);
-    pthread_mutex_destroy(&ground_truth.lock);
     
     /* Destroy vector generator */
     vg_destroy(vgen_instance);
@@ -480,8 +460,6 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
         return;
     }
     
-    pthread_rwlock_rdlock(&vgen_lock);
-    
     /* For ground truth, we need to iterate over ALL possible neighbor keys from reserved range.
      * The vector generator pre-allocates neighbor keys for each query in the reserved range.
      * We need to extract all unique neighbor keys and generate vectors for them. */
@@ -495,12 +473,14 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
     
     static _Atomic uint64_t ground_truth_key_index = 0;
     
+    /* Get dimensions (read-only after init, no lock needed) */
+    uint32_t dims = vg_get_dimensions(vgen_instance);
+    
     /* Generate vectors for reserved range keys */
     for (size_t i = 0; i < key_count; i++) {
         /* Use sequential keys from reserved range starting at 1 */
         uint64_t current_index = atomic_fetch_add(&ground_truth_key_index, 1);
-        vector_key_t key = (current_index) % 1000000; /* Reserved range: 0-999999 */
-        if (key == 0) key = 1; /* Skip key 0, start from 1 */
+        vector_key_t key = (current_index % 1000000) + 1; /* Reserved range: 1-1000000 */
         
         /* DEBUG: Print ground truth key being generated */
         static _Atomic int gt_debug_count = 0;
@@ -525,9 +505,8 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
         /* Replace vector placeholder - generate vector for this reserved key */
         if (i < vec_count) {
             char *vec_placeholder = cmd + vec_indices[i];
-            uint32_t dims = vg_get_dimensions(vgen_instance);
             
-            /* Generate vector from the reserved key */
+            /* Generate vector from the reserved key (thread-safe) */
             float *vector_data = malloc(dims * sizeof(float));
             if (vector_data) {
                 vg_generate_vector_from_key(vgen_instance, key, vector_data);
@@ -536,8 +515,6 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
             }
         }
     }
-    
-    pthread_rwlock_unlock(&vgen_lock);
     
     (void)key_counter;
     (void)vector_counter;
@@ -557,9 +534,7 @@ void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const si
                                    char *cmd, uint64_t *key_counter) {
     if (!vgen_is_initialized() || count == 0) return;
     
-    pthread_rwlock_rdlock(&vgen_lock);
-    
-    /* Use a simple atomic counter for deletion keys */
+    /* Use a simple atomic counter for deletion keys (lock-free) */
     static _Atomic uint64_t deletion_key_counter = 1000001;  /* Start after reserved range */
     
     /* Get keys and replace placeholders */
@@ -585,8 +560,6 @@ void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const si
         memcpy(placeholder + 16, &actual_key_len, 4);
     }
     
-    pthread_rwlock_unlock(&vgen_lock);
-    
     (void)key_counter; /* Unused for vgen */
     (void)thread_id;   /* Not used - atomic counter instead */
 }
@@ -605,56 +578,56 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
                                             char *cmd, uint64_t *vector_counter) {
     if (!vgen_is_initialized() || count == 0) return UINT64_MAX;
     
-    pthread_rwlock_rdlock(&vgen_lock);
-    
-    /* Get query iterator from pool */
+    /* Get query iterator from pool (lock-free using atomics) */
     vector_iterator_t *iter = vgen_get_thread_iterator(thread_id, ITER_QUERY);
     if (iter == NULL) {
         fprintf(stderr, "Error: Failed to get query iterator for thread %d\n", thread_id);
-        pthread_rwlock_unlock(&vgen_lock);
         return UINT64_MAX;
     }
     
     uint64_t query_idx = UINT64_MAX;
     
+    /* Get dimensions (read-only after init, no lock needed) */
+    uint32_t dims = vg_get_dimensions(vgen_instance);
+    size_t vector_bytes = dims * sizeof(float);
+    
     /* Get query vectors and replace placeholders */
     for (size_t i = 0; i < count; i++) {
         query_vector_t query;
-        if (!vg_iterator_next_query(iter, &query)) {
+        
+        /* Access thread-local iterator (no lock needed) */
+        int success = vg_iterator_next_query(iter, &query);
+        if (!success) {
             /* Iterator exhausted, reset it to cycle through queries again */
             iter->current = 0;
-            if (!vg_iterator_next_query(iter, &query)) {
-                /* Still no vectors available - skip */
-                continue;
-            }
+            success = vg_iterator_next_query(iter, &query);
         }
         
-        /* Replace placeholder with vector data */
-        char *placeholder = cmd + indices[i];
-        /* VGEN_VECTOR_PLACEHOLDER is 16 bytes at the start of the vector */
-        /* We need to replace the ENTIRE vector, not just the placeholder */
-        uint32_t dims = vg_get_dimensions(vgen_instance);
-        size_t vector_bytes = dims * sizeof(float);
+        if (!success) {
+            /* Still no vectors available - skip */
+            continue;
+        }
         
-        /* Replace the entire vector data (placeholder is at the beginning) */
+        /* Replace placeholder with vector data (no lock needed) */
+        char *placeholder = cmd + indices[i];
         memcpy(placeholder, query.vector.data, vector_bytes);
         
-        /* Store ground truth for recall calculation and get query index */
-        pthread_mutex_lock(&ground_truth.lock);
-        if (ground_truth.count < ground_truth.capacity) {
-            query_idx = ground_truth.count;  /* Store the index before incrementing */
-            stored_ground_truth_t *entry = &ground_truth.entries[ground_truth.count];
+        /* Store ground truth for recall calculation using atomic index (lock-free) */
+        uint64_t slot = atomic_fetch_add(&ground_truth.count, 1);
+        if (slot < ground_truth.capacity) {
+            query_idx = slot;  /* This is the index for this query */
+            stored_ground_truth_t *entry = &ground_truth.entries[slot];
             entry->query_key = query.vector.key;
             
             /* DEBUG: Print query key and ground truth */
-            static int query_debug_count = 0;
-            if (query_debug_count < 30) {
+            static _Atomic int query_debug_count = 0;
+            int debug_val = atomic_fetch_add(&query_debug_count, 1);
+            if (debug_val < 30) {
                 printf("[VGEN QUERY] Query key: %lu, Expected neighbors: ", query.vector.key);
                 for (int j = 0; j < NEIGHBORS_PER_QUERY && j < 5; j++) {
                     printf("%lu ", query.ground_truth[j].key);
                 }
                 printf("...\n");
-                query_debug_count++;
             }
             
             /* Copy ground truth neighbors from query */
@@ -662,15 +635,11 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
             for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
                 entry->neighbors[j] = query.ground_truth[j];
             }
-            ground_truth.count++;
         }
-        pthread_mutex_unlock(&ground_truth.lock);
     }
     
-    /* Release iterator back to pool */
+    /* Release iterator back to pool (lock-free using atomics) */
     vgen_release_thread_iterator(thread_id, ITER_QUERY);
-    
-    pthread_rwlock_unlock(&vgen_lock);
     
     (void)vector_counter; /* Unused for vgen */
     return query_idx;
@@ -702,19 +671,22 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
         return;
     }
     
-    pthread_rwlock_rdlock(&vgen_lock);
-    
-    /* Get ingestion iterator from pool */
+    /* Get ingestion iterator from pool (lock-free using atomics) */
     vector_iterator_t *iter = vgen_get_thread_iterator(thread_id, ITER_INSERT);
     if (iter == NULL) {
         fprintf(stderr, "Error: Failed to get ingestion iterator for thread %d\n", thread_id);
-        pthread_rwlock_unlock(&vgen_lock);
         return;
     }
+    
+    /* Get dimensions (read-only after init, no lock needed) */
+    uint32_t dims = vg_get_dimensions(vgen_instance);
+    size_t vector_bytes = dims * sizeof(float);
     
     /* Get vectors from ingestion iterator and replace both keys and vectors */
     for (size_t i = 0; i < key_count; i++) {
         vector_t vec;
+        
+        /* Access thread-local iterator (no lock needed) */
         if (!vg_iterator_next(iter, &vec)) {
             /* Iterator exhausted, reset it */
             iter->current = 0;
@@ -749,8 +721,6 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
         
         /* Replace vector placeholder */
         if (i < vec_count) {
-            uint32_t dims = vg_get_dimensions(vgen_instance);
-            size_t vector_bytes = dims * sizeof(float);
             char *vec_placeholder = cmd + vec_indices[i];
             
             /* Replace entire vector data */
@@ -758,10 +728,8 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
         }
     }
     
-    /* Release iterator back to pool */
+    /* Release iterator back to pool (lock-free using atomics) */
     vgen_release_thread_iterator(thread_id, ITER_INSERT);
-    
-    pthread_rwlock_unlock(&vgen_lock);
     
     (void)key_counter;
     (void)vector_counter;
@@ -785,17 +753,22 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
         return;
     }
     
-    /* Check if we have ground truth for this query */
-    pthread_mutex_lock(&ground_truth.lock);
-    if (query_idx >= ground_truth.count) {
-        pthread_mutex_unlock(&ground_truth.lock);
-        return;  /* No ground truth available */
-    }
+    /* Copy ground truth data while holding lock (minimize lock time) */
+    ground_truth_entry_t expected_neighbors_arr[NEIGHBORS_PER_QUERY];
+    int expected_neighbors = 0;
+    uint64_t query_key = 0;
     
-    stored_ground_truth_t *gt_entry = &ground_truth.entries[query_idx];
-    int expected_neighbors = gt_entry->neighbor_count;
-    uint64_t query_key = gt_entry->query_key;
-    pthread_mutex_unlock(&ground_truth.lock);
+    /* Read from ground truth storage (lock-free with atomic count) */
+    uint64_t current_count = atomic_load(&ground_truth.count);
+    if (query_idx < current_count) {
+        stored_ground_truth_t *gt_entry = &ground_truth.entries[query_idx];
+        expected_neighbors = gt_entry->neighbor_count;
+        query_key = gt_entry->query_key;
+        /* Copy ground truth neighbors to local buffer */
+        for (int i = 0; i < expected_neighbors; i++) {
+            expected_neighbors_arr[i] = gt_entry->neighbors[i];
+        }
+    }
     
     if (expected_neighbors == 0) {
         return;  /* No neighbors to compare */
@@ -825,7 +798,6 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
     
     /* Compute recall: count how many of the returned keys are in the ground truth neighbors */
     int matches = 0;
-    pthread_mutex_lock(&ground_truth.lock);
     
     /* Debug output for first 20 queries */
     static _Atomic int debug_count = 0;
@@ -837,7 +809,7 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
                current_debug, query_idx, query_key);
         printf("  Expected neighbors (%d): ", expected_neighbors);
         for (int j = 0; j < expected_neighbors && j < 5; j++) {
-            printf("%lu ", gt_entry->neighbors[j].key);
+            printf("%lu ", expected_neighbors_arr[j].key);
         }
         if (expected_neighbors > 5) printf("...");
         printf("\n");
@@ -851,7 +823,7 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
     
     for (int i = 0; i < returned_count; i++) {
         for (int j = 0; j < expected_neighbors; j++) {
-            if (returned_keys[i] == gt_entry->neighbors[j].key) {
+            if (returned_keys[i] == expected_neighbors_arr[j].key) {
                 matches++;
                 break;
             }
@@ -862,14 +834,12 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
         printf("  Matches: %d/%d\n", matches, returned_count < expected_neighbors ? returned_count : expected_neighbors);
     }
     
-    pthread_mutex_unlock(&ground_truth.lock);
-    
     /* Calculate recall@K where K is the minimum of returned and expected */
     int k = returned_count < expected_neighbors ? returned_count : expected_neighbors;
     double recall = (k > 0) ? ((double)matches / (double)k) : 0.0;
     
     /* Update recall statistics */
-    pthread_mutex_lock(&recall_tracker.lock);
+    // pthread_mutex_lock(&recall_tracker.lock);
     recall_tracker.total_queries++;
     recall_tracker.total_recall += recall;
     if (recall < recall_tracker.min_recall) {
@@ -878,7 +848,7 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
     if (recall > recall_tracker.max_recall) {
         recall_tracker.max_recall = recall;
     }
-    pthread_mutex_unlock(&recall_tracker.lock);
+    // pthread_mutex_unlock(&recall_tracker.lock);
 }
 
 /**
@@ -887,20 +857,20 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
 int vgen_get_ground_truth(uint64_t query_idx, uint64_t *neighbors) {
     if (!vgen_is_initialized() || !neighbors) return 0;
     
-    pthread_mutex_lock(&ground_truth.lock);
-    if (query_idx >= ground_truth.count) {
-        pthread_mutex_unlock(&ground_truth.lock);
-        return 0;
+    /* Read from ground truth storage (lock-free with atomic count) */
+    int count = 0;
+    uint64_t current_count = atomic_load(&ground_truth.count);
+    
+    if (query_idx < current_count) {
+        stored_ground_truth_t *gt_entry = &ground_truth.entries[query_idx];
+        count = gt_entry->neighbor_count;
+        
+        /* Copy neighbor keys to output buffer */
+        for (int i = 0; i < count; i++) {
+            neighbors[i] = gt_entry->neighbors[i].key;
+        }
     }
     
-    stored_ground_truth_t *gt_entry = &ground_truth.entries[query_idx];
-    int count = gt_entry->neighbor_count;
-    
-    for (int i = 0; i < count; i++) {
-        neighbors[i] = gt_entry->neighbors[i].key;
-    }
-    
-    pthread_mutex_unlock(&ground_truth.lock);
     return count;
 }
 
