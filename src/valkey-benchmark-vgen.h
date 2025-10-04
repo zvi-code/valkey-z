@@ -46,6 +46,26 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
 void vgen_cleanup(void);
 
 /**
+ * Replace both key and vector placeholders for ground truth ingestion.
+ * 
+ * This function is used to ingest the reserved-range vectors that will serve
+ * as ground truth neighbors for queries. Should be called once during setup
+ * before running any queries.
+ * 
+ * @param key_indices Array of key placeholder positions
+ * @param key_count Number of key placeholders
+ * @param vec_indices Array of vector placeholder positions
+ * @param vec_count Number of vector placeholders
+ * @param cmd Command buffer to modify in-place
+ * @param key_counter Atomic counter for key generation
+ * @param vector_counter Atomic counter for vector generation
+ */
+void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size_t key_count,
+                                            const size_t *vec_indices, const size_t vec_count,
+                                            char *cmd, uint64_t *key_counter,
+                                            uint64_t *vector_counter);
+
+/**
  * Replace key placeholder in command buffer for deletion operations.
  * 
  * This function replaces VGEN_KEY_PLACEHOLDER with actual keys from the
@@ -111,6 +131,23 @@ void vgen_compute_recall(client c, void *reply);
  * recall metrics (average, min, max, etc.).
  */
 void vgen_print_recall_report(void);
+
+/**
+ * Get ground truth for a specific query index (for debugging/printing).
+ * 
+ * @param query_idx The query index
+ * @param neighbors Output array to store neighbor keys (caller must allocate at least NEIGHBORS_PER_QUERY elements)
+ * @return Number of neighbors (0 if no ground truth available)
+ */
+int vgen_get_ground_truth(uint64_t query_idx, uint64_t *neighbors);
+
+/**
+ * Get the index of the next query to be processed (for ground truth lookup).
+ * This returns current_query_index which will be used for the next recall computation.
+ * 
+ * @return The current query index (next to be processed)
+ */
+uint64_t vgen_get_current_query_index(void);
 
 /**
  * Get vector generator statistics.

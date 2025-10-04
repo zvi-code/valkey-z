@@ -293,6 +293,7 @@ typedef struct _client {
     int thread_id;
     struct clusterNode *cluster_node;
     int slots_last_update;
+    uint64_t query_index;  /* For vector queries: index assigned when request is sent */
     uint64_t paused : 1;
     uint64_t reuse : 1;
 } *client;
@@ -496,6 +497,26 @@ static void printSearchResults(valkeyReply *reply) {
     /* First element is the total number of results */
     if (reply->element[0]->type == VALKEY_REPLY_INTEGER) {
         printf("\n=== Search Results (Total: %lld) ===\n", reply->element[0]->integer);
+    }
+    
+    /* Print ground truth if using vector generator */
+    if (config.is_vector_generator) {
+        extern int vgen_get_ground_truth(uint64_t query_idx, uint64_t *neighbors);
+        extern uint64_t vgen_get_current_query_index(void);
+        
+        uint64_t neighbors[10]; /* NEIGHBORS_PER_QUERY = 10 */
+        uint64_t query_idx = vgen_get_current_query_index();
+        int neighbor_count = vgen_get_ground_truth(query_idx, neighbors);
+        
+        if (neighbor_count > 0) {
+            printf("\n=== Expected Ground Truth (Query #%lu) ===\n", query_idx);
+            printf("  Expected neighbor keys: ");
+            for (int i = 0; i < neighbor_count; i++) {
+                printf("%lu", neighbors[i]);
+                if (i < neighbor_count - 1) printf(", ");
+            }
+            printf("\n");
+        }
     }
     
     /* Results come in pairs: key, fields */
@@ -1020,12 +1041,27 @@ static void replacePlaceholderVectorGenerator(const size_t key_count, const size
         return;
     }
     
-    // both key and vector replacement - on vector insert\update\overwrite commands
+    // both key and vector replacement
     if (key_count > 0 && vec_count > 0) {
-        vgen_replace_vector_and_key_placeholder(key_indices, key_count,
-                                                vec_indices, vec_count,
-                                                cmd, (uint64_t*)key_counter,
-                                                (uint64_t*)vector_counter);
+        /* Check if this is ground truth ingestion */
+        extern void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size_t key_count,
+                                                          const size_t *vec_indices, const size_t vec_count,
+                                                          char *cmd, uint64_t *key_counter,
+                                                          uint64_t *vector_counter);
+        
+        if (config.title && strcmp(config.title, "VEC-GROUND-TRUTH") == 0) {
+            /* Ground truth ingestion - use reserved range keys */
+            vgen_replace_ground_truth_placeholder(key_indices, key_count,
+                                                  vec_indices, vec_count,
+                                                  cmd, (uint64_t*)key_counter,
+                                                  (uint64_t*)vector_counter);
+        } else {
+            /* Regular ingestion - use general range keys */
+            vgen_replace_vector_and_key_placeholder(key_indices, key_count,
+                                                    vec_indices, vec_count,
+                                                    cmd, (uint64_t*)key_counter,
+                                                    (uint64_t*)vector_counter);
+        }
         return;
     }
 }
@@ -1318,6 +1354,10 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 if (config.print_search_results) {
                     printSearchResults(reply);
                 }
+                /* Compute recall if using vector generator */
+                if (config.is_vector_generator) {
+                    vgen_compute_recall_with_index(c, reply, c->query_index);
+                }
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
                 if (c->prefix_pending > 0) {
@@ -1461,6 +1501,11 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
         c->start = ustime();
         c->latency = -1;
+        
+        /* For vector queries, allocate query index for recall tracking */
+        if (config.is_vector_generator) {
+            c->query_index = vgen_allocate_query_index();
+        }
     }
     const ssize_t buflen = sdslen(c->obuf);
     const ssize_t writeLen = buflen - c->written;
@@ -1775,6 +1820,11 @@ static void showLatencyReport(void) {
         printf("  latency summary (msec):\n");
         printf("    %9s %9s %9s %9s %9s %9s\n", "avg", "min", "p50", "p95", "p99", "max");
         printf("    %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f\n", avg, p0, p50, p95, p99, p100);
+        
+        /* Print recall statistics if using vector generator */
+        if (config.is_vector_generator) {
+            vgen_print_recall_report();
+        }
     } else if (config.csv) {
         printf("\"%s\",\"%.2f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\"\n", config.title, reqpersec, avg,
                p0, p50, p95, p99, p100);
@@ -3566,6 +3616,13 @@ int main(int argc, char **argv) {
             free(cmd);
         }
         if (config.use_search) {
+            if (test_is_selected("vec-ground-truth")) {
+                /* Ingest ground truth vectors from reserved range */
+                len = createVectorInsertCmdTemplate(&cmd);
+                benchmark("VEC-GROUND-TRUTH", cmd, len);
+                free(cmd);
+            }
+            
             if (test_is_selected("vec-insert")) {
                 /* Use custom vector benchmark function */
                 len = createVectorInsertCmdTemplate(&cmd);
