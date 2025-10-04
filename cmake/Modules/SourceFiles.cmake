@@ -156,6 +156,8 @@ set(VALKEY_BENCHMARK_SRCS
     ${CMAKE_SOURCE_DIR}/src/util.c
     ${CMAKE_SOURCE_DIR}/src/valkey-benchmark.c
     ${CMAKE_SOURCE_DIR}/src/valkey-benchmark-utils.c
+    ${CMAKE_SOURCE_DIR}/src/valkey-benchmark-vgen.c
+    ${CMAKE_SOURCE_DIR}/utils/vgenerator/vector_generator.c
     ${CMAKE_SOURCE_DIR}/src/adlist.c
     ${CMAKE_SOURCE_DIR}/src/dict.c
     ${CMAKE_SOURCE_DIR}/src/zmalloc.c
