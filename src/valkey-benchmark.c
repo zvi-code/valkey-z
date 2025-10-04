@@ -1843,6 +1843,7 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
         printf("Search background indexing status: before=%lld after=%lld (diff=%+lld)\n",
                search_background_indexing_status, after_search_background_indexing_status, after_search_background_indexing_status - search_background_indexing_status);
     }
+    // TODO[is_vector_generator]:show recall report?
     showLatencyReport();
     freeAllClients();
     if (config.threads) freeBenchmarkThreads();
@@ -1863,6 +1864,7 @@ static benchmarkThread *createBenchmarkThread(int index) {
     thread->index = index;
     thread->el = aeCreateEventLoop(1024 * 10);
     thread->paused_clients = listCreate();
+    // TODO[is_vector_generator]: also add recall?
     aeCreateTimeEvent(thread->el, 1, showThroughput, (void *)thread, NULL);
     return thread;
 }
@@ -2726,8 +2728,11 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--search")) {
             // TODO: Is search is enabled and -t is not, do not run default tests
             config.use_search = 1;
+        } else if (!strcmp(argv[i], "--use_vgen")) {
+            // TODO[is_vector_generator]
+            config.is_vector_generator = 1;
         } else if (!strcmp(argv[i], "--search-print-results")) {
-            config.print_search_results = 1;          
+            config.print_search_results = 1;
         } else if (!strcmp(argv[i], "--search-prefix")) {
             if (lastarg) goto invalid;
             if (config.search.prefix) sdsfree(config.search.prefix);
