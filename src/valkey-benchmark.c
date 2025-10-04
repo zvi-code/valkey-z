@@ -766,20 +766,38 @@ static int createSearchCmdTemplate(char **cmd) {
     
     /* Build KNN query */
     sds query;
+    int is_hnsw = (strcasecmp(config.search.algorithm, "hnsw") == 0);
+    
     if (config.search.curr_conf.tag_filter && config.search.tag_field) {
-        query = sdscatprintf(sdsempty(), 
-            "@%s:{%s}=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
-            config.search.tag_field, 
-            config.search.curr_conf.tag_filter,
-            config.search.k, 
-            config.search.vector_field, 
-            config.search.ef_search);
+        if (is_hnsw) {
+            query = sdscatprintf(sdsempty(), 
+                "@%s:{%s}=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
+                config.search.tag_field, 
+                config.search.curr_conf.tag_filter,
+                config.search.k, 
+                config.search.vector_field, 
+                config.search.ef_search);
+        } else {
+            query = sdscatprintf(sdsempty(), 
+                "@%s:{%s}=>[KNN %d @%s $query_vector]", 
+                config.search.tag_field, 
+                config.search.curr_conf.tag_filter,
+                config.search.k, 
+                config.search.vector_field);
+        }
     } else {
-        query = sdscatprintf(sdsempty(), 
-            "*=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
-            config.search.k, 
-            config.search.vector_field, 
-            config.search.ef_search);
+        if (is_hnsw) {
+            query = sdscatprintf(sdsempty(), 
+                "*=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
+                config.search.k, 
+                config.search.vector_field, 
+                config.search.ef_search);
+        } else {
+            query = sdscatprintf(sdsempty(), 
+                "*=>[KNN %d @%s $query_vector]", 
+                config.search.k, 
+                config.search.vector_field);
+        }
     }
     
     /* Build FT.SEARCH command */
@@ -852,57 +870,86 @@ static void createDefaultSearchIndexes(void) {
             exit(1);
         }
     }
-    /* Check if any indexes exist */
-    valkeyReply *list_reply = valkeyCommand(ctx, "FT._LIST");
-    int index_exists = 0;
-    
-    if (list_reply && list_reply->type == VALKEY_REPLY_ARRAY) {
-        printf("Found %zu existing indexes: ", list_reply->elements);
-        for (size_t j = 0; j < list_reply->elements; j++) {
-            printf("found index '%s' ", list_reply->element[j]->str);
-            if (strcmp(list_reply->element[j]->str, config.search.name) == 0) {
-                index_exists = 1;
-                getFullInfo(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
-            }            
-        }
-        printf("\n");
-    } else {
-        printf("Found 0 existing indexes: \n");
+    int num_indexes = 1;
+    sds indexes_to_create[2] = {config.search.name, NULL};
+    sds algorithms[2] = {config.search.algorithm, NULL};
+    // compare case insensitively
+    if (strcmp(config.search.algorithm, "hnsw") == 0) {
+        algorithms[1] = sdsnew("flat"); /* Fallback to FLAT if HNSW not supported */
+        indexes_to_create[1] = sdsdup(config.search.name); /* Same index name for fallback */
+        // append _flat to index name
+        indexes_to_create[1] = sdscat(indexes_to_create[1], "_flat");
+        printf("Configured HNSW index, will also create fallback FLAT index '%s'\n", indexes_to_create[1]);
+        num_indexes = 2;
     }
-    
-    if (list_reply) {
-        freeReplyObject(list_reply);
-    }
-    if (index_exists) {
-        printf("Index '%s' already exists, skipping creation.\n", config.search.name);
-        return;
-    }
-    valkeyReply *reply = NULL;
-    /* Add TAG field if configured */
-    if (config.search.tag_field) {
-        reply = valkeyCommand(ctx, "FT.CREATE %s PREFIX 1 %s SCHEMA %s TAG %s VECTOR %s 12 TYPE FLOAT32 DIM %d DISTANCE_METRIC %s M %d EF_CONSTRUCTION %d EF_RUNTIME %d",
-        config.search.name, config.search.prefix, config.search.tag_field, config.search.vector_field, config.search.algorithm, config.search.vector_dim, config.search.metric, config.search.m,
-        config.search.ef_construction, config.search.ef_search);
-    } else {
-        reply = valkeyCommand(ctx, "FT.CREATE %s PREFIX 1 %s SCHEMA %s VECTOR %s 12 TYPE FLOAT32 DIM %d DISTANCE_METRIC %s M %d EF_CONSTRUCTION %d EF_RUNTIME %d",
-        config.search.name, config.search.prefix, config.search.vector_field, config.search.algorithm, config.search.vector_dim, config.search.metric, config.search.m,
-        config.search.ef_construction, config.search.ef_search);
-    }
-    
-    if (reply && (reply->type == VALKEY_REPLY_STRING || reply->type == VALKEY_REPLY_STATUS)) {
-        printf("Index created successfully\n");
-    } else {
-        fprintf(stderr, "Failed to create index: %s\n", 
-                reply ? reply->str : "Unknown error");
-        // if index already exists, we can ignore the error
-        if (reply && reply->type == VALKEY_REPLY_ERROR && index_exists) {
-            printf("Index '%s' already exists, ignoring error.\n", config.search.name);
+    for (int i = 0; i < num_indexes; i++) {        
+        /* Check if any indexes exist */
+        valkeyReply *list_reply = valkeyCommand(ctx, "FT._LIST");
+        int index_exists = 0;
+
+        if (list_reply && list_reply->type == VALKEY_REPLY_ARRAY) {
+            printf("Found %zu existing indexes: ", list_reply->elements);
+            for (size_t j = 0; j < list_reply->elements; j++) {
+                printf("found index '%s' ", list_reply->element[j]->str);
+                if (strcmp(list_reply->element[j]->str, indexes_to_create[i]) == 0) {
+                    index_exists = 1;
+                    getFullInfo(indexes_to_create[i], config.cluster_node_count, config.cluster_nodes, config.ct);
+                }            
+            }
+            printf("\n");
         } else {
-            fprintf(stderr, "Error creating index: %s\n", reply ? reply->str : "Unknown error");
-            exit(1);
+            printf("Found 0 existing indexes: \n");
         }
+        
+        if (list_reply) {
+            freeReplyObject(list_reply);
+        }
+        if (index_exists) {
+            printf("Index '%s' already exists, skipping creation.\n", indexes_to_create[i]);
+            continue;
+        }
+        valkeyReply *reply = NULL;
+        if (strcmp(algorithms[i], "hnsw") == 0) {
+            /* Add TAG field if configured */
+            if (config.search.tag_field) {            
+                reply = valkeyCommand(ctx, "FT.CREATE %s PREFIX 1 %s SCHEMA %s TAG %s VECTOR %s 12 TYPE FLOAT32 DIM %d DISTANCE_METRIC %s M %d EF_CONSTRUCTION %d EF_RUNTIME %d",
+                indexes_to_create[i], config.search.prefix, config.search.tag_field, config.search.vector_field, algorithms[i], config.search.vector_dim, config.search.metric, config.search.m,
+                config.search.ef_construction, config.search.ef_search);
+            } else {
+                reply = valkeyCommand(ctx, "FT.CREATE %s PREFIX 1 %s SCHEMA %s VECTOR %s 12 TYPE FLOAT32 DIM %d DISTANCE_METRIC %s M %d EF_CONSTRUCTION %d EF_RUNTIME %d",
+                indexes_to_create[i], config.search.prefix, config.search.vector_field, algorithms[i], config.search.vector_dim, config.search.metric, config.search.m,
+                config.search.ef_construction, config.search.ef_search);
+            }
+        } else {
+            /* Add TAG field if configured */
+            if (config.search.tag_field) {            
+                reply = valkeyCommand(ctx, "FT.CREATE %s PREFIX 1 %s SCHEMA %s TAG %s VECTOR %s 6 TYPE FLOAT32 DIM %d DISTANCE_METRIC %s",
+                indexes_to_create[i], config.search.prefix, config.search.tag_field, config.search.vector_field, algorithms[i], config.search.vector_dim, config.search.metric);
+            } else {
+                reply = valkeyCommand(ctx, "FT.CREATE %s PREFIX 1 %s SCHEMA %s VECTOR %s 6 TYPE FLOAT32 DIM %d DISTANCE_METRIC %s",
+                indexes_to_create[i], config.search.prefix, config.search.vector_field, algorithms[i], config.search.vector_dim, config.search.metric);
+            }
+        }
+        if (reply && (reply->type == VALKEY_REPLY_STRING || reply->type == VALKEY_REPLY_STATUS)) {
+            printf("Index created successfully\n");
+        } else {
+            fprintf(stderr, "Failed to create index: %s\n", 
+                    reply ? reply->str : "Unknown error");
+            // if index already exists, we can ignore the error
+            if (reply && reply->type == VALKEY_REPLY_ERROR && index_exists) {
+                printf("Index '%s' already exists, ignoring error.\n", indexes_to_create[i]);
+            } else {
+                fprintf(stderr, "Error creating index: %s\n", reply ? reply->str : "Unknown error");
+                exit(1);
+            }
+        }
+        if (reply) freeReplyObject(reply);    
+    }        
+    /* Only free the duplicated index name, not the original config.search.name */
+    if (num_indexes > 1) {
+        if (algorithms[1]) sdsfree(algorithms[1]);
+        if (indexes_to_create[1]) sdsfree(indexes_to_create[1]);
     }
-    if (reply) freeReplyObject(reply);            
 }
 
 /* Best-effort server config fetch: use INFO; skip CONFIG on managed services */
