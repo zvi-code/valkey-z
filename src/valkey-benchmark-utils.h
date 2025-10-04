@@ -24,12 +24,7 @@ typedef struct clusterSnapshot {
 
 /* Callback types */
 typedef int (*matcherCallBack)(const char *line, const char *prefix);
-typedef long long (*parseCallBack)(const char *value);
-typedef void (*clusterAggregationCallBack)(void **opaque, long long value, 
-                                           int node_idx, int is_last_node);
-typedef void (*displayCallBack)(const char *field_name, void *opaque, int node_count);
-typedef void (*diffCallBack)(const char *field_name, fieldSnapshot *old, 
-                             fieldSnapshot *new_snap, long long time_delta_ms, int node_idx);
+
 
 /* Read from replica options */
 typedef enum readFromReplica {
@@ -38,15 +33,53 @@ typedef enum readFromReplica {
     FROM_ALL
 } readFromReplica;
 
+typedef enum {
+    DIFF_NONE = 0,
+    DIFF_RATE_COUNT,        /* delta / time_sec */
+    DIFF_RATE_MICROSEC,     /* (delta / 1M) / time_sec - for microsecond counters */
+    DIFF_MEMORY_GROWTH,     /* (delta_bytes / MB) / time_sec */
+    DIFF_PERCENTAGE_CHANGE  /* (delta / old_value) * 100 */
+} DiffType;
+
+typedef enum {
+    DISPLAY_INTEGER,
+    DISPLAY_MEMORY_MB,
+    DISPLAY_MEMORY_HUMAN,
+    DISPLAY_PERCENTAGE,  /* From fixed-point scaled by 1000 */
+    DISPLAY_FLOAT,       /* From fixed-point scaled by 1000 */
+    DISPLAY_LATENCY_USEC,
+    DISPLAY_MINMAX
+} DisplayFormat;
+
+typedef enum {
+    AGG_SUM,
+    AGG_AVERAGE,
+    AGG_MAX,
+    AGG_MINMAX
+} AggregationType;
+
+/* Generic numeric parser with conversion strategy */
+typedef enum {
+    PARSE_INTEGER,
+    PARSE_MEMORY,      /* Handles K/M/G suffixes */
+    PARSE_FLOAT_FIXED, /* Returns value * 1000 */
+    PARSE_PERCENTILE,   /* Extracts p50/p99/p99.9 from string */
+    PARSE_CMDSTATS    /* Extracts from cmdstat_<cmd>: calls=...,usec=...,usec_per_call=...,rejected=...,failed=... */
+} ParseStrategy;
+
+typedef struct {
+    ParseStrategy strategy;
+    const char *key;  /* For percentile: "p50", "p99", "p99.9" */
+} ParseConfig;
+
 /* Extended field type with temporal diff support */
 typedef struct infoFieldType {
     char* prefix_match;
-    char* name;    
     matcherCallBack match;
-    parseCallBack parse;
-    clusterAggregationCallBack agg;
-    displayCallBack disp;
-    diffCallBack diff;           /* Calculate and display diff */
+    ParseConfig parse_config;
+    AggregationType aggregation_type;
+    DisplayFormat display_format;
+    DiffType diff_type;
     int track_per_node;          /* Whether to store per-node values */
     readFromReplica nodes_to_aggregate; /* Whether to read from replicas */
     int is_last; /* Whether we should re-process this line for next field, or stop */

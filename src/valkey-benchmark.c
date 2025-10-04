@@ -2744,7 +2744,7 @@ int main(int argc, char **argv) {
     config.conn_info.hostport = 6379;
     config.use_search = 0;
     config.print_search_results = 0;
-    config.search_debug = 0;
+    config.search_debug = 1;
     config.tests = NULL;
     config.conn_info.input_dbnum = 0;
     config.stdinarg = 0;
