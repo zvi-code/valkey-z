@@ -29,6 +29,7 @@
  */
 
 #include "valkey-benchmark-utils.h"
+#include "valkey-benchmark-vgen.h"
 #include "fmacros.h"
 
 #include <stdio.h>
@@ -381,6 +382,13 @@ static struct config {
     searchIndex search;
     int print_search_results; /* Print FT.SEARCH results */
     int search_debug;
+    
+    /* Vector generator configuration */
+    uint64_t vgen_initial_capacity; /* Initial vector capacity */
+    uint32_t vgen_num_centroids;    /* Number of centroids for clustering */
+    float vgen_radius;              /* Clustering radius */
+    float vgen_sparsity;            /* Sparsity level (0.0-1.0) */
+    uint64_t vgen_seed;             /* Random seed for reproducibility */
 } config;
 
 
@@ -410,7 +418,25 @@ static int dictSdsKeyCompare(const void *key1, const void *key2);
 
 /* Fast unique vector generation using key-based deterministic randomization */
 static sds createVectorTemplate(uint64_t key_idx) {
-    // TODO[is_vector_generator]: if vector generator, use appropriate placeholder size to deduce from dim 4 floats instead of 2
+    // If vector generator is enabled, use VGEN_VECTOR_PLACEHOLDER
+    if (config.is_vector_generator) {
+        /* Allocate vector with placeholder for vgen replacement */
+        float *vector = zmalloc(config.search.vector_dim * sizeof(float));
+        
+        /* Insert VGEN_VECTOR_PLACEHOLDER at the beginning (16 bytes = 4 floats) */
+        memcpy(vector, VGEN_VECTOR_PLACEHOLDER, 16);
+        
+        /* Fill rest with non-zero pattern so strstr works (avoid NULL bytes) */
+        memset(vector + 4, 0xFF, (config.search.vector_dim - 4) * sizeof(float));
+        
+        sds vector_data = sdsnewlen(vector, config.search.vector_dim * sizeof(float));
+        zfree(vector);
+        
+        assert(sdslen(vector_data) == config.search.vector_dim * sizeof(float));
+        return vector_data;
+    }
+    
+    // Original implementation for non-vgen mode
     int dim = config.search.vector_dim - VECTOR_NUM_RAND_DIM;
     float *vector = zcalloc(config.search.vector_dim * sizeof(float));
     /* Use multiple hash passes for better distribution */
@@ -639,8 +665,28 @@ static void initBaseVector(int dim) {
 
 static sds getVectorKey(void) {
     sds key;
-    // TODO[is_vector_generator]: if vector generator, use VGEN_KEY_PLACEHOLDER and append the total length of the key in a 4-byte little-endian integer
-
+    // If vector generator is enabled, use VGEN_KEY_PLACEHOLDER
+    if (config.is_vector_generator) {
+        /* Create key with VGEN_KEY_PLACEHOLDER (16 bytes) + 4 bytes for length */
+        if (config.cluster_mode) {
+            /* Cluster mode: prefix{tag}: + placeholder + length */
+            key = sdscatprintf(sdsempty(), "%s{tag}:", config.search.prefix);
+        } else {
+            /* Standalone mode: prefix + placeholder + length */
+            key = sdscatprintf(sdsempty(), "%s", config.search.prefix);
+        }
+        
+        /* Append the 16-byte placeholder */
+        key = sdscatlen(key, VGEN_KEY_PLACEHOLDER, 16);
+        
+        /* Append 4 bytes for length - use non-zero pattern to avoid breaking strstr */
+        uint32_t placeholder_len = 0xFFFFFFFF;  /* Will be overwritten by vgen */
+        key = sdscatlen(key, &placeholder_len, 4);
+        
+        return key;
+    }
+    
+    // Original implementation for non-vgen mode
     if (config.cluster_mode) {
         key = sdscatprintf(sdsempty(), "%s{tag}:__rand_int__", config.search.prefix);
     } else {
@@ -952,39 +998,36 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
         memcpy(placeholder, cmd + indices[0], placeholder_len);
     }
 }
-// TODO[is_vector_generator]: implement vector generator replacement
+// Vector generator placeholder replacement
 static void replacePlaceholderVectorGenerator(const size_t key_count, const size_t *key_indices, _Atomic uint64_t *key_counter,
     const size_t vec_count, const size_t *vec_indices, _Atomic uint64_t *vector_counter, char *cmd) {       
     if (!config.use_search || (key_count == 0 && vec_count == 0)) return;
+    if (!config.is_vector_generator) return;
+    
     assert((key_count == vec_count) ||
         (vec_count == 0) ||
         (key_count == 0));
+    
     // key only replacement - on vec-del commands
+    if (vec_count == 0 && key_count > 0) {
+        vgen_replace_key_placeholder(key_indices, key_count, cmd, (uint64_t*)key_counter);
+        return;
+    }
+    
     // vector only replacement - on search commands
+    if (key_count == 0 && vec_count > 0) {
+        vgen_replace_vector_placeholder_query(vec_indices, vec_count, cmd, (uint64_t*)vector_counter);
+        return;
+    }
+    
     // both key and vector replacement - on vector insert\update\overwrite commands
-    if (vec_count == 0) {
-        for (size_t i = 0; i < key_count; i++) {
-            // TODO[is_vector_generator]: implement key set for deletion according to the vgen api
-            // replacePlaceholderVGenDelete(key_indices + i, 1, cmd, key_counter);
-        }
+    if (key_count > 0 && vec_count > 0) {
+        vgen_replace_vector_and_key_placeholder(key_indices, key_count,
+                                                vec_indices, vec_count,
+                                                cmd, (uint64_t*)key_counter,
+                                                (uint64_t*)vector_counter);
         return;
     }
-    if (key_count == 0) {
-        for (size_t i = 0; i < vec_count; i++) {
-            // TODO[is_vector_generator]: implement vector set for search according to the vgen api
-            //replacePlaceholderVGenSearch(vec_indices + i, 1, cmd, vector_counter);
-        }
-        return;
-    }
-    for (size_t i = 0; i < placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX]; i++) {
-        // TODO[is_vector_generator]: implement key set for deletion according to the vgen api
-        // 
-    }
-
-    UNUSED(vec_indices);
-    UNUSED(cmd);
-    UNUSED(key_indices);
-    UNUSED(key_counter);
 }
 
 static void replacePlaceholderVector(const size_t *indices, const size_t count, 
@@ -2729,8 +2772,22 @@ int parseOptions(int argc, char **argv) {
             // TODO: Is search is enabled and -t is not, do not run default tests
             config.use_search = 1;
         } else if (!strcmp(argv[i], "--use_vgen")) {
-            // TODO[is_vector_generator]
             config.is_vector_generator = 1;
+        } else if (!strcmp(argv[i], "--vgen-capacity")) {
+            if (lastarg) goto invalid;
+            config.vgen_initial_capacity = strtoull(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--vgen-centroids")) {
+            if (lastarg) goto invalid;
+            config.vgen_num_centroids = (uint32_t)atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--vgen-radius")) {
+            if (lastarg) goto invalid;
+            config.vgen_radius = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--vgen-sparsity")) {
+            if (lastarg) goto invalid;
+            config.vgen_sparsity = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--vgen-seed")) {
+            if (lastarg) goto invalid;
+            config.vgen_seed = strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--search-print-results")) {
             config.print_search_results = 1;
         } else if (!strcmp(argv[i], "--search-prefix")) {
@@ -3166,6 +3223,12 @@ int main(int argc, char **argv) {
     config.use_search = 0;
     config.print_search_results = 0;
     config.search_debug = 1;
+    config.is_vector_generator = 0;
+    config.vgen_initial_capacity = 1000000;  /* Default 1M vectors */
+    config.vgen_num_centroids = 10;          /* Default 10 clusters */
+    config.vgen_radius = 5.0f;               /* Default clustering radius */
+    config.vgen_sparsity = 0.0f;             /* Default no sparsity */
+    config.vgen_seed = 42;                   /* Default seed */
     config.tests = NULL;
     config.conn_info.input_dbnum = 0;
     config.stdinarg = 0;
@@ -3419,8 +3482,21 @@ int main(int argc, char **argv) {
         last_ftinfo = getFtInfoStatistics(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
         last_info_all = getInfoCluster(config.cluster_node_count, config.cluster_nodes, config.ct);
 
-
-        // TODO[is_vector_generator]: if vector generation is used, initialize vector generation according to the appropriate definitions
+        /* Initialize vector generator if enabled */
+        if (config.is_vector_generator) {
+            printf("Initializing vector generator for search workload...\n");
+            if (vgen_init_from_config(config.search.vector_dim,
+                                       config.vgen_initial_capacity,
+                                       config.vgen_num_centroids,
+                                       config.vgen_radius,
+                                       config.vgen_sparsity,
+                                       config.vgen_seed,
+                                       config.cluster_mode,
+                                       config.search.prefix) != 0) {
+                fprintf(stderr, "Failed to initialize vector generator\n");
+                exit(1);
+            }
+        }
     }
     /* Run default benchmark suite. */
     data = zcalloc(config.datasize + 1);
@@ -3652,6 +3728,11 @@ int main(int argc, char **argv) {
     if (config.server_config != NULL) freeServerConfig(config.server_config);
     if (base_vector != NULL) zfree(base_vector);
     resetPlaceholders();
+    
+    /* Cleanup vector generator if it was initialized */
+    if (config.is_vector_generator) {
+        vgen_cleanup();
+    }
 
     return 0;
 }

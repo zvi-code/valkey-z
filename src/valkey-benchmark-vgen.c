@@ -24,12 +24,13 @@
 /* Include vector generator from utils/vgenerator */
 #include "../../utils/vgenerator/vector_generator.h"
 
-/* External config reference - will be properly linked */
-extern struct config config;
-
 /* Global vector generator instance */
 static vector_generator_t *vgen_instance = NULL;
 static pthread_rwlock_t vgen_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/* Configuration values stored at init time */
+static int vgen_cluster_mode = 0;
+static char vgen_prefix[256] = "";
 
 /* Recall tracking structure */
 typedef struct {
@@ -106,7 +107,10 @@ static void cleanup_thread_pools(void) {
 /**
  * Initialize the vector generator from benchmark configuration.
  */
-int vgen_init_from_config(void) {
+int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
+                           uint32_t num_centroids, float radius,
+                           float sparsity, uint64_t seed,
+                           int cluster_mode, const char *prefix) {
     pthread_rwlock_wrlock(&vgen_lock);
     
     if (vgen_instance != NULL) {
@@ -115,41 +119,35 @@ int vgen_init_from_config(void) {
         return 0;
     }
     
-    /* Create generator configuration from benchmark config */
+    /* Store configuration values for later use */
+    vgen_cluster_mode = cluster_mode;
+    if (prefix) {
+        snprintf(vgen_prefix, sizeof(vgen_prefix), "%s", prefix);
+    }
+    
+    /* Create generator configuration from parameters */
     generator_config_t vgen_config = {
-        .dimensions = 128,           /* Default, will be overridden */
-        .initial_capacity = 1000000, /* Default 1M vectors */
-        .sparsity = 0.0,            /* Default no sparsity */
-        .radius = 5.0,              /* Default clustering radius */
-        .num_centroids = 10,        /* Default 10 clusters */
-        .seed = 42                  /* Default seed */
+        .dimensions = dimensions > 0 ? dimensions : 128,
+        .initial_capacity = initial_capacity,
+        .sparsity = sparsity,
+        .radius = radius,
+        .num_centroids = num_centroids,
+        .seed = seed
     };
     
-    /* TODO: Read from config structure once config fields are added in Phase 2 */
-    /* For now, use defaults or environment variables for testing */
-    const char *env_capacity = getenv("VGEN_CAPACITY");
-    if (env_capacity) {
-        vgen_config.initial_capacity = strtoull(env_capacity, NULL, 10);
+    /* Validate configuration */
+    if (vgen_config.dimensions < 4 || vgen_config.dimensions > 2048) {
+        fprintf(stderr, "Error: Vector dimensions must be between 4 and 2048 (got %u)\n", 
+                vgen_config.dimensions);
+        pthread_rwlock_unlock(&vgen_lock);
+        return -1;
     }
     
-    const char *env_centroids = getenv("VGEN_CENTROIDS");
-    if (env_centroids) {
-        vgen_config.num_centroids = (uint32_t)atoi(env_centroids);
-    }
-    
-    const char *env_radius = getenv("VGEN_RADIUS");
-    if (env_radius) {
-        vgen_config.radius = (float)atof(env_radius);
-    }
-    
-    const char *env_sparsity = getenv("VGEN_SPARSITY");
-    if (env_sparsity) {
-        vgen_config.sparsity = (float)atof(env_sparsity);
-    }
-    
-    const char *env_seed = getenv("VGEN_SEED");
-    if (env_seed) {
-        vgen_config.seed = strtoull(env_seed, NULL, 10);
+    if (vgen_config.sparsity < 0.0f || vgen_config.sparsity > 1.0f) {
+        fprintf(stderr, "Error: Sparsity must be between 0.0 and 1.0 (got %.2f)\n", 
+                vgen_config.sparsity);
+        pthread_rwlock_unlock(&vgen_lock);
+        return -1;
     }
     
     /* Initialize the vector generator */
@@ -209,14 +207,56 @@ void vgen_cleanup(void) {
  */
 void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
                                    char *cmd, uint64_t *key_counter) {
-    /* Placeholder implementation for Phase 1 */
-    /* Will be implemented in Phase 4 */
-    (void)indices;
-    (void)count;
-    (void)cmd;
-    (void)key_counter;
+    if (!vgen_is_initialized() || count == 0) return;
     
-    /* TODO: Phase 4 - Get deletion iterator and replace keys */
+    pthread_rwlock_rdlock(&vgen_lock);
+    
+    /* Get or create deletion iterator for this thread */
+    int thread_id = 0; /* TODO: Get actual thread ID from config */
+    thread_iterator_pool_t *pool = &thread_pools[thread_id];
+    
+    pthread_mutex_lock(&pool->lock);
+    
+    if (pool->deletion_iter == NULL) {
+        /* Create deletion iterator - iterate over previously ingested vectors */
+        pool->deletion_iter = vg_get_deletion_iterator(vgen_instance, count);
+    }
+    
+    /* Get keys from deletion iterator and replace placeholders */
+    for (size_t i = 0; i < count; i++) {
+        vector_key_t key;
+        if (!vg_iterator_next_key(pool->deletion_iter, &key)) {
+            /* Iterator exhausted, recreate it */
+            vg_iterator_destroy(pool->deletion_iter);
+            pool->deletion_iter = vg_get_deletion_iterator(vgen_instance, count);
+            if (!vg_iterator_next_key(pool->deletion_iter, &key)) {
+                /* Still no keys available - skip */
+                continue;
+            }
+        }
+        
+        /* Format key - key number only, prefix already in template */
+        char key_buf[32];
+        int key_len = snprintf(key_buf, sizeof(key_buf), "%lu", key);
+        
+        /* Replace placeholder in command buffer */
+        /* The placeholder location includes the prefix{tag}: already */
+        /* We need to replace just the 16-byte VGEN_KEY_PLACEHOLDER + 4 byte length */
+        char *placeholder = cmd + indices[i];
+        
+        /* Write the actual key number into the 16-byte placeholder space */
+        memset(placeholder, 0, 16);  /* Clear placeholder first */
+        memcpy(placeholder, key_buf, key_len < 16 ? key_len : 16);
+        
+        /* Write the actual key length in the 4-byte length field */
+        uint32_t actual_key_len = (uint32_t)key_len;
+        memcpy(placeholder + 16, &actual_key_len, 4);
+    }
+    
+    pthread_mutex_unlock(&pool->lock);
+    pthread_rwlock_unlock(&vgen_lock);
+    
+    (void)key_counter; /* Unused for vgen */
 }
 
 /**
@@ -224,14 +264,52 @@ void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
  */
 void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t count,
                                             char *cmd, uint64_t *vector_counter) {
-    /* Placeholder implementation for Phase 1 */
-    /* Will be implemented in Phase 4 */
-    (void)indices;
-    (void)count;
-    (void)cmd;
-    (void)vector_counter;
+    if (!vgen_is_initialized() || count == 0) return;
     
-    /* TODO: Phase 4 - Get query iterator and replace vectors with ground truth */
+    pthread_rwlock_rdlock(&vgen_lock);
+    
+    /* Get or create query iterator for this thread */
+    int thread_id = 0; /* TODO: Get actual thread ID from config */
+    thread_iterator_pool_t *pool = &thread_pools[thread_id];
+    
+    pthread_mutex_lock(&pool->lock);
+    
+    if (pool->query_iter == NULL) {
+        /* Create query iterator */
+        pool->query_iter = vg_get_query_iterator(vgen_instance, count);
+    }
+    
+    /* Get query vectors and replace placeholders */
+    for (size_t i = 0; i < count; i++) {
+        query_vector_t query;
+        if (!vg_iterator_next_query(pool->query_iter, &query)) {
+            /* Iterator exhausted, recreate it */
+            vg_iterator_destroy(pool->query_iter);
+            pool->query_iter = vg_get_query_iterator(vgen_instance, count);
+            if (!vg_iterator_next_query(pool->query_iter, &query)) {
+                /* Still no vectors available - skip */
+                continue;
+            }
+        }
+        
+        /* Replace placeholder with vector data */
+        char *placeholder = cmd + indices[i];
+        /* VGEN_VECTOR_PLACEHOLDER is 16 bytes at the start of the vector */
+        /* We need to replace the ENTIRE vector, not just the placeholder */
+        uint32_t dims = vg_get_dimensions(vgen_instance);
+        size_t vector_bytes = dims * sizeof(float);
+        
+        /* Replace the entire vector data (placeholder is at the beginning) */
+        memcpy(placeholder, query.vector.data, vector_bytes);
+        
+        /* Store ground truth for later recall computation */
+        /* TODO: Phase 5 - Store ground truth mapping for recall calculation */
+    }
+    
+    pthread_mutex_unlock(&pool->lock);
+    pthread_rwlock_unlock(&vgen_lock);
+    
+    (void)vector_counter; /* Unused for vgen */
 }
 
 /**
@@ -241,17 +319,78 @@ void vgen_replace_vector_and_key_placeholder(const size_t *key_indices, const si
                                               const size_t *vec_indices, const size_t vec_count,
                                               char *cmd, uint64_t *key_counter,
                                               uint64_t *vector_counter) {
-    /* Placeholder implementation for Phase 1 */
-    /* Will be implemented in Phase 4 */
-    (void)key_indices;
-    (void)key_count;
-    (void)vec_indices;
-    (void)vec_count;
-    (void)cmd;
+    if (!vgen_is_initialized()) return;
+    if (key_count == 0 && vec_count == 0) return;
+    
+    /* Should have matching counts for ingestion */
+    if (key_count != vec_count) {
+        fprintf(stderr, "Warning: key_count (%zu) != vec_count (%zu) in ingestion\n",
+                key_count, vec_count);
+        return;
+    }
+    
+    pthread_rwlock_rdlock(&vgen_lock);
+    
+    /* Get or create ingestion iterator for this thread */
+    int thread_id = 0; /* TODO: Get actual thread ID from config */
+    thread_iterator_pool_t *pool = &thread_pools[thread_id];
+    
+    pthread_mutex_lock(&pool->lock);
+    
+    if (pool->ingestion_iter == NULL) {
+        /* Create ingestion iterator with random order */
+        pool->ingestion_iter = vg_get_ingestion_iterator(vgen_instance, 
+                                                         key_count, 
+                                                         GEN_ORDER_RANDOM);
+    }
+    
+    /* Get vectors from ingestion iterator and replace both keys and vectors */
+    for (size_t i = 0; i < key_count; i++) {
+        vector_t vec;
+        if (!vg_iterator_next(pool->ingestion_iter, &vec)) {
+            /* Iterator exhausted, recreate it */
+            vg_iterator_destroy(pool->ingestion_iter);
+            pool->ingestion_iter = vg_get_ingestion_iterator(vgen_instance, 
+                                                             key_count,
+                                                             GEN_ORDER_RANDOM);
+            if (!vg_iterator_next(pool->ingestion_iter, &vec)) {
+                /* Still no vectors available - skip */
+                continue;
+            }
+        }
+        
+        /* Replace key placeholder */
+        if (i < key_count) {
+            /* Format key number only - prefix already in template */
+            char key_buf[32];
+            int key_len = snprintf(key_buf, sizeof(key_buf), "%lu", vec.key);
+            
+            char *key_placeholder = cmd + key_indices[i];
+            /* Write key number into 16-byte placeholder space */
+            memset(key_placeholder, 0, 16);  /* Clear first */
+            memcpy(key_placeholder, key_buf, key_len < 16 ? key_len : 16);
+            
+            /* Write actual key length in 4-byte length field */
+            uint32_t actual_key_len = (uint32_t)key_len;
+            memcpy(key_placeholder + 16, &actual_key_len, 4);
+        }
+        
+        /* Replace vector placeholder */
+        if (i < vec_count) {
+            char *vec_placeholder = cmd + vec_indices[i];
+            uint32_t dims = vg_get_dimensions(vgen_instance);
+            size_t vector_bytes = dims * sizeof(float);
+            
+            /* Replace entire vector data */
+            memcpy(vec_placeholder, vec.data, vector_bytes);
+        }
+    }
+    
+    pthread_mutex_unlock(&pool->lock);
+    pthread_rwlock_unlock(&vgen_lock);
+    
     (void)key_counter;
     (void)vector_counter;
-    
-    /* TODO: Phase 4 - Get ingestion iterator and replace both keys and vectors */
 }
 
 /**

@@ -23,9 +23,20 @@ typedef struct _client *client;
  * This should be called once during benchmark initialization, after command-line
  * arguments have been parsed and before any clients are created.
  * 
+ * @param dimensions Vector dimensions
+ * @param initial_capacity Initial vector capacity
+ * @param num_centroids Number of centroids for clustering
+ * @param radius Clustering radius  
+ * @param sparsity Sparsity level (0.0-1.0)
+ * @param seed Random seed
+ * @param cluster_mode Whether cluster mode is enabled
+ * @param prefix Key prefix for search operations
  * @return 0 on success, -1 on failure
  */
-int vgen_init_from_config(void);
+int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
+                           uint32_t num_centroids, float radius,
+                           float sparsity, uint64_t seed,
+                           int cluster_mode, const char *prefix);
 
 /**
  * Cleanup and destroy the vector generator instance.
