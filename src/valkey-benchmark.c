@@ -729,9 +729,11 @@ static sds getVectorKey(void) {
             /* Standalone mode: prefix + placeholder + length */
             key = sdscatprintf(sdsempty(), "%s", config.search.prefix);
         }
+        key = sdscatlen(key, VGEN_KEY_PLACEHOLDER, 16);
         
-        /* Append the 16-byte placeholder */
-        key = sdscatlen(key, VGEN_KEY_PLACEHOLDER, 16);        
+        /* Append 4 bytes for length - use non-zero pattern to avoid breaking strstr */
+        uint32_t placeholder_len = 0xFFFFFFFF;  /* Will be overwritten by vgen */
+        key = sdscatlen(key, &placeholder_len, 4);            
         return key;
     }
     
@@ -988,6 +990,11 @@ static void createDefaultSearchIndexes(void) {
     if (num_indexes > 1) {
         if (algorithms[1]) sdsfree(algorithms[1]);
         if (indexes_to_create[1]) sdsfree(indexes_to_create[1]);
+    }
+    
+    /* Free the context if we created a new one */
+    if (ctx != config.conn_ctx) {
+        valkeyFree(ctx);
     }
 }
 
@@ -2514,6 +2521,10 @@ cleanup:
     }
     if (reply) freeReplyObject(reply);
     if (nodes) dictRelease(nodes);
+    /* Free the context if we created a new one */
+    if (ctx != config.conn_ctx) {
+        valkeyFree(ctx);
+    }
     return success;
 }
 

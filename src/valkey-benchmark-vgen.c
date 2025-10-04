@@ -630,15 +630,17 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
                 printf("...\n");
             }
             
-            /* Copy ground truth neighbors from query */
-            entry->neighbor_count = NEIGHBORS_PER_QUERY;
-            for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
-                entry->neighbors[j] = query.ground_truth[j];
-            }
+        /* Copy ground truth neighbors from query */
+        entry->neighbor_count = NEIGHBORS_PER_QUERY;
+        for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
+            entry->neighbors[j] = query.ground_truth[j];
         }
     }
     
-    /* Release iterator back to pool (lock-free using atomics) */
+    /* Free the allocated vector data (allocated by vg_iterator_next_query) */
+    free(query.vector.data);
+    query.vector.data = NULL;
+}    /* Release iterator back to pool (lock-free using atomics) */
     vgen_release_thread_iterator(thread_id, ITER_QUERY);
     
     (void)vector_counter; /* Unused for vgen */
@@ -987,5 +989,62 @@ void vgen_get_iterator_stats(int *active_ingestion, int *active_query, int *acti
     if (active_ingestion) *active_ingestion = ingestion_count;
     if (active_query) *active_query = query_count;
     if (active_deletion) *active_deletion = 0;  /* Deletion doesn't use pool */
+}
+
+void vgen_print_memory_stats(void) {
+    printf("\n====== Vector Generator Memory Stats ======\n");
+    
+    /* Iterator pool stats */
+    if (iterator_pool) {
+        int ingestion_count = 0, query_count = 0;
+        
+        for (int i = 0; i < iterator_pool->pool_size; i++) {
+            if (iterator_pool->insert_iterators[i]) ingestion_count++;
+            if (iterator_pool->query_iterators[i]) query_count++;
+        }
+        
+        printf("  Iterator Pool:\n");
+        printf("    Pool size: %d\n", iterator_pool->pool_size);
+        printf("    Query iterators allocated: %d\n", query_count);
+        printf("    Insert iterators allocated: %d\n", ingestion_count);
+        
+        /* Estimate memory usage */
+        size_t pool_memory = sizeof(VgenIteratorPool);
+        pool_memory += iterator_pool->pool_size * sizeof(vector_iterator_t*) * 2;  /* query + insert pools */
+        pool_memory += iterator_pool->pool_size * sizeof(_Atomic int) * 2;  /* in_use flags */
+        printf("    Pool overhead: ~%zu bytes\n", pool_memory);
+    } else {
+        printf("  Iterator Pool: Not initialized\n");
+    }
+    
+    /* Ground truth storage stats */
+    uint64_t gt_count = atomic_load(&ground_truth.count);
+    if (ground_truth.entries) {
+        size_t gt_memory = ground_truth.capacity * sizeof(stored_ground_truth_t);
+        printf("  Ground Truth Storage:\n");
+        printf("    Capacity: %lu entries\n", (unsigned long)ground_truth.capacity);
+        printf("    Entries stored: %lu\n", (unsigned long)gt_count);
+        printf("    Memory allocated: %zu bytes (%.2f MB)\n", 
+               gt_memory, (double)gt_memory / (1024 * 1024));
+        printf("    Memory used: ~%zu bytes (%.2f MB)\n",
+               gt_count * sizeof(stored_ground_truth_t),
+               (double)(gt_count * sizeof(stored_ground_truth_t)) / (1024 * 1024));
+        printf("    Utilization: %.1f%%\n", 
+               (double)gt_count / ground_truth.capacity * 100.0);
+    } else {
+        printf("  Ground Truth Storage: Not initialized\n");
+    }
+    
+    /* Recall tracking stats */
+    printf("  Recall Tracker:\n");
+    printf("    Total queries tracked: %lu\n", (unsigned long)recall_tracker.total_queries);
+    if (recall_tracker.total_queries > 0) {
+        printf("    Average recall: %.2f%%\n", 
+               recall_tracker.total_recall / recall_tracker.total_queries);
+        printf("    Min recall: %.2f%%\n", recall_tracker.min_recall);
+        printf("    Max recall: %.2f%%\n", recall_tracker.max_recall);
+    }
+    
+    printf("============================================\n\n");
 }
 

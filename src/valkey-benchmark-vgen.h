@@ -184,4 +184,11 @@ void vgen_reset_recall_stats(void);
  */
 void vgen_get_iterator_stats(int *active_ingestion, int *active_query, int *active_deletion);
 
+/**
+ * Print memory usage statistics for the vector generator.
+ * 
+ * This function displays memory consumption of the iterator pool and ground truth storage.
+ */
+void vgen_print_memory_stats(void);
+
 #endif /* VALKEY_BENCHMARK_VGEN_H */
