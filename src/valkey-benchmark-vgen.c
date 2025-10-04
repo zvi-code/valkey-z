@@ -411,17 +411,16 @@ void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t c
     pthread_mutex_lock(&pool->lock);
     
     if (pool->query_iter == NULL) {
-        /* Create query iterator */
-        pool->query_iter = vg_get_query_iterator(vgen_instance, count);
+        /* Create query iterator with unlimited count - we'll cycle through queries */
+        pool->query_iter = vg_get_query_iterator(vgen_instance, UINT64_MAX);
     }
     
     /* Get query vectors and replace placeholders */
     for (size_t i = 0; i < count; i++) {
         query_vector_t query;
         if (!vg_iterator_next_query(pool->query_iter, &query)) {
-            /* Iterator exhausted, recreate it */
-            vg_iterator_destroy(pool->query_iter);
-            pool->query_iter = vg_get_query_iterator(vgen_instance, count);
+            /* Iterator exhausted, reset it to cycle through queries again */
+            pool->query_iter->current = 0;
             if (!vg_iterator_next_query(pool->query_iter, &query)) {
                 /* Still no vectors available - skip */
                 continue;
@@ -446,7 +445,7 @@ void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t c
             
             /* DEBUG: Print query key and ground truth */
             static int query_debug_count = 0;
-            if (query_debug_count < 10) {
+            if (query_debug_count < 30) {
                 printf("[VGEN QUERY] Query key: %lu, Expected neighbors: ", query.vector.key);
                 for (int j = 0; j < NEIGHBORS_PER_QUERY && j < 5; j++) {
                     printf("%lu ", query.ground_truth[j].key);

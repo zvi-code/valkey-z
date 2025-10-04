@@ -293,7 +293,6 @@ typedef struct _client {
     int thread_id;
     struct clusterNode *cluster_node;
     int slots_last_update;
-    uint64_t query_index;  /* For vector queries: index assigned when request is sent */
     uint64_t paused : 1;
     uint64_t reuse : 1;
 } *client;
@@ -1356,7 +1355,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 }
                 /* Compute recall if using vector generator */
                 if (config.is_vector_generator) {
-                    vgen_compute_recall_with_index(c, reply, c->query_index);
+                    vgen_compute_recall(c, reply);
                 }
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
@@ -1501,11 +1500,6 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
         c->start = ustime();
         c->latency = -1;
-        
-        /* For vector queries, allocate query index for recall tracking */
-        if (config.is_vector_generator) {
-            c->query_index = vgen_allocate_query_index();
-        }
     }
     const ssize_t buflen = sdslen(c->obuf);
     const ssize_t writeLen = buflen - c->written;
@@ -3111,7 +3105,18 @@ usage:
         "                    Set tag filter pattern for vec-query operations (e.g., 'category_*').\n"
         " --search-tags <distribution>\n"
         "                    Comma-separated tag:percentage pairs for vec-insert operations.\n"
-        "                    Example: 'fruits:8.5,vegetables:7.2,dairy:32.1,meat:52.2'\n",
+        "                    Example: 'fruits:8.5,vegetables:7.2,dairy:32.1,meat:52.2'\n"
+        " --use_vgen         Enable vector generator for deterministic vector generation.\n"
+        "                    Provides ground truth tracking and recall metrics for vec-query tests.\n"
+        " --vgen-capacity <num>\n"
+        "                    Initial capacity for vector generator (default: based on -n value).\n"
+        " --vgen-centroids <num>\n"
+        "                    Number of centroids for vector clustering (default 5).\n"
+        " --vgen-radius <value>\n"
+        "                    Cluster radius for vector generation (default 0.5).\n"
+        " --vgen-sparsity <value>\n"
+        "                    Sparsity ratio for vectors, 0.0-1.0 (default 0.0).\n"
+        " --vgen-seed <num>  Seed for deterministic vector generation (default: random).\n",
         tls_usage,
         rdma_usage,        
         " --mptcp            Enable an MPTCP connection.\n"
@@ -3140,6 +3145,27 @@ usage:
         "   $ valkey-benchmark --search  --search-name grocery_products     --vector-dim 768     --tag-field \"category\"\n"
          "--search-tags 'fruits:5.7,vegetables:0.3,dairy:10.1,meat:52.2,fruitsppo:99,fruitsppod:99' --tag-filter 'fruits*'\n"
          "   -t vec-query  --search-print-results   -n 1 -r 10000000\n\n"
+        " Vector Generator with Recall Tracking:\n"
+        "   The vector generator (--use_vgen) provides deterministic vector generation\n"
+        "   with ground truth tracking for measuring search recall accuracy.\n\n"
+        "   Step 1 - Ingest ground truth vectors (REQUIRED before queries):\n"
+        "   $ valkey-benchmark --cluster -h <host> --use_vgen --vgen-seed 42 \\\n"
+        "       --vgen-capacity 100 --vgen-centroids 5 --vgen-radius 0.5 \\\n"
+        "       --search --vector-dim 1024 --search-name my_index --search-prefix vec: \\\n"
+        "       -t vec-ground-truth -n 10000 -c 1 --rfr 'no'\n\n"
+        "   Step 2 - Run queries and measure recall:\n"
+        "   $ valkey-benchmark --cluster -h <host> --use_vgen --vgen-seed 42 \\\n"
+        "       --vgen-capacity 100 --vgen-centroids 5 --vgen-radius 0.5 \\\n"
+        "       --search --vector-dim 1024 --search-name my_index --search-prefix vec: \\\n"
+        "       -t vec-query -n 1000 -c 10 --threads 5 --rfr 'no'\n\n"
+        "   The output will include recall statistics:\n"
+        "     ====== Recall Statistics ======\n"
+        "       Total queries: 1000\n"
+        "       Average recall: 75.50%%\n"
+        "       Min recall: 30.00%%\n"
+        "       Max recall: 100.00%%\n\n"
+        "   Important: Use --rfr 'no' for write operations (vec-ground-truth, vec-insert)\n"
+        "              to send writes only to primary nodes. Replicas don't accept writes.\n\n"
         " For more information, see the Valkey documentation at https://valkey.io.\n");
     exit(exit_status);
 }

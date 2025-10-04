@@ -312,9 +312,13 @@ vector_generator_t* vg_init(const generator_config_t* config) {
     gen->query_ground_truth = calloc(gen->num_query_vectors, sizeof(query_ground_truth_t));
     if (!gen->query_ground_truth) goto error;
     
-    /* Pre-assign query and neighbor keys */
+    /* Pre-assign query and neighbor keys using prime number spacing for better distribution */
     for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
-        gen->query_ground_truth[i].query_key = i * 10 + 1;
+        /* Use prime spacing (997) to distribute query keys across reserved range */
+        gen->query_ground_truth[i].query_key = (i * 997 + 1) % RESERVED_KEY_RANGE;
+        if (gen->query_ground_truth[i].query_key == 0) {
+            gen->query_ground_truth[i].query_key = 1; /* Avoid key 0 */
+        }
         
         for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
             gen->query_ground_truth[i].neighbor_keys[j] = 
@@ -324,20 +328,7 @@ vector_generator_t* vg_init(const generator_config_t* config) {
         gen->query_ground_truth[i].computed = false;
         pthread_mutex_init(&gen->query_ground_truth[i].compute_mutex, NULL);
     }
-    /* Pre-assign query and neighbor keys ALL from reserved range */
-    for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
-        /* Query key: use every 100th key in reserved range */
-        gen->query_ground_truth[i].query_key = (i * 100) + 1;
-        
-        /* Neighbors: next 10 keys after query */
-        for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
-            gen->query_ground_truth[i].neighbor_keys[j] = 
-                gen->query_ground_truth[i].query_key + j + 1;
-        }
-        
-        gen->query_ground_truth[i].computed = false;
-        pthread_mutex_init(&gen->query_ground_truth[i].compute_mutex, NULL);
-    }
+    
     /* Initialize allocator to start after reserved range */
     atomic_init(&gen->allocator.next_key, gen->general_key_start);
     atomic_init(&gen->allocator.deleted_count, 0);
