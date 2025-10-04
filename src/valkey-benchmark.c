@@ -3673,7 +3673,8 @@ int main(int argc, char **argv) {
                                        config.vgen_sparsity,
                                        config.vgen_seed,
                                        config.cluster_mode,
-                                       config.search.prefix) != 0) {
+                                       config.search.prefix,
+                                       config.num_threads) != 0) {
                 fprintf(stderr, "Failed to initialize vector generator\n");
                 exit(1);
             }

@@ -75,78 +75,234 @@ static recall_tracker_t recall_tracker = {
 };
 
 /**
- * Thread-local iterator pool.
- * 
- * Each thread maintains its own set of iterators to avoid contention.
- * Iterators are created lazily on first use and reused for subsequent operations.
- * 
- * Thread Safety:
- * - Each pool is protected by its own mutex
- * - Pools are indexed by thread_id (must be < MAX_THREADS)
- * - Global initialization is single-threaded (called from main thread)
+ * Iterator types for pool management
  */
-typedef struct {
-    vector_iterator_t *ingestion_iter;  /* Iterator for bulk ingestion (keys 1M+) */
-    vector_iterator_t *query_iter;      /* Iterator for query vectors (reserved range) */
-    vector_iterator_t *deletion_iter;   /* Iterator for deletion operations */
-    pthread_mutex_t lock;                /* Protects all iterators in this pool */
-} thread_iterator_pool_t;
-
-#define MAX_THREADS 500
-static thread_iterator_pool_t thread_pools[MAX_THREADS];
-static int thread_pools_initialized = 0;
+typedef enum {
+    ITER_QUERY,    /* Query iterator for reserved range (1-1M) */
+    ITER_INSERT    /* Insert iterator for general range (1M+) */
+} IteratorType;
 
 /**
- * Initialize thread iterator pools.
+ * Vector Generator Iterator Pool
  * 
- * This function must be called once before any thread uses the iterator pools.
- * It initializes all pool structures and mutexes.
+ * Manages a pool of iterators for multi-threaded vector generation.
+ * Thread-safe allocation/deallocation using atomic operations.
+ * 
+ * Design:
+ * - Query iterators: One per thread for query workloads
+ * - Insert iterators: One per thread for ingestion workloads  
+ * - Ground truth iterator: Shared across threads (mutex-protected)
+ * 
+ * Usage:
+ *   VectorGeneratorIterator *iter = vgen_get_thread_iterator(thread_id, ITER_QUERY);
+ *   // ... use iterator ...
+ *   vgen_release_thread_iterator(thread_id, ITER_QUERY);
+ */
+typedef struct {
+    vector_iterator_t **query_iterators;   /* Pool for query ops */
+    vector_iterator_t **insert_iterators;  /* Pool for insert ops */
+    vector_iterator_t *ground_truth_iter;  /* Single GT iterator */
+    int pool_size;                         /* = num_threads or 8 */
+    _Atomic int *query_in_use;             /* Track allocation */
+    _Atomic int *insert_in_use;            /* Track allocation */
+    pthread_mutex_t pool_lock;             /* Protect pool operations */
+} VgenIteratorPool;
+
+static VgenIteratorPool *iterator_pool = NULL;
+
+/**
+ * Initialize iterator pool with specified number of threads.
+ * 
+ * Creates a pool of iterators for thread-safe vector generation.
+ * Each slot in the pool can hold one query iterator and one insert iterator.
+ * 
+ * @param num_threads Number of threads that will use the pool
+ * @return 1 on success, 0 on failure
  * 
  * Thread Safety: Must be called from a single thread (typically main thread).
  */
-static void init_thread_pools(void) {
-    if (thread_pools_initialized) return;
-    
-    for (int i = 0; i < MAX_THREADS; i++) {
-        thread_pools[i].ingestion_iter = NULL;
-        thread_pools[i].query_iter = NULL;
-        thread_pools[i].deletion_iter = NULL;
-        pthread_mutex_init(&thread_pools[i].lock, NULL);
+static int vgen_init_iterator_pool(int num_threads) {
+    if (iterator_pool != NULL) {
+        fprintf(stderr, "Warning: Iterator pool already initialized\n");
+        return 0;
     }
-    thread_pools_initialized = 1;
+    
+    int pool_size = (num_threads > 0) ? num_threads : 8;
+    
+    /* Allocate pool structure */
+    iterator_pool = zcalloc(sizeof(VgenIteratorPool));
+    if (!iterator_pool) {
+        fprintf(stderr, "Error: Failed to allocate iterator pool\n");
+        return 0;
+    }
+    
+    iterator_pool->pool_size = pool_size;
+    
+    /* Allocate query iterator pool */
+    iterator_pool->query_iterators = zcalloc(pool_size * sizeof(vector_iterator_t*));
+    iterator_pool->query_in_use = zcalloc(pool_size * sizeof(_Atomic int));
+    
+    if (!iterator_pool->query_iterators || !iterator_pool->query_in_use) {
+        fprintf(stderr, "Error: Failed to allocate query iterator pool\n");
+        if (iterator_pool->query_iterators) zfree(iterator_pool->query_iterators);
+        if (iterator_pool->query_in_use) zfree(iterator_pool->query_in_use);
+        zfree(iterator_pool);
+        iterator_pool = NULL;
+        return 0;
+    }
+    
+    /* Allocate insert iterator pool */
+    iterator_pool->insert_iterators = zcalloc(pool_size * sizeof(vector_iterator_t*));
+    iterator_pool->insert_in_use = zcalloc(pool_size * sizeof(_Atomic int));
+    
+    if (!iterator_pool->insert_iterators || !iterator_pool->insert_in_use) {
+        fprintf(stderr, "Error: Failed to allocate insert iterator pool\n");
+        zfree(iterator_pool->query_iterators);
+        zfree(iterator_pool->query_in_use);
+        if (iterator_pool->insert_iterators) zfree(iterator_pool->insert_iterators);
+        if (iterator_pool->insert_in_use) zfree(iterator_pool->insert_in_use);
+        zfree(iterator_pool);
+        iterator_pool = NULL;
+        return 0;
+    }
+    
+    /* Initialize atomic flags to 0 (not in use) */
+    for (int i = 0; i < pool_size; i++) {
+        atomic_init(&iterator_pool->query_in_use[i], 0);
+        atomic_init(&iterator_pool->insert_in_use[i], 0);
+    }
+    
+    /* Create shared ground truth iterator (will be created on first use) */
+    iterator_pool->ground_truth_iter = NULL;
+    
+    pthread_mutex_init(&iterator_pool->pool_lock, NULL);
+    
+    return 1;
 }
 
 /**
- * Cleanup thread iterator pools.
+ * Get or create a thread-local iterator from the pool.
  * 
- * This function destroys all iterators and mutexes in all thread pools.
- * Should be called during shutdown before destroying the vector generator.
+ * @param thread_id Thread identifier (-1 for main thread, 0+ for worker threads)
+ * @param type Iterator type (ITER_QUERY or ITER_INSERT)
+ * @return Iterator pointer or NULL on error
+ * 
+ * Thread Safety: Uses atomic operations for lock-free slot acquisition.
+ * If the preferred slot is busy, searches for a free slot.
+ */
+static vector_iterator_t* vgen_get_thread_iterator(int thread_id, IteratorType type) {
+    if (!iterator_pool || !vgen_instance) return NULL;
+    
+    /* Calculate preferred slot based on thread_id */
+    int slot = (thread_id >= 0) ? thread_id % iterator_pool->pool_size : 0;
+    
+    vector_iterator_t **pool = (type == ITER_QUERY) 
+        ? iterator_pool->query_iterators 
+        : iterator_pool->insert_iterators;
+    _Atomic int *in_use = (type == ITER_QUERY)
+        ? iterator_pool->query_in_use
+        : iterator_pool->insert_in_use;
+    
+    /* Try to acquire preferred slot atomically */
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&in_use[slot], &expected, 1)) {
+        /* Preferred slot is busy, find a free slot */
+        int found = 0;
+        for (int i = 0; i < iterator_pool->pool_size; i++) {
+            expected = 0;
+            if (atomic_compare_exchange_strong(&in_use[i], &expected, 1)) {
+                slot = i;
+                found = 1;
+                break;
+            }
+        }
+        
+        if (!found) {
+            /* All slots busy - this shouldn't happen if pool_size >= num_threads */
+            #ifdef DEBUG
+            fprintf(stderr, "WARN: All iterator slots busy (pool_size=%d, thread_id=%d)\n", 
+                    iterator_pool->pool_size, thread_id);
+            #endif
+            return NULL;
+        }
+    }
+    
+    /* Lazy allocation on first use */
+    if (!pool[slot]) {
+        if (type == ITER_QUERY) {
+            pool[slot] = vg_get_query_iterator(vgen_instance, UINT64_MAX);
+        } else {
+            /* For INSERT iterators, use random order generation */
+            pool[slot] = vg_get_ingestion_iterator(vgen_instance, UINT64_MAX, GEN_ORDER_RANDOM);
+        }
+        
+        if (!pool[slot]) {
+            /* Failed to create iterator, release slot */
+            atomic_store(&in_use[slot], 0);
+            fprintf(stderr, "Error: Failed to create iterator (type=%d)\n", type);
+            return NULL;
+        }
+    }
+    
+    return pool[slot];
+}
+
+/**
+ * Release a thread-local iterator back to the pool.
+ * 
+ * @param thread_id Thread identifier (-1 for main thread, 0+ for worker threads)
+ * @param type Iterator type (ITER_QUERY or ITER_INSERT)
+ * 
+ * Thread Safety: Uses atomic operations for lock-free release.
+ */
+static void vgen_release_thread_iterator(int thread_id, IteratorType type) {
+    if (!iterator_pool) return;
+    
+    /* Calculate slot based on thread_id */
+    int slot = (thread_id >= 0) ? thread_id % iterator_pool->pool_size : 0;
+    
+    _Atomic int *in_use = (type == ITER_QUERY)
+        ? iterator_pool->query_in_use
+        : iterator_pool->insert_in_use;
+    
+    /* Release atomically */
+    atomic_store(&in_use[slot], 0);
+}
+
+/**
+ * Cleanup iterator pool and destroy all iterators.
  * 
  * Thread Safety: Must be called when no threads are actively using the pools.
  */
-static void cleanup_thread_pools(void) {
-    if (!thread_pools_initialized) return;
+static void vgen_cleanup_iterator_pool(void) {
+    if (!iterator_pool) return;
     
-    for (int i = 0; i < MAX_THREADS; i++) {
-        pthread_mutex_lock(&thread_pools[i].lock);
-        
-        if (thread_pools[i].ingestion_iter) {
-            vg_iterator_destroy(thread_pools[i].ingestion_iter);
-            thread_pools[i].ingestion_iter = NULL;
+    /* Destroy query iterators */
+    for (int i = 0; i < iterator_pool->pool_size; i++) {
+        if (iterator_pool->query_iterators[i]) {
+            vg_iterator_destroy(iterator_pool->query_iterators[i]);
+            iterator_pool->query_iterators[i] = NULL;
         }
-        if (thread_pools[i].query_iter) {
-            vg_iterator_destroy(thread_pools[i].query_iter);
-            thread_pools[i].query_iter = NULL;
+        if (iterator_pool->insert_iterators[i]) {
+            vg_iterator_destroy(iterator_pool->insert_iterators[i]);
+            iterator_pool->insert_iterators[i] = NULL;
         }
-        if (thread_pools[i].deletion_iter) {
-            vg_iterator_destroy(thread_pools[i].deletion_iter);
-            thread_pools[i].deletion_iter = NULL;
-        }
-        
-        pthread_mutex_unlock(&thread_pools[i].lock);
-        pthread_mutex_destroy(&thread_pools[i].lock);
     }
-    thread_pools_initialized = 0;
+    
+    /* Destroy ground truth iterator */
+    if (iterator_pool->ground_truth_iter) {
+        vg_iterator_destroy(iterator_pool->ground_truth_iter);
+        iterator_pool->ground_truth_iter = NULL;
+    }
+    
+    /* Free pool resources */
+    zfree(iterator_pool->query_iterators);
+    zfree(iterator_pool->insert_iterators);
+    zfree(iterator_pool->query_in_use);
+    zfree(iterator_pool->insert_in_use);
+    pthread_mutex_destroy(&iterator_pool->pool_lock);
+    zfree(iterator_pool);
+    iterator_pool = NULL;
 }
 
 /**
@@ -155,7 +311,7 @@ static void cleanup_thread_pools(void) {
 int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
                            uint32_t num_centroids, float radius,
                            float sparsity, uint64_t seed,
-                           int cluster_mode, const char *prefix) {
+                           int cluster_mode, const char *prefix, int num_threads) {
     pthread_rwlock_wrlock(&vgen_lock);
     
     if (vgen_instance != NULL) {
@@ -203,8 +359,25 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
         return -1;
     }
     
-    /* Initialize thread pools */
-    init_thread_pools();
+    /* Initialize iterator pool */
+    if (num_threads > 0) {
+        if (!vgen_init_iterator_pool(num_threads)) {
+            fprintf(stderr, "Error: Failed to initialize iterator pool\n");
+            vg_destroy(vgen_instance);
+            vgen_instance = NULL;
+            pthread_rwlock_unlock(&vgen_lock);
+            return -1;
+        }
+    } else {
+        /* Default pool size of 8 for single-threaded mode */
+        if (!vgen_init_iterator_pool(8)) {
+            fprintf(stderr, "Error: Failed to initialize iterator pool\n");
+            vg_destroy(vgen_instance);
+            vgen_instance = NULL;
+            pthread_rwlock_unlock(&vgen_lock);
+            return -1;
+        }
+    }
     
     /* Initialize ground truth storage */
     pthread_mutex_init(&ground_truth.lock, NULL);
@@ -213,6 +386,7 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
     ground_truth.entries = calloc(ground_truth.capacity, sizeof(stored_ground_truth_t));
     if (ground_truth.entries == NULL) {
         fprintf(stderr, "Error: Failed to allocate ground truth storage\n");
+        vgen_cleanup_iterator_pool();
         vg_destroy(vgen_instance);
         vgen_instance = NULL;
         pthread_rwlock_unlock(&vgen_lock);
@@ -246,8 +420,8 @@ void vgen_cleanup(void) {
         return;
     }
     
-    /* Cleanup thread pools first */
-    cleanup_thread_pools();
+    /* Cleanup iterator pool first */
+    vgen_cleanup_iterator_pool();
     
     /* Cleanup ground truth storage */
     pthread_mutex_lock(&ground_truth.lock);
@@ -291,12 +465,6 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
     if (!vgen_is_initialized()) return;
     if (key_count == 0 && vec_count == 0) return;
     
-    /* Validate thread_id to prevent out-of-bounds access */
-    if (thread_id < 0 || thread_id >= MAX_THREADS) {
-        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
-        return;
-    }
-    
     /* Should have matching counts */
     if (key_count != vec_count) {
         fprintf(stderr, "Warning: key_count (%zu) != vec_count (%zu) in ground truth ingestion\n",
@@ -305,11 +473,6 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
     }
     
     pthread_rwlock_rdlock(&vgen_lock);
-    
-    /* Get or create ground truth iterator for this thread */
-    thread_iterator_pool_t *pool = &thread_pools[thread_id];
-    
-    pthread_mutex_lock(&pool->lock);
     
     /* For ground truth, we need to iterate over ALL possible neighbor keys from reserved range.
      * The vector generator pre-allocates neighbor keys for each query in the reserved range.
@@ -322,19 +485,20 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
     /* For now, use a simple approach: generate vectors for keys in reserved range (1-999999)
      * that will be used as neighbors. We'll use a separate static counter. */
     
-    static uint64_t ground_truth_key_index = 0;
+    static _Atomic uint64_t ground_truth_key_index = 0;
     
     /* Generate vectors for reserved range keys */
     for (size_t i = 0; i < key_count; i++) {
         /* Use sequential keys from reserved range starting at 1 */
-        vector_key_t key = (ground_truth_key_index++) % 1000000; /* Reserved range: 0-999999 */
+        uint64_t current_index = atomic_fetch_add(&ground_truth_key_index, 1);
+        vector_key_t key = (current_index) % 1000000; /* Reserved range: 0-999999 */
         if (key == 0) key = 1; /* Skip key 0, start from 1 */
         
         /* DEBUG: Print ground truth key being generated */
-        static int gt_debug_count = 0;
-        if (gt_debug_count < 10) {
-            printf("[VGEN GROUND_TRUTH] Ingesting reserved key: %lu (iteration %d)\n", key, gt_debug_count);
-            gt_debug_count++;
+        static _Atomic int gt_debug_count = 0;
+        int current_debug_count = atomic_fetch_add(&gt_debug_count, 1);
+        if (current_debug_count < 10) {
+            printf("[VGEN GROUND_TRUTH] Ingesting reserved key: %lu (iteration %d)\n", key, current_debug_count);
         }
         
         /* Replace key placeholder */
@@ -365,17 +529,17 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
         }
     }
     
-    pthread_mutex_unlock(&pool->lock);
     pthread_rwlock_unlock(&vgen_lock);
     
     (void)key_counter;
     (void)vector_counter;
+    (void)thread_id;  /* Not used for ground truth - uses atomic counter instead */
 }
 
 /**
  * Replace key placeholder for deletion operations.
  * 
- * @param thread_id Thread identifier (must be < MAX_THREADS)
+ * @param thread_id Thread identifier (unused for deletion, uses atomic counter)
  * @param indices Array of placeholder positions in command buffer
  * @param count Number of placeholders to replace
  * @param cmd Command buffer to modify in-place
@@ -385,36 +549,15 @@ void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const si
                                    char *cmd, uint64_t *key_counter) {
     if (!vgen_is_initialized() || count == 0) return;
     
-    /* Validate thread_id to prevent out-of-bounds access */
-    if (thread_id < 0 || thread_id >= MAX_THREADS) {
-        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
-        return;
-    }
-    
     pthread_rwlock_rdlock(&vgen_lock);
     
-    /* Get or create deletion iterator for this thread */
-    thread_iterator_pool_t *pool = &thread_pools[thread_id];
+    /* Use a simple atomic counter for deletion keys */
+    static _Atomic uint64_t deletion_key_counter = 1000001;  /* Start after reserved range */
     
-    pthread_mutex_lock(&pool->lock);
-    
-    if (pool->deletion_iter == NULL) {
-        /* Create deletion iterator - iterate over previously ingested vectors */
-        pool->deletion_iter = vg_get_deletion_iterator(vgen_instance, count);
-    }
-    
-    /* Get keys from deletion iterator and replace placeholders */
+    /* Get keys and replace placeholders */
     for (size_t i = 0; i < count; i++) {
-        vector_key_t key;
-        if (!vg_iterator_next_key(pool->deletion_iter, &key)) {
-            /* Iterator exhausted, recreate it */
-            vg_iterator_destroy(pool->deletion_iter);
-            pool->deletion_iter = vg_get_deletion_iterator(vgen_instance, count);
-            if (!vg_iterator_next_key(pool->deletion_iter, &key)) {
-                /* Still no keys available - skip */
-                continue;
-            }
-        }
+        /* Get next key atomically */
+        vector_key_t key = atomic_fetch_add(&deletion_key_counter, 1);
         
         /* Format key - key number only, prefix already in template */
         char key_buf[32];
@@ -434,10 +577,10 @@ void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const si
         memcpy(placeholder + 16, &actual_key_len, 4);
     }
     
-    pthread_mutex_unlock(&pool->lock);
     pthread_rwlock_unlock(&vgen_lock);
     
     (void)key_counter; /* Unused for vgen */
+    (void)thread_id;   /* Not used - atomic counter instead */
 }
 
 /**
@@ -454,22 +597,14 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
                                             char *cmd, uint64_t *vector_counter) {
     if (!vgen_is_initialized() || count == 0) return UINT64_MAX;
     
-    /* Validate thread_id to prevent out-of-bounds access */
-    if (thread_id < 0 || thread_id >= MAX_THREADS) {
-        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
-        return UINT64_MAX;
-    }
-    
     pthread_rwlock_rdlock(&vgen_lock);
     
-    /* Get or create query iterator for this thread */
-    thread_iterator_pool_t *pool = &thread_pools[thread_id];
-    
-    pthread_mutex_lock(&pool->lock);
-    
-    if (pool->query_iter == NULL) {
-        /* Create query iterator with unlimited count - we'll cycle through queries */
-        pool->query_iter = vg_get_query_iterator(vgen_instance, UINT64_MAX);
+    /* Get query iterator from pool */
+    vector_iterator_t *iter = vgen_get_thread_iterator(thread_id, ITER_QUERY);
+    if (iter == NULL) {
+        fprintf(stderr, "Error: Failed to get query iterator for thread %d\n", thread_id);
+        pthread_rwlock_unlock(&vgen_lock);
+        return UINT64_MAX;
     }
     
     uint64_t query_idx = UINT64_MAX;
@@ -477,10 +612,10 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
     /* Get query vectors and replace placeholders */
     for (size_t i = 0; i < count; i++) {
         query_vector_t query;
-        if (!vg_iterator_next_query(pool->query_iter, &query)) {
+        if (!vg_iterator_next_query(iter, &query)) {
             /* Iterator exhausted, reset it to cycle through queries again */
-            pool->query_iter->current = 0;
-            if (!vg_iterator_next_query(pool->query_iter, &query)) {
+            iter->current = 0;
+            if (!vg_iterator_next_query(iter, &query)) {
                 /* Still no vectors available - skip */
                 continue;
             }
@@ -524,7 +659,9 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
         pthread_mutex_unlock(&ground_truth.lock);
     }
     
-    pthread_mutex_unlock(&pool->lock);
+    /* Release iterator back to pool */
+    vgen_release_thread_iterator(thread_id, ITER_QUERY);
+    
     pthread_rwlock_unlock(&vgen_lock);
     
     (void)vector_counter; /* Unused for vgen */
@@ -550,12 +687,6 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
     if (!vgen_is_initialized()) return;
     if (key_count == 0 && vec_count == 0) return;
     
-    /* Validate thread_id to prevent out-of-bounds access */
-    if (thread_id < 0 || thread_id >= MAX_THREADS) {
-        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
-        return;
-    }
-    
     /* Should have matching counts for ingestion */
     if (key_count != vec_count) {
         fprintf(stderr, "Warning: key_count (%zu) != vec_count (%zu) in ingestion\n",
@@ -565,28 +696,21 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
     
     pthread_rwlock_rdlock(&vgen_lock);
     
-    /* Get or create ingestion iterator for this thread */
-    thread_iterator_pool_t *pool = &thread_pools[thread_id];
-    
-    pthread_mutex_lock(&pool->lock);
-    
-    if (pool->ingestion_iter == NULL) {
-        /* Create ingestion iterator with random order */
-        pool->ingestion_iter = vg_get_ingestion_iterator(vgen_instance, 
-                                                         key_count, 
-                                                         GEN_ORDER_RANDOM);
+    /* Get ingestion iterator from pool */
+    vector_iterator_t *iter = vgen_get_thread_iterator(thread_id, ITER_INSERT);
+    if (iter == NULL) {
+        fprintf(stderr, "Error: Failed to get ingestion iterator for thread %d\n", thread_id);
+        pthread_rwlock_unlock(&vgen_lock);
+        return;
     }
     
     /* Get vectors from ingestion iterator and replace both keys and vectors */
     for (size_t i = 0; i < key_count; i++) {
         vector_t vec;
-        if (!vg_iterator_next(pool->ingestion_iter, &vec)) {
-            /* Iterator exhausted, recreate it */
-            vg_iterator_destroy(pool->ingestion_iter);
-            pool->ingestion_iter = vg_get_ingestion_iterator(vgen_instance, 
-                                                             key_count,
-                                                             GEN_ORDER_RANDOM);
-            if (!vg_iterator_next(pool->ingestion_iter, &vec)) {
+        if (!vg_iterator_next(iter, &vec)) {
+            /* Iterator exhausted, reset it */
+            iter->current = 0;
+            if (!vg_iterator_next(iter, &vec)) {
                 /* Still no vectors available - skip */
                 continue;
             }
@@ -626,7 +750,9 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
         }
     }
     
-    pthread_mutex_unlock(&pool->lock);
+    /* Release iterator back to pool */
+    vgen_release_thread_iterator(thread_id, ITER_INSERT);
+    
     pthread_rwlock_unlock(&vgen_lock);
     
     (void)key_counter;
@@ -861,10 +987,10 @@ void vgen_reset_recall_stats(void) {
  * 
  * @param active_ingestion Out: number of active ingestion iterators
  * @param active_query Out: number of active query iterators
- * @param active_deletion Out: number of active deletion iterators
+ * @param active_deletion Out: number of active deletion iterators (deprecated, always 0)
  */
 void vgen_get_iterator_stats(int *active_ingestion, int *active_query, int *active_deletion) {
-    if (!thread_pools_initialized) {
+    if (!iterator_pool) {
         if (active_ingestion) *active_ingestion = 0;
         if (active_query) *active_query = 0;
         if (active_deletion) *active_deletion = 0;
@@ -873,19 +999,15 @@ void vgen_get_iterator_stats(int *active_ingestion, int *active_query, int *acti
     
     int ingestion_count = 0;
     int query_count = 0;
-    int deletion_count = 0;
     
-    for (int i = 0; i < MAX_THREADS; i++) {
-        pthread_mutex_lock(&thread_pools[i].lock);
-        
-        if (thread_pools[i].ingestion_iter) ingestion_count++;
-        if (thread_pools[i].query_iter) query_count++;
-        if (thread_pools[i].deletion_iter) deletion_count++;
-        
-        pthread_mutex_unlock(&thread_pools[i].lock);
+    /* Count allocated iterators in the pool */
+    for (int i = 0; i < iterator_pool->pool_size; i++) {
+        if (iterator_pool->insert_iterators[i]) ingestion_count++;
+        if (iterator_pool->query_iterators[i]) query_count++;
     }
     
     if (active_ingestion) *active_ingestion = ingestion_count;
     if (active_query) *active_query = query_count;
-    if (active_deletion) *active_deletion = deletion_count;
+    if (active_deletion) *active_deletion = 0;  /* Deletion doesn't use pool */
 }
+

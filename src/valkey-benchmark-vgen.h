@@ -31,12 +31,13 @@ typedef struct _client *client;
  * @param seed Random seed
  * @param cluster_mode Whether cluster mode is enabled
  * @param prefix Key prefix for search operations
+ * @param num_threads Number of threads for iterator pool (0 = use default)
  * @return 0 on success, -1 on failure
  */
 int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
                            uint32_t num_centroids, float radius,
                            float sparsity, uint64_t seed,
-                           int cluster_mode, const char *prefix);
+                           int cluster_mode, const char *prefix, int num_threads);
 
 /**
  * Cleanup and destroy the vector generator instance.
