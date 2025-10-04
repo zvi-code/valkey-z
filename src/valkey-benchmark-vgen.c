@@ -74,12 +74,22 @@ static recall_tracker_t recall_tracker = {
     .lock = PTHREAD_MUTEX_INITIALIZER
 };
 
-/* Thread-local iterator pool */
+/**
+ * Thread-local iterator pool.
+ * 
+ * Each thread maintains its own set of iterators to avoid contention.
+ * Iterators are created lazily on first use and reused for subsequent operations.
+ * 
+ * Thread Safety:
+ * - Each pool is protected by its own mutex
+ * - Pools are indexed by thread_id (must be < MAX_THREADS)
+ * - Global initialization is single-threaded (called from main thread)
+ */
 typedef struct {
-    vector_iterator_t *ingestion_iter;
-    vector_iterator_t *query_iter;
-    vector_iterator_t *deletion_iter;
-    pthread_mutex_t lock;
+    vector_iterator_t *ingestion_iter;  /* Iterator for bulk ingestion (keys 1M+) */
+    vector_iterator_t *query_iter;      /* Iterator for query vectors (reserved range) */
+    vector_iterator_t *deletion_iter;   /* Iterator for deletion operations */
+    pthread_mutex_t lock;                /* Protects all iterators in this pool */
 } thread_iterator_pool_t;
 
 #define MAX_THREADS 500
@@ -88,6 +98,11 @@ static int thread_pools_initialized = 0;
 
 /**
  * Initialize thread iterator pools.
+ * 
+ * This function must be called once before any thread uses the iterator pools.
+ * It initializes all pool structures and mutexes.
+ * 
+ * Thread Safety: Must be called from a single thread (typically main thread).
  */
 static void init_thread_pools(void) {
     if (thread_pools_initialized) return;
@@ -103,6 +118,11 @@ static void init_thread_pools(void) {
 
 /**
  * Cleanup thread iterator pools.
+ * 
+ * This function destroys all iterators and mutexes in all thread pools.
+ * Should be called during shutdown before destroying the vector generator.
+ * 
+ * Thread Safety: Must be called when no threads are actively using the pools.
  */
 static void cleanup_thread_pools(void) {
     if (!thread_pools_initialized) return;
@@ -254,6 +274,15 @@ void vgen_cleanup(void) {
 /**
  * Replace both key and vector placeholders for ground truth ingestion.
  * This ingests the reserved-range vectors that serve as ground truth neighbors.
+ * 
+ * @param thread_id Thread identifier (must be < MAX_THREADS)
+ * @param key_indices Array of key placeholder positions
+ * @param key_count Number of key placeholders
+ * @param vec_indices Array of vector placeholder positions
+ * @param vec_count Number of vector placeholders
+ * @param cmd Command buffer to modify in-place
+ * @param key_counter Unused for vgen (kept for API compatibility)
+ * @param vector_counter Unused for vgen (kept for API compatibility)
  */
 void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indices, const size_t key_count,
                                             const size_t *vec_indices, const size_t vec_count,
@@ -261,6 +290,12 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
                                             uint64_t *vector_counter) {
     if (!vgen_is_initialized()) return;
     if (key_count == 0 && vec_count == 0) return;
+    
+    /* Validate thread_id to prevent out-of-bounds access */
+    if (thread_id < 0 || thread_id >= MAX_THREADS) {
+        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
+        return;
+    }
     
     /* Should have matching counts */
     if (key_count != vec_count) {
@@ -339,10 +374,22 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
 
 /**
  * Replace key placeholder for deletion operations.
+ * 
+ * @param thread_id Thread identifier (must be < MAX_THREADS)
+ * @param indices Array of placeholder positions in command buffer
+ * @param count Number of placeholders to replace
+ * @param cmd Command buffer to modify in-place
+ * @param key_counter Unused for vgen (kept for API compatibility)
  */
 void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const size_t count,
                                    char *cmd, uint64_t *key_counter) {
     if (!vgen_is_initialized() || count == 0) return;
+    
+    /* Validate thread_id to prevent out-of-bounds access */
+    if (thread_id < 0 || thread_id >= MAX_THREADS) {
+        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
+        return;
+    }
     
     pthread_rwlock_rdlock(&vgen_lock);
     
@@ -395,10 +442,23 @@ void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const si
 
 /**
  * Replace vector placeholder for query operations.
+ * 
+ * @param thread_id Thread identifier (must be < MAX_THREADS)
+ * @param indices Array of placeholder positions in command buffer
+ * @param count Number of placeholders to replace
+ * @param cmd Command buffer to modify in-place
+ * @param vector_counter Unused for vgen (kept for API compatibility)
+ * @return Query index for recall tracking, or UINT64_MAX if no query generated
  */
 uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indices, const size_t count,
                                             char *cmd, uint64_t *vector_counter) {
     if (!vgen_is_initialized() || count == 0) return UINT64_MAX;
+    
+    /* Validate thread_id to prevent out-of-bounds access */
+    if (thread_id < 0 || thread_id >= MAX_THREADS) {
+        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
+        return UINT64_MAX;
+    }
     
     pthread_rwlock_rdlock(&vgen_lock);
     
@@ -473,6 +533,15 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
 
 /**
  * Replace both key and vector placeholders for ingestion operations.
+ * 
+ * @param thread_id Thread identifier (must be < MAX_THREADS)
+ * @param key_indices Array of key placeholder positions
+ * @param key_count Number of key placeholders
+ * @param vec_indices Array of vector placeholder positions
+ * @param vec_count Number of vector placeholders
+ * @param cmd Command buffer to modify in-place
+ * @param key_counter Unused for vgen (kept for API compatibility)
+ * @param vector_counter Unused for vgen (kept for API compatibility)
  */
 void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_indices, const size_t key_count,
                                               const size_t *vec_indices, const size_t vec_count,
@@ -480,6 +549,12 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
                                               uint64_t *vector_counter) {
     if (!vgen_is_initialized()) return;
     if (key_count == 0 && vec_count == 0) return;
+    
+    /* Validate thread_id to prevent out-of-bounds access */
+    if (thread_id < 0 || thread_id >= MAX_THREADS) {
+        fprintf(stderr, "Error: Invalid thread_id %d (must be 0-%d)\n", thread_id, MAX_THREADS-1);
+        return;
+    }
     
     /* Should have matching counts for ingestion */
     if (key_count != vec_count) {
