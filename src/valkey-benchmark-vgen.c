@@ -193,6 +193,14 @@ static int vgen_init_iterator_pool(int num_threads) {
 static vector_iterator_t* vgen_get_thread_iterator(int thread_id, IteratorType type) {
     if (!iterator_pool || !vgen_instance) return NULL;
     
+    #ifdef DEBUG
+    /* Debug assertion: Warn if thread_id exceeds pool size */
+    if (thread_id >= iterator_pool->pool_size) {
+        fprintf(stderr, "WARN: thread_id %d exceeds pool size %d\n", 
+                thread_id, iterator_pool->pool_size);
+    }
+    #endif
+    
     /* Calculate preferred slot based on thread_id */
     int slot = (thread_id >= 0) ? thread_id % iterator_pool->pool_size : 0;
     
