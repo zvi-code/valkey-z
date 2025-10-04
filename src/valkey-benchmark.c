@@ -293,6 +293,10 @@ typedef struct _client {
     int thread_id;
     struct clusterNode *cluster_node;
     int slots_last_update;
+    uint64_t *vgen_query_indices; /* Queue of query indices for pipelined requests */
+    int vgen_query_head;          /* Head position in query index queue */
+    int vgen_query_tail;          /* Tail position in query index queue */
+    int vgen_query_capacity;      /* Capacity of query index queue */
     uint64_t paused : 1;
     uint64_t reuse : 1;
 } *client;
@@ -1066,10 +1070,10 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
     }
 }
 // Vector generator placeholder replacement
-static void replacePlaceholderVectorGenerator(const size_t key_count, const size_t *key_indices, _Atomic uint64_t *key_counter,
+static uint64_t replacePlaceholderVectorGenerator(const size_t key_count, const size_t *key_indices, _Atomic uint64_t *key_counter,
     const size_t vec_count, const size_t *vec_indices, _Atomic uint64_t *vector_counter, char *cmd) {       
-    if (!config.use_search || (key_count == 0 && vec_count == 0)) return;
-    if (!config.is_vector_generator) return;
+    if (!config.use_search || (key_count == 0 && vec_count == 0)) return UINT64_MAX;
+    if (!config.is_vector_generator) return UINT64_MAX;
     
     assert((key_count == vec_count) ||
         (vec_count == 0) ||
@@ -1078,13 +1082,13 @@ static void replacePlaceholderVectorGenerator(const size_t key_count, const size
     // key only replacement - on vec-del commands
     if (vec_count == 0 && key_count > 0) {
         vgen_replace_key_placeholder(key_indices, key_count, cmd, (uint64_t*)key_counter);
-        return;
+        return UINT64_MAX;
     }
     
     // vector only replacement - on search commands
     if (key_count == 0 && vec_count > 0) {
-        vgen_replace_vector_placeholder_query(vec_indices, vec_count, cmd, (uint64_t*)vector_counter);
-        return;
+        uint64_t query_idx = vgen_replace_vector_placeholder_query(vec_indices, vec_count, cmd, (uint64_t*)vector_counter);
+        return query_idx;
     }
     
     // both key and vector replacement
@@ -1108,8 +1112,9 @@ static void replacePlaceholderVectorGenerator(const size_t key_count, const size
                                                     cmd, (uint64_t*)key_counter,
                                                     (uint64_t*)vector_counter);
         }
-        return;
+        return UINT64_MAX;
     }
+    return UINT64_MAX;
 }
 
 static void replacePlaceholderVector(const size_t *indices, const size_t count, 
@@ -1193,11 +1198,16 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
             replacePlaceholderVector(indices, count, cmd, 
                                    &seq_key[VECTOR_PLACEHOLDER_INDEX]);
         }
-        /* Handle __rand_int__ separately (multiple different values) */    
-        replacePlaceholderVectorGenerator(placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX-1], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
+        /* Handle vector generator placeholders and store query index */    
+        uint64_t query_idx = replacePlaceholderVectorGenerator(placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX-1], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
                 &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
                 placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX], &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX], 
-                cmd);        
+                cmd);
+        /* Enqueue query index for recall tracking (handles pipelining) */
+        if (query_idx != UINT64_MAX) {
+            assert(c->vgen_query_tail < c->vgen_query_capacity);
+            c->vgen_query_indices[c->vgen_query_tail++] = query_idx;
+        }
     }
 }
 
@@ -1231,6 +1241,7 @@ static void freeClient(client c) {
     if (c->paused) releasePausedClient(c);
     sdsfree(c->obuf);
     zfree(c->stagptr);
+    if (c->vgen_query_indices) zfree(c->vgen_query_indices);
     zfree(c);
     if (config.num_threads) pthread_mutex_lock(&(config.liveclients_mutex));
     config.liveclients--;
@@ -1261,6 +1272,9 @@ static void resetClient(client c) {
     }
     c->written = 0;
     c->pending = config.pipeline * c->seqlen;
+    /* Reset query index queue for vector generator */
+    c->vgen_query_head = 0;
+    c->vgen_query_tail = 0;
 }
 
 /* Acquires the specified number of tokens from the token bucket or calculates the wait time if tokens are not available.
@@ -1401,8 +1415,10 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                     printSearchResults(reply);
                 }
                 /* Compute recall if using vector generator */
-                if (config.is_vector_generator) {
-                    vgen_compute_recall(c, reply);
+                if (config.is_vector_generator && c->vgen_query_head < c->vgen_query_tail) {
+                    /* Dequeue the query index for this response */
+                    uint64_t query_idx = c->vgen_query_indices[c->vgen_query_head++];
+                    vgen_compute_recall(query_idx, reply);
                 }
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
@@ -1636,6 +1652,11 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
     c->paused = 0;
     c->reuse = 0;
     c->thread_id = thread_id;
+    /* Initialize query index queue for vector generator recall tracking */
+    c->vgen_query_capacity = config.pipeline * 2;  /* 2x pipeline for safety */
+    c->vgen_query_indices = zcalloc(sizeof(uint64_t) * c->vgen_query_capacity);
+    c->vgen_query_head = 0;
+    c->vgen_query_tail = 0;
     /* Suppress libvalkey cleanup of unused buffers for max speed. */
     c->context->reader->maxbuf = 0;
 
@@ -3715,6 +3736,24 @@ int main(int argc, char **argv) {
                 len = valkeyFormatCommand(&cmd, "DEL %s", key);
                 benchmark("VEC-DEL", cmd, len);
                 sdsfree(key);
+                free(cmd);
+            }
+
+            if (test_is_selected("vec-scan-q-verify")) {
+                /* This test scans for a random vector, then queries with it and verifies
+                 * the key appears in results. This is a multi-command sequence:
+                 * 1. SCAN with MATCH to find a key with the prefix
+                 * 2. HGET to retrieve the vector
+                 * 3. FT.SEARCH to query with that vector
+                 * The test will be implemented as a Lua script for atomicity */
+                
+                /* For now, we'll use a simpler approach: just do FT.SEARCH with a random
+                 * vector and verify results. The full scan-verify logic should be 
+                 * implemented as a custom benchmark function later. */
+                fprintf(stderr, "Warning: vec-scan-q-verify is not yet fully implemented.\n");
+                fprintf(stderr, "Using vec-query as placeholder. Full implementation coming soon.\n");
+                len = createSearchCmdTemplate(&cmd);
+                benchmark("VEC-SCAN-Q-VERIFY", cmd, len);
                 free(cmd);
             }
         }

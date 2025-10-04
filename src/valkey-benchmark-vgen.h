@@ -80,7 +80,7 @@ void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
                                    char *cmd, uint64_t *key_counter);
 
 /**
- * Replace vector placeholder in command buffer for query operations.
+ * Replace vector placeholders with query vectors from query iterator.
  * 
  * This function replaces VGEN_VECTOR_PLACEHOLDER with query vectors from the
  * query iterator. Ground truth is automatically stored for later recall computation.
@@ -89,8 +89,9 @@ void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
  * @param count Number of placeholders to replace
  * @param cmd Command buffer to modify in-place
  * @param vector_counter Atomic counter for vector generation
+ * @return Query index for recall tracking (or UINT64_MAX if no query)
  */
-void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t count,
+uint64_t vgen_replace_vector_placeholder_query(const size_t *indices, const size_t count,
                                             char *cmd, uint64_t *vector_counter);
 
 /**
@@ -119,10 +120,10 @@ void vgen_replace_vector_and_key_placeholder(const size_t *key_indices, const si
  * It extracts the returned keys, compares them with ground truth, and updates
  * recall statistics.
  * 
- * @param client The client that received the search response
+ * @param query_idx The query index for this search (from client->vgen_query_index)
  * @param reply The search response (valkeyReply*)
  */
-void vgen_compute_recall(client c, void *reply);
+void vgen_compute_recall(uint64_t query_idx, void *reply);
 
 /**
  * Print recall statistics report.

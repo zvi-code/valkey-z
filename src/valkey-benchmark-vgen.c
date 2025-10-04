@@ -398,9 +398,9 @@ void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
 /**
  * Replace vector placeholder for query operations.
  */
-void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t count,
+uint64_t vgen_replace_vector_placeholder_query(const size_t *indices, const size_t count,
                                             char *cmd, uint64_t *vector_counter) {
-    if (!vgen_is_initialized() || count == 0) return;
+    if (!vgen_is_initialized() || count == 0) return UINT64_MAX;
     
     pthread_rwlock_rdlock(&vgen_lock);
     
@@ -414,6 +414,8 @@ void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t c
         /* Create query iterator with unlimited count - we'll cycle through queries */
         pool->query_iter = vg_get_query_iterator(vgen_instance, UINT64_MAX);
     }
+    
+    uint64_t query_idx = UINT64_MAX;
     
     /* Get query vectors and replace placeholders */
     for (size_t i = 0; i < count; i++) {
@@ -437,9 +439,10 @@ void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t c
         /* Replace the entire vector data (placeholder is at the beginning) */
         memcpy(placeholder, query.vector.data, vector_bytes);
         
-        /* Store ground truth for recall calculation */
+        /* Store ground truth for recall calculation and get query index */
         pthread_mutex_lock(&ground_truth.lock);
         if (ground_truth.count < ground_truth.capacity) {
+            query_idx = ground_truth.count;  /* Store the index before incrementing */
             stored_ground_truth_t *entry = &ground_truth.entries[ground_truth.count];
             entry->query_key = query.vector.key;
             
@@ -468,6 +471,7 @@ void vgen_replace_vector_placeholder_query(const size_t *indices, const size_t c
     pthread_rwlock_unlock(&vgen_lock);
     
     (void)vector_counter; /* Unused for vgen */
+    return query_idx;
 }
 
 /**
@@ -561,7 +565,7 @@ void vgen_replace_vector_and_key_placeholder(const size_t *key_indices, const si
 /**
  * Compute recall for a search result.
  */
-void vgen_compute_recall(client c, void *reply) {
+void vgen_compute_recall(uint64_t query_idx, void *reply) {
     if (!vgen_is_initialized() || !reply) return;
     
     valkeyReply *r = (valkeyReply *)reply;
@@ -571,11 +575,10 @@ void vgen_compute_recall(client c, void *reply) {
         return;
     }
     
-    /* Get the current query index atomically */
-    pthread_mutex_lock(&recall_tracker.lock);
-    uint64_t query_idx = recall_tracker.current_query_index;
-    recall_tracker.current_query_index++;
-    pthread_mutex_unlock(&recall_tracker.lock);
+    /* Skip if no valid query index */
+    if (query_idx == UINT64_MAX) {
+        return;
+    }
     
     /* Check if we have ground truth for this query */
     pthread_mutex_lock(&ground_truth.lock);
@@ -586,6 +589,7 @@ void vgen_compute_recall(client c, void *reply) {
     
     stored_ground_truth_t *gt_entry = &ground_truth.entries[query_idx];
     int expected_neighbors = gt_entry->neighbor_count;
+    uint64_t query_key = gt_entry->query_key;
     pthread_mutex_unlock(&ground_truth.lock);
     
     if (expected_neighbors == 0) {
@@ -617,6 +621,29 @@ void vgen_compute_recall(client c, void *reply) {
     /* Compute recall: count how many of the returned keys are in the ground truth neighbors */
     int matches = 0;
     pthread_mutex_lock(&ground_truth.lock);
+    
+    /* Debug output for first 20 queries */
+    static _Atomic int debug_count = 0;
+    int current_debug = atomic_fetch_add(&debug_count, 1);
+    int should_debug = (current_debug < 20);
+    
+    if (should_debug) {
+        printf("\n[RECALL DEBUG #%d] Query idx=%lu, query_key=%lu\n", 
+               current_debug, query_idx, query_key);
+        printf("  Expected neighbors (%d): ", expected_neighbors);
+        for (int j = 0; j < expected_neighbors && j < 5; j++) {
+            printf("%lu ", gt_entry->neighbors[j].key);
+        }
+        if (expected_neighbors > 5) printf("...");
+        printf("\n");
+        printf("  Returned neighbors (%d): ", returned_count);
+        for (int i = 0; i < returned_count && i < 5; i++) {
+            printf("%lu ", returned_keys[i]);
+        }
+        if (returned_count > 5) printf("...");
+        printf("\n");
+    }
+    
     for (int i = 0; i < returned_count; i++) {
         for (int j = 0; j < expected_neighbors; j++) {
             if (returned_keys[i] == gt_entry->neighbors[j].key) {
@@ -625,6 +652,11 @@ void vgen_compute_recall(client c, void *reply) {
             }
         }
     }
+    
+    if (should_debug) {
+        printf("  Matches: %d/%d\n", matches, returned_count < expected_neighbors ? returned_count : expected_neighbors);
+    }
+    
     pthread_mutex_unlock(&ground_truth.lock);
     
     /* Calculate recall@K where K is the minimum of returned and expected */
@@ -642,8 +674,6 @@ void vgen_compute_recall(client c, void *reply) {
         recall_tracker.max_recall = recall;
     }
     pthread_mutex_unlock(&recall_tracker.lock);
-    
-    (void)c;  /* Unused parameter */
 
     /* TODO: Phase 5 - Extract keys from reply and compare with ground truth */
 }
