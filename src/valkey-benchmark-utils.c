@@ -6,396 +6,15 @@
 #include <string.h>
 #include <stdlib.h>
 #include "zmalloc.h"
+#include "util.h"
 #include <time.h>
-
-#include "fmacros.h"
-
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <time.h>
-#include <sys/time.h>
-#include <signal.h>
 #include <assert.h>
-#include <math.h>
-#include <pthread.h>
-#include <stdatomic.h>
 
-#include "sds.h"
-#include "ae.h"
-#include <valkey/valkey.h>
-#ifdef USE_OPENSSL
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <valkey/tls.h>
-#endif
-#ifdef USE_RDMA
-#include <valkey/rdma.h>
-#endif
-#include "adlist.h"
-#include "dict.h"
-#include "zmalloc.h"
-#include "crc16_slottable.h"
-#include "hdr_histogram.h"
-#include "cli_common.h"
-#include "mt19937-64.h"
+/* Forward declaration - getValkeyContext is defined in valkey-benchmark.c */
+valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
 
-extern uint16_t crc16(const char *buf, int len);
-
-#define RANDPTR_INITIAL_SIZE 8
-#define DEFAULT_LATENCY_PRECISION 3
-#define MAX_LATENCY_PRECISION 4
-#define MAX_THREADS 500
-#define CLUSTER_SLOTS 16384
-#define CONFIG_LATENCY_HISTOGRAM_MIN_VALUE 10L              /* >= 10 usecs */
-#define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 3000000L         /* <= 3 secs(us precision) */
-#define CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE 3000000L /* <= 3 secs(us precision) */
-#define SHOW_THROUGHPUT_INTERVAL 250                        /* 250ms */
-
-#define CLIENT_GET_EVENTLOOP(c) (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
-
-#define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
-#define VECTOR_PLACEHOLDER_LEN 8 // length of VECTOR_PLACEHOLDER strings
-#define VECTOR_NUM_RAND_DIM (VECTOR_PLACEHOLDER_LEN/sizeof(float)) // Number of random dimensions for vector generation
-#define VECTOR_PLACEHOLDER_INDEX 11
-
-#define CLUSTER_PLACEHOLDER "{tag}"
-#define CLUSTER_PLACEHOLDER_LEN 5 // length of CLUSTER_PLACEHOLDER strings
-#define CLUSTER_PLACEHOLDER_INDEX 10
-
-#define PLACEHOLDER_NORMAL_LEN 12 // length of BENCHMARK_PLACEHOLDERS strings
-#define PLACEHOLDER_NUM_OF 12
-#define PLACEHOLDER_NORMAL_NUM_OF 10  // Number of normal placeholders excluding vector and cluster placeholders
-// TODO: Use existing vectors\fields in the index as base for vector\tag\numeric generation
-static const char *PLACEHOLDERS[PLACEHOLDER_NUM_OF] = {
-    "__rand_int__", "__rand_1st__", "__rand_2nd__", "__rand_3rd__", "__rand_4th__",
-    "__rand_5th__", "__rand_6th__", "__rand_7th__", "__rand_8th__", "__rand_9th__",
-    CLUSTER_PLACEHOLDER,
-    VECTOR_PLACEHOLDER  // Vector placeholder
-};
-
-struct benchmarkThread;
-struct clusterNode;
-struct serverConfig;
-
-/* 
-FT,INFO index_name
-Response:
-[ARR][array with 26 elements]
-[STA]  Status: index_name
-[STA]  Status: grocery_products
-[STA]  Status: index_options
-[ARR]  [array with 0 elements]
-[STA]  Status: index_definition
-[ARR]  [array with 6 elements]
-[STA]    Status: key_type
-[STA]    Status: HASH
-[STA]    Status: prefixes
-[ARR]    [array with 1 elements]
-[STA]      Status: vec:
-[STA]    Status: default_score
-[STR]    1
-[STA]  Status: attributes
-[ARR]  [array with 2 elements]
-[ARR]    [array with 8 elements]
-[STA]      Status: identifier
-[STA]      Status: vector_field
-[STA]      Status: attribute
-[STA]      Status: vector_field
-[STA]      Status: type
-[STA]      Status: VECTOR
-[STA]      Status: index
-[ARR]      [array with 12 elements]
-[STA]        Status: capacity
-[INT]        102400
-[STA]        Status: dimensions
-[INT]        768
-[STA]        Status: distance_metric
-[STA]        Status: COSINE
-[STA]        Status: size
-[STR]        2
-[STA]        Status: data_type
-[STA]        Status: FLOAT32
-[STA]        Status: algorithm
-[ARR]        [array with 8 elements]
-[STA]          Status: name
-[STA]          Status: HNSW
-[STA]          Status: m
-[INT]          16
-[STA]          Status: ef_construction
-[INT]          200
-[STA]          Status: ef_runtime
-[INT]          200
-[STA]    Status: curr_vectors
-[INT]  100230
-[STA]  Status: curr_deleted_vectors
-[INT]  100228
-[ARR]  [array with 10 elements]
-[STA]    Status: identifier
-[STA]    Status: category
-[STA]    Status: attribute
-[STA]    Status: category
-[STA]    Status: type
-[STA]    Status: TAG
-[STA]    Status: SEPARATOR
-[STA]    Status: ,
-[STA]    Status: size
-[STR]    2
-[STA]  Status: num_docs
-[STR]  2
-[STA]  Status: num_terms
-[STR]  0
-[STA]  Status: num_records
-[STR]  4
-[STA]  Status: hash_indexing_failures
-[STR]  0
-[STA]  Status: backfill_in_progress
-[STR]  0
-[STA]  Status: backfill_complete_percent
-[STR]  1.000000
-[STA]  Status: mutation_queue_size
-[STR]  0
-*/
-/* struct to hold exact ft.info response data */
-typedef struct searchFtInfoResponse {
-    sds index_name;          /* Index name */
-    /* Index options, currently unused */
-    sds key_type;           /* Key type (e.g., HASH) */
-    sds* prefixes;           /* Key prefixes for the index */
-    int prefixes_count; /* Number of prefixes */
-    sds default_score;      /* Default score for documents */
-    sds identifier;         /* Identifier for the index */
-    sds attribute;        /* Attributes of the index */
-    sds type;              /* Type of the index (e.g., VECTOR) */
-
-
-} searchFtInfoResponse;
-
-
-/* Tag distribution structure */
-typedef struct tagDistribution {
-    sds pattern;            /* Tag pattern with optional placeholders */
-    double percentage;      /* Percentage of keys with this tag */
-    double cumulative;      /* Cumulative percentage for selection */
-} tagDistribution;
-
-typedef struct searchRuntimeConfig {
-    /* Tag distribution fields */
-    tagDistribution *tag_dists; /* Array of tag distributions */
-    int n_dists;               /* Number of distributions */
-    sds tag_filter;                      /* Filter pattern for queries */
-} searchRuntimeConfig;
-/* Search index configuration */
-typedef struct searchIndex {
-    sds name;               /* Index name */
-    sds algorithm;          /* Index algorithm type (e.g., HNSW, FLAT) */
-    sds prefix;             /* Index key prefix */
-    int nocontent;           /* Use NOCONTENT option for FT.SEARCH */
-    sds vector_field;       /* Vector field name */
-    int vector_dim;         /* Vector dimension */    
-    sds tag_field;          /* Tag field name if exists*/
-    sds numeric_field;      /* Numeric field name if exists */
-    int ef_construction;    /* EF Construction for vector search */
-    int m;                  /* HNSW M parameter */
-    int ef_search;          /* EF Search for vector search */
-    int k;                  /* Number of nearest neighbors to return */
-    sds metric;            /* Distance metric (e.g., L2, COSINE) */
-    searchRuntimeConfig curr_conf; /* Runtime configuration for search */
-} searchIndex;
-
-/* Vector placeholder callback information */
-typedef enum {
-    VECTOR_PHASE_PREFILL,
-    VECTOR_PHASE_INSERT,
-    VECTOR_PHASE_QUERY
-} VectorPhase;
-
-/* Callback function type for vector placeholder replacement */
-typedef void (*VectorPlaceholderCallback)(char *vector_data, const char *key, VectorPhase phase, int dim);
-
-/* Base vector for efficient vector generation */
-static float *base_vector = NULL;
-static int base_vector_dim = 0;
-
-/* Locations of the placeholders __rand_int__, __rand_1st__,
- * __rand_2nd, etc. within the RESP encoded command buffer. */
-static struct placeholders {
-    size_t cmd_len;                     /* length of the command */
-    size_t count[PLACEHOLDER_NUM_OF];    /* number of each placeholder in the command */
-    size_t len[PLACEHOLDER_NUM_OF];      /* length of each placeholder */
-    size_t *indices[PLACEHOLDER_NUM_OF]; /* pointer to indices for each placeholder */
-    size_t *index_data;                 /* allocation holding all index data */
-} placeholders;
-
-typedef struct _client {
-    valkeyContext *context;
-    sds obuf;
-    char **stagptr;     /* Pointers to slot hashtags (cluster mode only) */
-    size_t staglen;     /* Number of pointers in client->stagptr */
-    size_t stagfree;    /* Number of unused pointers in client->stagptr */
-    size_t written;     /* Bytes of 'obuf' already written */
-    long long start;    /* Start time of a request */
-    long long latency;  /* Request latency */
-    int seqlen;         /* Number of commands in the command sequence */
-    int pending;        /* Number of pending requests (replies to consume) */
-    int prefix_pending; /* If non-zero, number of pending prefix commands. Commands
-                           such as auth and select are prefixed to the pipeline of
-                           benchmark commands and discarded after the first send. */
-    int prefixlen;      /* Size in bytes of the pending prefix commands */
-    int thread_id;
-    struct clusterNode *cluster_node;
-    int slots_last_update;
-    uint64_t paused : 1;
-    uint64_t reuse : 1;
-} *client;
-
-
-/* Threads. */
-typedef struct benchmarkThread {
-    int index;
-    pthread_t thread;
-    aeEventLoop *el;
-    list *paused_clients;
-} benchmarkThread;
-
-
-
-/* Cluster. */
-typedef struct clusterNode {
-    valkeyContext *ctx;
-    char *ip;
-    int port;
-    sds name;
-    int flags;
-    sds replicate; /* Primary ID if node is a replica */
-    int *slots;
-    int slots_count;
-    int *updated_slots;      /* Used by updateClusterSlotsConfiguration */
-    int updated_slots_count; /* Used by updateClusterSlotsConfiguration */
-    int replicas_count;
-    struct serverConfig *server_config;
-} clusterNode;
-
-typedef struct serverConfig {
-    sds save;
-    sds appendonly;
-} serverConfig;
-
-static struct config {
-    aeEventLoop *el;
-    enum valkeyConnectionType ct;
-    cliConnInfo conn_info;
-    valkeyContext *conn_ctx;
-    int tls;
-    int mptcp;
-    struct cliSSLconfig sslconfig;
-    int numclients;
-    _Atomic int liveclients;
-    int requests;
-    _Atomic int requests_issued;
-    _Atomic int requests_finished;
-    _Atomic int previous_requests_finished;
-    int last_printed_bytes;
-    long long previous_tick;
-    int keysize;
-    int datasize;
-    int replace_placeholders;
-    int keyspacelen;
-    int sequential_replacement;
-    int keepalive;
-    int pipeline;
-    long long start;
-    long long totlatency;
-    const char *title;
-    list *clients;
-    list *paused_clients;
-    int quiet;
-    int csv;
-    int loop;
-    int idlemode;
-    sds input_dbnumstr;
-    char *tests;
-    int stdinarg; /* get last arg from stdin. (-x option) */
-    int precision;
-    int num_threads;
-    struct benchmarkThread **threads;
-    int cluster_mode;
-    readFromReplica read_from_replica;
-    int cluster_node_count;
-    struct clusterNode **cluster_nodes;
-    int cluster_primary_node_count;
-    struct clusterNode **cluster_primary_nodes;
-    int selected_node_count;
-    struct clusterNode **selected_nodes;
-    struct serverConfig *server_config;
-    struct hdr_histogram *latency_histogram;
-    struct hdr_histogram *current_sec_latency_histogram;
-    _Atomic int is_fetching_slots;
-    _Atomic int is_updating_slots;
-    _Atomic int slots_last_update;
-    int enable_tracking;
-    int num_functions;
-    int num_keys_in_fcall;
-    pthread_mutex_t liveclients_mutex;
-    pthread_mutex_t is_updating_slots_mutex;
-    int resp3; /* use RESP3 */
-    int rps;
-    atomic_uint_fast64_t last_time_ns;
-    uint64_t time_per_token;
-    uint64_t time_per_burst;
-    int use_search; /* Use search indexes */
-    searchIndex search;
-    int print_search_results; /* Print FT.SEARCH results */
-    int search_debug;
-} config;
-
-
-/* Prototypes */
-static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
-static void createMissingClients(client c);
-static benchmarkThread *createBenchmarkThread(int index);
-static void freeBenchmarkThread(benchmarkThread *thread);
-static void freeBenchmarkThreads(void);
-static void *execBenchmarkThread(void *ptr);
-static void benchmark(const char *title, char *cmd, int len);
-static clusterNode *createClusterNode(char *ip, int port);
-// static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port);
-static sds selectTagByDistribution(void);
-static void parseTagDistributions(const char *distributions_str);
-static valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
-static void freeServerConfig(serverConfig *cfg);
-static int fetchClusterSlotsConfiguration(client c);
-static void updateClusterSlotsConfiguration(void);
-static long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData);
-
-/* Dict callbacks */
-static uint64_t dictSdsHash(const void *key);
-static int dictSdsKeyCompare(const void *key1, const void *key2);
-
+static int search_debug = 1;
 #define UNUSED(V) ((void)V)
-
-/* Implementation */
-static long long ustime(void) {
-    struct timeval tv;
-    long long ust;
-
-    gettimeofday(&tv, NULL);
-    ust = ((long long)tv.tv_sec) * 1000000;
-    ust += tv.tv_usec;
-    return ust;
-}
-
-static long long mstime(void) {
-    return ustime() / 1000;
-}
-
-static long long nstime(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-}
 
 /* Exact field name matcher */
 static int exact_field_matcher(const char *line, const char *prefix) {
@@ -417,13 +36,13 @@ static int prefix_field_matcher(const char *line, const char *prefix) {
     return strncmp(line, prefix, strlen(prefix)) == 0;
 }
 
-static long long parse_generic(const char *value, ParseConfig config) {
+static long long parse_generic(const char *value, ParseConfig parse_config) {
     if (!value) return 0;
-    if (config.strategy == PARSE_CMDSTATS) {
+    if (parse_config.strategy == PARSE_CMDSTATS) {
         /* Example: cmdstat_get:calls=100,usec=2000,usec_per_call=20.00,rejected=0,failed=0 */
-        const char *p = strstr(value, config.key);
+        const char *p = strstr(value, parse_config.key);
         if (!p) return 0;
-        p += strlen(config.key);
+        p += strlen(parse_config.key);
         if (*p == '=') p++;
         return (long long)atoll(p) * 1000; // Scale by 1000 for fixed-point
     }
@@ -445,7 +64,7 @@ static long long parse_generic(const char *value, ParseConfig config) {
         }
     }
     
-    switch (config.strategy) {
+    switch (parse_config.strategy) {
         case PARSE_INTEGER:
             return atoll(value);
             
@@ -466,9 +85,9 @@ static long long parse_generic(const char *value, ParseConfig config) {
             return (long long)(atof(value) * 1000.0);
             
         case PARSE_PERCENTILE: {
-            const char *p = strstr(value, config.key);
+            const char *p = strstr(value, parse_config.key);
             if (!p) return 0;
-            p += strlen(config.key);
+            p += strlen(parse_config.key);
             if (*p == '=') p++;
             return (long long)(atof(p) * 1000);
         }
@@ -1533,14 +1152,20 @@ search_vector_externing_lru_promote_cnt:0
 search_vector_externing_num_lru_entries:0
 search_network_bytes_out:0
 search_network_bytes_in:0
+
+    int cluster_node_count;
+    clusterNode **cluster_nodes;
 */
-clusterSnapshot* createClusterSnapshot(const char *command, int num_fields, 
-                                       infoFieldType *fields, int print_info) {
+
+clusterSnapshot* createClusterSnapshot(const char *command, 
+                                        int num_fields, infoFieldType *fields, 
+                                        int cluster_node_count, clusterNode **cluster_nodes,
+                                        enum valkeyConnectionType ct, int print_info) {
     clusterSnapshot *snapshot = zcalloc(sizeof(clusterSnapshot));
     snapshot->timestamp_ms = ustime() / 1000;
     snapshot->num_fields = num_fields;
     snapshot->fields = zcalloc(num_fields * sizeof(fieldSnapshot));
-    snapshot->num_nodes = config.cluster_node_count;
+    snapshot->num_nodes = cluster_node_count;
     snapshot->node_identifiers = zcalloc(snapshot->num_nodes * sizeof(sds));
     
     /* Initialize fields */
@@ -1564,8 +1189,8 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
     int is_ftinfo = (strncasecmp(command, "FT.INFO", 7) == 0);
     
     /* Query each node and aggregate (unchanged logic) */
-    for (int node_idx = 0; node_idx < config.cluster_node_count; node_idx++) {
-        clusterNode *node = config.cluster_nodes[node_idx];
+    for (int node_idx = 0; node_idx < cluster_node_count; node_idx++) {
+        clusterNode *node = cluster_nodes[node_idx];
         assert(node != NULL);
         int is_replica = node->replicate == NULL ? 0 : 1;
         
@@ -1579,7 +1204,7 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
                                                         is_replica ? 'R' : 'P');
         }
         
-        valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(config.ct, node->ip, node->port);
+        valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(ct, node->ip, node->port);
         assert(ctx != NULL);
         
         valkeyReply *reply = valkeyCommand(ctx, command);
@@ -1616,7 +1241,7 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
                                 }
                                 
                                 /* Aggregate */
-                                int is_last_node = (node_idx == config.cluster_node_count - 1);
+                                int is_last_node = (node_idx == cluster_node_count - 1);
                                 if ((field->nodes_to_aggregate == FROM_ALL) || 
                                     (field->nodes_to_aggregate == FROM_PRIMARY_ONLY && !is_replica) || 
                                     (field->nodes_to_aggregate == FROM_REPLICA_ONLY && is_replica)) {
@@ -1662,7 +1287,7 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
         int rows_to_print = 0;
         for (int field_idx = 0; field_idx < num_fields; field_idx++) {
             if (!shouldSkipZeroRow(&snapshot->fields[field_idx], &fields[field_idx],
-                                  snapshot->num_nodes, config.search_debug)) {
+                                  snapshot->num_nodes, search_debug)) {
                 rows_to_print++;
             }
         }
@@ -1679,7 +1304,7 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
         
         /* Calculate layout */
         TableLayout layout = calculateTableLayout(snapshot, num_fields, fields, 
-                                                  config.search_debug);
+                                                  search_debug);
         
         /* Check if we have per-node data */
         int has_per_node_data = 0;
@@ -1711,7 +1336,7 @@ clusterSnapshot* createClusterSnapshot(const char *command, int num_fields,
         /* Print data rows */
         for (int field_idx = 0; field_idx < num_fields; field_idx++) {
             if (shouldSkipZeroRow(&snapshot->fields[field_idx], &fields[field_idx],
-                                 snapshot->num_nodes, config.search_debug)) {
+                                 snapshot->num_nodes, search_debug)) {
                 if (field_opaques[field_idx]) {
                     zfree(field_opaques[field_idx]);
                     field_opaques[field_idx] = NULL;
@@ -1794,7 +1419,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
 
         int is_memory_diff = (fields[field_idx].diff_type == DIFF_MEMORY_GROWTH);
         if (!shouldSkipZeroDeltaRow(old_field, new_field, &fields[field_idx],
-                                   old->num_nodes, config.search_debug, is_memory_diff)) {
+                                   old->num_nodes, search_debug, is_memory_diff)) {
             rows_to_print++;
         }
     }
@@ -1825,7 +1450,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     snprintf(new_time_str, sizeof(new_time_str), "%s.%03d", temp_buf, new_ms);
     
     /* Calculate layout */
-    TableLayout layout = calculateTableLayout(old, num_fields, fields, config.search_debug);
+    TableLayout layout = calculateTableLayout(old, num_fields, fields, search_debug);
     
     /* Check for per-node data */
     int has_per_node_data = 0;
@@ -1880,7 +1505,7 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
         
         int is_memory_diff = (fields[field_idx].diff_type == DIFF_MEMORY_GROWTH);
         if (shouldSkipZeroDeltaRow(old_field, new_field, &fields[field_idx],
-                                  old->num_nodes, config.search_debug, is_memory_diff)) {
+                                  old->num_nodes, search_debug, is_memory_diff)) {
             continue;
         }
         
@@ -2020,8 +1645,17 @@ infoFieldType info_fields[] = {
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_PRIMARY_ONLY, 1}
 };
 
+/*
+
+(const char *command, 
+                                        int num_fields, infoFieldType *fields, 
+                                        int cluster_node_count, clusterNode **cluster_nodes,
+                                        valkeyConnectionType ct, int print_info)
+*/
 // getMemoryInfoClusterGeneric();
-void getFullInfo(const char *index_name) {
+void getFullInfo(const char *index_name, 
+                int cluster_node_count, clusterNode **cluster_nodes,
+                enum valkeyConnectionType ct) {
     // long long search_memory = 0;
     // long long search_reclaimable = 0;
     // long long search_total_docs = 0;
@@ -2030,13 +1664,16 @@ void getFullInfo(const char *index_name) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
     int ftinfo_num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
-    clusterSnapshot* ftinfo_snapshot = createClusterSnapshot(cmd, ftinfo_num_fields, ftinfo_fields, 1);
+    clusterSnapshot* ftinfo_snapshot = createClusterSnapshot(cmd, ftinfo_num_fields, ftinfo_fields, 
+                                                              cluster_node_count, cluster_nodes, ct, 1);
 
     int search_num_fields = sizeof(search_info_fields) / sizeof(search_info_fields[0]);
-    clusterSnapshot* search_info_snapshot = createClusterSnapshot("INFO SEARCH", search_num_fields, search_info_fields, 1);
+    clusterSnapshot* search_info_snapshot = createClusterSnapshot("INFO SEARCH", search_num_fields, search_info_fields, 
+                                                                   cluster_node_count, cluster_nodes, ct, 1);
 
     int info_num_fields = sizeof(info_fields) / sizeof(info_fields[0]);
-    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", info_num_fields, info_fields, 1);
+    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", info_num_fields, info_fields, 
+                                                            cluster_node_count, cluster_nodes, ct, 1);
 
     freeClusterSnapshot(ftinfo_snapshot);
     freeClusterSnapshot(search_info_snapshot);
@@ -2044,11 +1681,14 @@ void getFullInfo(const char *index_name) {
     // printf("------>\n");
 }
 
-clusterSnapshot* getSearchInfo(long long *search_memory, long long *search_reclaimable, 
-                   long long *search_total_docs, long long *search_ingest_field_vector, 
-                   long long *search_background_indexing_status) {
+clusterSnapshot* getSearchInfo(int cluster_node_count, clusterNode **cluster_nodes,
+                                enum valkeyConnectionType ct,
+                                long long *search_memory, long long *search_reclaimable, 
+                                long long *search_total_docs, long long *search_ingest_field_vector, 
+                                long long *search_background_indexing_status) {
     int num_fields = sizeof(search_info_fields) / sizeof(search_info_fields[0]);
-    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO SEARCH", num_fields, search_info_fields, 0);
+    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO SEARCH", num_fields, search_info_fields, 
+                                                            cluster_node_count, cluster_nodes, ct, 0);
     /* Initialize aggregated values */
     *search_memory = 0;
     *search_reclaimable = 0;
@@ -2076,21 +1716,26 @@ clusterSnapshot* getSearchInfo(long long *search_memory, long long *search_recla
     return info_snapshot;
 }
 
-clusterSnapshot* getInfoCluster(void) {
+clusterSnapshot* getInfoCluster(int cluster_node_count, clusterNode **cluster_nodes,
+                                enum valkeyConnectionType ct) {
     int num_fields = sizeof(info_fields) / sizeof(info_fields[0]);
-    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", num_fields, info_fields, 0);
+    clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", num_fields, info_fields, 
+                                                            cluster_node_count, cluster_nodes, ct, 0);
     // print the values in the snapshot
     assert(info_snapshot); 
     return info_snapshot;
 }
 
 /* Example 4: Get current FT.INFO statistics */
-clusterSnapshot* getFtInfoStatistics(const char *index_name) {
+clusterSnapshot* getFtInfoStatistics(const char *index_name,
+                                      int cluster_node_count, clusterNode **cluster_nodes,
+                                      enum valkeyConnectionType ct) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
     int num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
     // getAggregatedClusterStats(cmd, num_fields, ftinfo_fields);
-    clusterSnapshot* info_snapshot = createClusterSnapshot(cmd, num_fields, ftinfo_fields, 0);
+    clusterSnapshot* info_snapshot = createClusterSnapshot(cmd, num_fields, ftinfo_fields, 
+                                                            cluster_node_count, cluster_nodes, ct, 0);
     assert(info_snapshot); 
     // for (int i = 0; i < info_snapshot->num_fields; i++) {
     //     if (info_snapshot->fields[i].valid) {
@@ -2100,7 +1745,11 @@ clusterSnapshot* getFtInfoStatistics(const char *index_name) {
     return info_snapshot;
 }
 
-void* compareInfoSnapshots(clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch) {
+void* compareInfoSnapshots(int cluster_node_count, clusterNode **cluster_nodes,
+                            enum valkeyConnectionType ct, 
+                            clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, 
+                            clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, 
+                            clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch) {
     int ftinfo_num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
     int search_num_fields = sizeof(search_info_fields) / sizeof(search_info_fields[0]);
     int info_num_fields = sizeof(info_fields) / sizeof(info_fields[0]);

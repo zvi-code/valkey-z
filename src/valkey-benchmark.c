@@ -28,10 +28,389 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "valkey-benchmark-utils.c"
+#include "valkey-benchmark-utils.h"
+#include "fmacros.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <assert.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
+
+#include "sds.h"
+#include "ae.h"
+#include "util.h"
+#include <valkey/valkey.h>
+#ifdef USE_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <valkey/tls.h>
+#endif
+#ifdef USE_RDMA
+#include <valkey/rdma.h>
+#endif
+#include "adlist.h"
+#include "dict.h"
+#include "zmalloc.h"
+#include "crc16_slottable.h"
+#include "hdr_histogram.h"
+#include "cli_common.h"
+#include "mt19937-64.h"
+
+extern uint16_t crc16(const char *buf, int len);
+
+static long long nstime(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+#define RANDPTR_INITIAL_SIZE 8
+#define DEFAULT_LATENCY_PRECISION 3
+#define MAX_LATENCY_PRECISION 4
+#define MAX_THREADS 500
+#define CLUSTER_SLOTS 16384
+#define CONFIG_LATENCY_HISTOGRAM_MIN_VALUE 10L              /* >= 10 usecs */
+#define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 3000000L         /* <= 3 secs(us precision) */
+#define CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE 3000000L /* <= 3 secs(us precision) */
+#define SHOW_THROUGHPUT_INTERVAL 250                        /* 250ms */
+
+#define CLIENT_GET_EVENTLOOP(c) (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
+
+/* Vector generation placeholders 
+ KEY - The key placeholder will follow with 4 bytes total key length. 
+    This will be used if need to replace the entire key.
+ VECTOR - Vector placeholder indicates the last 4 floats of the vector in the command.
+    A replace will use the vector dimension from the index configuration and will 
+    override the entire vector with generated vector provided by vgen.
+ */
+#define VGEN_KEY_PLACEHOLDER "__v_gen_key_ph__"  // followed by 4 bytes total key length
+#define VGEN_VECTOR_PLACEHOLDER "__v_gen_vec_ph__"  // Exactly 16 characters for 2 floats
+#define VGEN_VECTOR_PLACEHOLDER_INDEX 13
+
+#define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
+#define VECTOR_PLACEHOLDER_LEN 8 // length of VECTOR_PLACEHOLDER strings
+#define VECTOR_NUM_RAND_DIM (VECTOR_PLACEHOLDER_LEN/sizeof(float)) // Number of random dimensions for vector generation
+#define VECTOR_PLACEHOLDER_INDEX 11
+
+#define CLUSTER_PLACEHOLDER "{tag}"
+#define CLUSTER_PLACEHOLDER_INDEX 10
+
+
+#define PLACEHOLDER_NUM_OF 14
+#define PLACEHOLDER_NORMAL_NUM_OF 10  // Number of normal placeholders excluding vector and cluster placeholders
+
+
+// TODO: Use existing vectors\fields in the index as base for vector\tag\numeric generation
+static const struct {
+    const char *name;
+    int len;
+} PLACEHOLDERS[PLACEHOLDER_NUM_OF] = {
+    {"__rand_int__", 12}, {"__rand_1st__", 12}, {"__rand_2nd__", 12}, {"__rand_3rd__", 12}, {"__rand_4th__", 12},
+    {"__rand_5th__", 12}, {"__rand_6th__", 12}, {"__rand_7th__", 12}, {"__rand_8th__", 12}, {"__rand_9th__", 12},
+    {CLUSTER_PLACEHOLDER, 5},
+    {VECTOR_PLACEHOLDER, 8},  // Vector placeholder
+    {VGEN_KEY_PLACEHOLDER, 16},
+    {VGEN_VECTOR_PLACEHOLDER, 16},
+};
+
+struct benchmarkThread;
+struct clusterNode;
+struct serverConfig;
+
+/* 
+FT,INFO index_name
+Response:
+[ARR][array with 26 elements]
+[STA]  Status: index_name
+[STA]  Status: grocery_products
+[STA]  Status: index_options
+[ARR]  [array with 0 elements]
+[STA]  Status: index_definition
+[ARR]  [array with 6 elements]
+[STA]    Status: key_type
+[STA]    Status: HASH
+[STA]    Status: prefixes
+[ARR]    [array with 1 elements]
+[STA]      Status: vec:
+[STA]    Status: default_score
+[STR]    1
+[STA]  Status: attributes
+[ARR]  [array with 2 elements]
+[ARR]    [array with 8 elements]
+[STA]      Status: identifier
+[STA]      Status: vector_field
+[STA]      Status: attribute
+[STA]      Status: vector_field
+[STA]      Status: type
+[STA]      Status: VECTOR
+[STA]      Status: index
+[ARR]      [array with 12 elements]
+[STA]        Status: capacity
+[INT]        102400
+[STA]        Status: dimensions
+[INT]        768
+[STA]        Status: distance_metric
+[STA]        Status: COSINE
+[STA]        Status: size
+[STR]        2
+[STA]        Status: data_type
+[STA]        Status: FLOAT32
+[STA]        Status: algorithm
+[ARR]        [array with 8 elements]
+[STA]          Status: name
+[STA]          Status: HNSW
+[STA]          Status: m
+[INT]          16
+[STA]          Status: ef_construction
+[INT]          200
+[STA]          Status: ef_runtime
+[INT]          200
+[STA]    Status: curr_vectors
+[INT]  100230
+[STA]  Status: curr_deleted_vectors
+[INT]  100228
+[ARR]  [array with 10 elements]
+[STA]    Status: identifier
+[STA]    Status: category
+[STA]    Status: attribute
+[STA]    Status: category
+[STA]    Status: type
+[STA]    Status: TAG
+[STA]    Status: SEPARATOR
+[STA]    Status: ,
+[STA]    Status: size
+[STR]    2
+[STA]  Status: num_docs
+[STR]  2
+[STA]  Status: num_terms
+[STR]  0
+[STA]  Status: num_records
+[STR]  4
+[STA]  Status: hash_indexing_failures
+[STR]  0
+[STA]  Status: backfill_in_progress
+[STR]  0
+[STA]  Status: backfill_complete_percent
+[STR]  1.000000
+[STA]  Status: mutation_queue_size
+[STR]  0
+*/
+/* struct to hold exact ft.info response data */
+typedef struct searchFtInfoResponse {
+    sds index_name;          /* Index name */
+    /* Index options, currently unused */
+    sds key_type;           /* Key type (e.g., HASH) */
+    sds* prefixes;           /* Key prefixes for the index */
+    int prefixes_count; /* Number of prefixes */
+    sds default_score;      /* Default score for documents */
+    sds identifier;         /* Identifier for the index */
+    sds attribute;        /* Attributes of the index */
+    sds type;              /* Type of the index (e.g., VECTOR) */
+
+
+} searchFtInfoResponse;
+
+
+/* Tag distribution structure */
+typedef struct tagDistribution {
+    sds pattern;            /* Tag pattern with optional placeholders */
+    double percentage;      /* Percentage of keys with this tag */
+    double cumulative;      /* Cumulative percentage for selection */
+} tagDistribution;
+
+typedef struct searchRuntimeConfig {
+    /* Tag distribution fields */
+    tagDistribution *tag_dists; /* Array of tag distributions */
+    int n_dists;               /* Number of distributions */
+    sds tag_filter;                      /* Filter pattern for queries */
+} searchRuntimeConfig;
+/* Search index configuration */
+typedef struct searchIndex {
+    sds name;               /* Index name */
+    sds algorithm;          /* Index algorithm type (e.g., HNSW, FLAT) */
+    sds prefix;             /* Index key prefix */
+    int nocontent;           /* Use NOCONTENT option for FT.SEARCH */
+    sds vector_field;       /* Vector field name */
+    int vector_dim;         /* Vector dimension */    
+    sds tag_field;          /* Tag field name if exists*/
+    sds numeric_field;      /* Numeric field name if exists */
+    int ef_construction;    /* EF Construction for vector search */
+    int m;                  /* HNSW M parameter */
+    int ef_search;          /* EF Search for vector search */
+    int k;                  /* Number of nearest neighbors to return */
+    sds metric;            /* Distance metric (e.g., L2, COSINE) */
+    searchRuntimeConfig curr_conf; /* Runtime configuration for search */
+} searchIndex;
+
+/* Vector placeholder callback information */
+typedef enum {
+    VECTOR_PHASE_PREFILL,
+    VECTOR_PHASE_INSERT,
+    VECTOR_PHASE_QUERY
+} VectorPhase;
+
+/* Callback function type for vector placeholder replacement */
+typedef void (*VectorPlaceholderCallback)(char *vector_data, const char *key, VectorPhase phase, int dim);
+
+/* Base vector for efficient vector generation */
+static float *base_vector = NULL;
+static int base_vector_dim = 0;
+
+/* Locations of the placeholders __rand_int__, __rand_1st__,
+ * __rand_2nd, etc. within the RESP encoded command buffer. */
+static struct placeholders {
+    size_t cmd_len;                     /* length of the command */
+    size_t count[PLACEHOLDER_NUM_OF];    /* number of each placeholder in the command */
+    size_t len[PLACEHOLDER_NUM_OF];      /* length of each placeholder */
+    size_t *indices[PLACEHOLDER_NUM_OF]; /* pointer to indices for each placeholder */
+    size_t *index_data;                 /* allocation holding all index data */
+} placeholders;
+
+typedef struct _client {
+    valkeyContext *context;
+    sds obuf;
+    char **stagptr;     /* Pointers to slot hashtags (cluster mode only) */
+    size_t staglen;     /* Number of pointers in client->stagptr */
+    size_t stagfree;    /* Number of unused pointers in client->stagptr */
+    size_t written;     /* Bytes of 'obuf' already written */
+    long long start;    /* Start time of a request */
+    long long latency;  /* Request latency */
+    int seqlen;         /* Number of commands in the command sequence */
+    int pending;        /* Number of pending requests (replies to consume) */
+    int prefix_pending; /* If non-zero, number of pending prefix commands. Commands
+                           such as auth and select are prefixed to the pipeline of
+                           benchmark commands and discarded after the first send. */
+    int prefixlen;      /* Size in bytes of the pending prefix commands */
+    int thread_id;
+    struct clusterNode *cluster_node;
+    int slots_last_update;
+    uint64_t paused : 1;
+    uint64_t reuse : 1;
+} *client;
+
+
+/* Threads. */
+typedef struct benchmarkThread {
+    int index;
+    pthread_t thread;
+    aeEventLoop *el;
+    list *paused_clients;
+} benchmarkThread;
+
+
+
+/* Cluster - clusterNode is now defined in valkey-benchmark-utils.h */
+
+typedef struct serverConfig {
+    sds save;
+    sds appendonly;
+} serverConfig;
+
+static struct config {
+    aeEventLoop *el;
+    enum valkeyConnectionType ct;
+    cliConnInfo conn_info;
+    valkeyContext *conn_ctx;
+    int tls;
+    int mptcp;
+    struct cliSSLconfig sslconfig;
+    int numclients;
+    _Atomic int liveclients;
+    int requests;
+    _Atomic int requests_issued;
+    _Atomic int requests_finished;
+    _Atomic int previous_requests_finished;
+    int last_printed_bytes;
+    long long previous_tick;
+    int keysize;
+    int datasize;
+    int replace_placeholders;
+    int keyspacelen;
+    int sequential_replacement;
+    int keepalive;
+    int pipeline;
+    long long start;
+    long long totlatency;
+    const char *title;
+    list *clients;
+    list *paused_clients;
+    int quiet;
+    int csv;
+    int loop;
+    int idlemode;
+    sds input_dbnumstr;
+    char *tests;
+    int stdinarg; /* get last arg from stdin. (-x option) */
+    int precision;
+    int num_threads;
+    struct benchmarkThread **threads;
+    int cluster_mode;
+    readFromReplica read_from_replica;
+    int cluster_node_count;
+    struct clusterNode **cluster_nodes;
+    int cluster_primary_node_count;
+    struct clusterNode **cluster_primary_nodes;
+    int selected_node_count;
+    struct clusterNode **selected_nodes;
+    struct serverConfig *server_config;
+    struct hdr_histogram *latency_histogram;
+    struct hdr_histogram *current_sec_latency_histogram;
+    _Atomic int is_fetching_slots;
+    _Atomic int is_updating_slots;
+    _Atomic int slots_last_update;
+    int enable_tracking;
+    int num_functions;
+    int num_keys_in_fcall;
+    pthread_mutex_t liveclients_mutex;
+    pthread_mutex_t is_updating_slots_mutex;
+    int resp3; /* use RESP3 */
+    int rps;
+    atomic_uint_fast64_t last_time_ns;
+    uint64_t time_per_token;
+    uint64_t time_per_burst;
+    int use_search; /* Use search indexes */
+    int is_vector_generator; /* Use vector generator for vector placeholders */
+    searchIndex search;
+    int print_search_results; /* Print FT.SEARCH results */
+    int search_debug;
+} config;
+
+
+/* Prototypes */
+static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void createMissingClients(client c);
+static benchmarkThread *createBenchmarkThread(int index);
+static void freeBenchmarkThread(benchmarkThread *thread);
+static void freeBenchmarkThreads(void);
+static void *execBenchmarkThread(void *ptr);
+static void benchmark(const char *title, char *cmd, int len);
+static clusterNode *createClusterNode(char *ip, int port);
+// static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port);
+static sds selectTagByDistribution(void);
+static void parseTagDistributions(const char *distributions_str);
+valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
+static void freeServerConfig(serverConfig *cfg);
+static int fetchClusterSlotsConfiguration(client c);
+static void updateClusterSlotsConfiguration(void);
+static long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData);
+
+/* Dict callbacks */
+static uint64_t dictSdsHash(const void *key);
+static int dictSdsKeyCompare(const void *key1, const void *key2);
+
+#define UNUSED(V) ((void)V)
 
 /* Fast unique vector generation using key-based deterministic randomization */
 static sds createVectorTemplate(uint64_t key_idx) {
+    // TODO[is_vector_generator]: if vector generator, use appropriate placeholder size to deduce from dim 4 floats instead of 2
     int dim = config.search.vector_dim - VECTOR_NUM_RAND_DIM;
     float *vector = zcalloc(config.search.vector_dim * sizeof(float));
     /* Use multiple hash passes for better distribution */
@@ -66,6 +445,7 @@ static sds createVectorTemplate(uint64_t key_idx) {
             }
         }
     }
+    // TODO[is_vector_generator]: if vector generator, use VGEN_VECTOR_PLACEHOLDER
     /* Append the 8-byte placeholder (will be replaced in-place later) */
     memcpy(vector + dim, VECTOR_PLACEHOLDER, VECTOR_PLACEHOLDER_LEN); // Append placeholder for random part
     sds vector_data = sdsnewlen(vector, config.search.vector_dim * sizeof(float));
@@ -167,7 +547,7 @@ static dictType dtype = {
     NULL               /* allow to expand */
 };
 
-static valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port) {
+valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port) {
     valkeyContext *ctx = NULL;
     valkeyReply *reply = NULL;
     struct timeval tv = {0};
@@ -259,6 +639,8 @@ static void initBaseVector(int dim) {
 
 static sds getVectorKey(void) {
     sds key;
+    // TODO[is_vector_generator]: if vector generator, use VGEN_KEY_PLACEHOLDER and append the total length of the key in a 4-byte little-endian integer
+
     if (config.cluster_mode) {
         key = sdscatprintf(sdsempty(), "%s{tag}:__rand_int__", config.search.prefix);
     } else {
@@ -272,10 +654,10 @@ static sds getVectorKey(void) {
 /* Benchmark function for vector operations with cluster awareness */
 static int createVectorInsertCmdTemplate(char **cmd) {
     int len;   
-    /* Generate key with appropriate cluster tag */
+    /* Generate key with appropriate cluster tag */    
     sds key = getVectorKey();
     /* Validation checks */
-    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim > VECTOR_NUM_RAND_DIM);    
+    assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim > VECTOR_NUM_RAND_DIM);        
     /* Build vector data: fixed part + placeholder */
     sds vector_binary = createVectorTemplate(0x736f6d6575736572); // "someusername" as base
 
@@ -414,7 +796,7 @@ static void createDefaultSearchIndexes(void) {
             printf("found index '%s' ", list_reply->element[j]->str);
             if (strcmp(list_reply->element[j]->str, config.search.name) == 0) {
                 index_exists = 1;
-                getFullInfo(config.search.name);
+                getFullInfo(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
             }            
         }
         printf("\n");
@@ -494,14 +876,7 @@ void resetPlaceholders(void) {
     for (size_t placeholder = 0; placeholder < PLACEHOLDER_NUM_OF; placeholder++) {
         placeholders.indices[placeholder] = NULL;
         placeholders.count[placeholder] = 0;
-        /* Move past the placeholder - vector placeholder has different length */
-        if (placeholder >= VECTOR_PLACEHOLDER_INDEX) {
-            placeholders.len[placeholder] = VECTOR_PLACEHOLDER_LEN;
-        } else if (placeholder == CLUSTER_PLACEHOLDER_INDEX) {
-            placeholders.len[placeholder] = CLUSTER_PLACEHOLDER_LEN;
-        } else {
-            placeholders.len[placeholder] = PLACEHOLDER_NORMAL_LEN;
-        }
+        placeholders.len[placeholder] = PLACEHOLDERS[placeholder].len;
                
     }
 }
@@ -521,7 +896,7 @@ void initPlaceholders(const char *cmd, size_t cmd_len) {
         temp_indices[placeholder] = zcalloc(sizeof(size_t) * temp_size);
         const char *p = cmd;
         const char *end = cmd + cmd_len;
-        while ((p = strstr(p, PLACEHOLDERS[placeholder])) != NULL && p < end) {
+        while ((p = strstr(p, PLACEHOLDERS[placeholder].name)) != NULL && p < end) {
             if (*count == temp_size) {
                 temp_size *= 2;
                 temp_indices[placeholder] = zrealloc(temp_indices[placeholder], sizeof(size_t) * temp_size);
@@ -577,7 +952,40 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
         memcpy(placeholder, cmd + indices[0], placeholder_len);
     }
 }
+// TODO[is_vector_generator]: implement vector generator replacement
+static void replacePlaceholderVectorGenerator(const size_t key_count, const size_t *key_indices, _Atomic uint64_t *key_counter,
+    const size_t vec_count, const size_t *vec_indices, _Atomic uint64_t *vector_counter, char *cmd) {       
+    if (!config.use_search || (key_count == 0 && vec_count == 0)) return;
+    assert((key_count == vec_count) ||
+        (vec_count == 0) ||
+        (key_count == 0));
+    // key only replacement - on vec-del commands
+    // vector only replacement - on search commands
+    // both key and vector replacement - on vector insert\update\overwrite commands
+    if (vec_count == 0) {
+        for (size_t i = 0; i < key_count; i++) {
+            // TODO[is_vector_generator]: implement key set for deletion according to the vgen api
+            // replacePlaceholderVGenDelete(key_indices + i, 1, cmd, key_counter);
+        }
+        return;
+    }
+    if (key_count == 0) {
+        for (size_t i = 0; i < vec_count; i++) {
+            // TODO[is_vector_generator]: implement vector set for search according to the vgen api
+            //replacePlaceholderVGenSearch(vec_indices + i, 1, cmd, vector_counter);
+        }
+        return;
+    }
+    for (size_t i = 0; i < placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX]; i++) {
+        // TODO[is_vector_generator]: implement key set for deletion according to the vgen api
+        // 
+    }
 
+    UNUSED(vec_indices);
+    UNUSED(cmd);
+    UNUSED(key_indices);
+    UNUSED(key_counter);
+}
 
 static void replacePlaceholderVector(const size_t *indices, const size_t count, 
                                     char *cmd, _Atomic uint64_t *key_counter) {
@@ -660,6 +1068,11 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
             replacePlaceholderVector(indices, count, cmd, 
                                    &seq_key[VECTOR_PLACEHOLDER_INDEX]);
         }
+        /* Handle __rand_int__ separately (multiple different values) */    
+        replacePlaceholderVectorGenerator(placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX-1], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
+                &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
+                placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX], &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX], 
+                cmd);        
     }
 }
 
@@ -808,7 +1221,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(fd);
     UNUSED(mask);
-
+    // TODO[is_vector_generator]: if using vector generater and search command, we need to check recall. Recall is checked with appropriate vgen api.
     /* Calculate latency only for the first read event. This means that the
      * server already sent the reply and we need to parse it. Parsing overhead
      * is not part of the latency, so calculate it only once, here. */
@@ -1373,7 +1786,7 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
 
     initPlaceholders(cmd, len);
     if (config.num_threads) initBenchmarkThreads();
-    getFullInfo(config.search.name);
+    getFullInfo(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
     long long search_memory = 0;
     long long search_reclaimable = 0;
     long long search_total_docs = 0;
@@ -1402,15 +1815,18 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
         startBenchmarkThreads();
     config.totlatency = mstime() - config.start;
     if (config.use_search) {
-        getFullInfo(config.search.name);
+        getFullInfo(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
         clusterSnapshot* after_search_info = NULL;
         clusterSnapshot* after_ftinfo = NULL;
         clusterSnapshot* after_info_all = NULL;
-        after_search_info = getSearchInfo(&after_search_memory, &after_search_reclaimable, &after_search_total_docs,
-                            &after_search_ingest_field_vector, &after_search_background_indexing_status);
-        after_ftinfo = getFtInfoStatistics(config.search.name);
-        after_info_all = getInfoCluster();
-        compareInfoSnapshots(last_info_all, after_info_all, last_ftinfo, after_ftinfo, last_search_info, after_search_info);
+        after_search_info = getSearchInfo(config.cluster_node_count, config.cluster_nodes, config.ct,
+                                         &after_search_memory, &after_search_reclaimable,
+                                         &after_search_total_docs, &after_search_ingest_field_vector,
+                                         &after_search_background_indexing_status);
+        after_ftinfo = getFtInfoStatistics(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
+        after_info_all = getInfoCluster(config.cluster_node_count, config.cluster_nodes, config.ct);
+        compareInfoSnapshots(config.cluster_node_count, config.cluster_nodes, config.ct,
+                             last_info_all, after_info_all, last_ftinfo, after_ftinfo, last_search_info, after_search_info);
         freeClusterSnapshot(last_search_info);
         freeClusterSnapshot(last_ftinfo);
         freeClusterSnapshot(last_info_all);
@@ -2992,10 +3408,14 @@ int main(int argc, char **argv) {
         long long search_total_docs = 0;
         long long search_ingest_field_vector = 0;
         long long search_background_indexing_status = 0;
-        last_search_info = getSearchInfo(&search_memory, &search_reclaimable, &search_total_docs,
-                    &search_ingest_field_vector, &search_background_indexing_status);
-        last_ftinfo = getFtInfoStatistics(config.search.name);
-        last_info_all = getInfoCluster();
+        last_search_info = getSearchInfo(config.cluster_node_count, config.cluster_nodes, config.ct,
+                                        &search_memory, &search_reclaimable, &search_total_docs,
+                                        &search_ingest_field_vector, &search_background_indexing_status);
+        last_ftinfo = getFtInfoStatistics(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
+        last_info_all = getInfoCluster(config.cluster_node_count, config.cluster_nodes, config.ct);
+
+
+        // TODO[is_vector_generator]: if vector generation is used, initialize vector generation according to the appropriate definitions
     }
     /* Run default benchmark suite. */
     data = zcalloc(config.datasize + 1);

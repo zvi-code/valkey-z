@@ -3,6 +3,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "sds.h"
+#include <valkey/valkey.h>
+
+/* Forward declarations */
+struct serverConfig;
+
+/* Cluster node - shared between valkey-benchmark.c and valkey-benchmark-utils.c */
+typedef struct clusterNode {
+    valkeyContext *ctx;
+    char *ip;
+    int port;
+    sds name;
+    int flags;
+    sds replicate; /* Primary ID if node is a replica */
+    int *slots;
+    int slots_count;
+    int *updated_slots;      /* Used by updateClusterSlotsConfiguration */
+    int updated_slots_count; /* Used by updateClusterSlotsConfiguration */
+    int replicas_count;
+    struct serverConfig *server_config;
+} clusterNode;
+
 /* Field snapshot for temporal diff calculations */
 typedef struct fieldSnapshot {
     sds field_name;
@@ -86,11 +107,23 @@ typedef struct infoFieldType {
 } infoFieldType;
 
 // getMemoryInfoClusterGeneric();
-clusterSnapshot* getSearchInfo(long long *search_memory, long long *search_reclaimable, 
+clusterSnapshot* getSearchInfo(int cluster_node_count, clusterNode **cluster_nodes,
+                                enum valkeyConnectionType ct, 
+                                long long *search_memory, long long *search_reclaimable, 
                    long long *search_total_docs, long long *search_ingest_field_vector, 
                    long long *search_background_indexing_status);
-clusterSnapshot* getInfoCluster(void);
-clusterSnapshot* getFtInfoStatistics(const char *index_name);
-void getFullInfo(const char *index_name);
-void* compareInfoSnapshots(clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch);
+clusterSnapshot* getInfoCluster(int cluster_node_count, clusterNode **cluster_nodes,
+                                enum valkeyConnectionType ct);
+clusterSnapshot* getFtInfoStatistics(const char *index_name,
+int cluster_node_count, clusterNode **cluster_nodes,
+                                enum valkeyConnectionType ct);
+void getFullInfo(const char *index_name, 
+                int cluster_node_count, clusterNode **cluster_nodes,
+                enum valkeyConnectionType ct);
+void* compareInfoSnapshots(int cluster_node_count, clusterNode **cluster_nodes,
+                                      enum valkeyConnectionType ct, 
+                                      clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch);
+void freeClusterSnapshot(clusterSnapshot *snapshot);
+valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
+
 #endif /* __VALKEY_BENCHMARK_UTILS_H */
