@@ -670,8 +670,6 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
         recall_tracker.max_recall = recall;
     }
     pthread_mutex_unlock(&recall_tracker.lock);
-
-    /* TODO: Phase 5 - Extract keys from reply and compare with ground truth */
 }
 
 /**
