@@ -855,3 +855,37 @@ void vgen_reset_recall_stats(void) {
     
     pthread_mutex_unlock(&recall_tracker.lock);
 }
+
+/**
+ * Get iterator pool statistics for monitoring and debugging.
+ * 
+ * @param active_ingestion Out: number of active ingestion iterators
+ * @param active_query Out: number of active query iterators
+ * @param active_deletion Out: number of active deletion iterators
+ */
+void vgen_get_iterator_stats(int *active_ingestion, int *active_query, int *active_deletion) {
+    if (!thread_pools_initialized) {
+        if (active_ingestion) *active_ingestion = 0;
+        if (active_query) *active_query = 0;
+        if (active_deletion) *active_deletion = 0;
+        return;
+    }
+    
+    int ingestion_count = 0;
+    int query_count = 0;
+    int deletion_count = 0;
+    
+    for (int i = 0; i < MAX_THREADS; i++) {
+        pthread_mutex_lock(&thread_pools[i].lock);
+        
+        if (thread_pools[i].ingestion_iter) ingestion_count++;
+        if (thread_pools[i].query_iter) query_count++;
+        if (thread_pools[i].deletion_iter) deletion_count++;
+        
+        pthread_mutex_unlock(&thread_pools[i].lock);
+    }
+    
+    if (active_ingestion) *active_ingestion = ingestion_count;
+    if (active_query) *active_query = query_count;
+    if (active_deletion) *active_deletion = deletion_count;
+}

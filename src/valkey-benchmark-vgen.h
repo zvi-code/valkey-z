@@ -174,4 +174,13 @@ int vgen_is_initialized(void);
  */
 void vgen_reset_recall_stats(void);
 
+/**
+ * Get iterator pool statistics for monitoring and debugging.
+ * 
+ * @param active_ingestion Output: number of threads with active ingestion iterators
+ * @param active_query Output: number of threads with active query iterators
+ * @param active_deletion Output: number of threads with active deletion iterators
+ */
+void vgen_get_iterator_stats(int *active_ingestion, int *active_query, int *active_deletion);
+
 #endif /* VALKEY_BENCHMARK_VGEN_H */
