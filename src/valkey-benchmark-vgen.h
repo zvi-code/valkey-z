@@ -60,7 +60,7 @@ void vgen_cleanup(void);
  * @param key_counter Atomic counter for key generation
  * @param vector_counter Atomic counter for vector generation
  */
-void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size_t key_count,
+void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indices, const size_t key_count,
                                             const size_t *vec_indices, const size_t vec_count,
                                             char *cmd, uint64_t *key_counter,
                                             uint64_t *vector_counter);
@@ -76,7 +76,7 @@ void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size
  * @param cmd Command buffer to modify in-place
  * @param key_counter Atomic counter for key generation (may be used for tracking)
  */
-void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
+void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const size_t count,
                                    char *cmd, uint64_t *key_counter);
 
 /**
@@ -91,7 +91,7 @@ void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
  * @param vector_counter Atomic counter for vector generation
  * @return Query index for recall tracking (or UINT64_MAX if no query)
  */
-uint64_t vgen_replace_vector_placeholder_query(const size_t *indices, const size_t count,
+uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indices, const size_t count,
                                             char *cmd, uint64_t *vector_counter);
 
 /**
@@ -108,7 +108,7 @@ uint64_t vgen_replace_vector_placeholder_query(const size_t *indices, const size
  * @param key_counter Atomic counter for key generation
  * @param vector_counter Atomic counter for vector generation
  */
-void vgen_replace_vector_and_key_placeholder(const size_t *key_indices, const size_t key_count,
+void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_indices, const size_t key_count,
                                               const size_t *vec_indices, const size_t vec_count,
                                               char *cmd, uint64_t *key_counter,
                                               uint64_t *vector_counter);

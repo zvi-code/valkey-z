@@ -44,7 +44,7 @@ static long long parse_generic(const char *value, ParseConfig parse_config) {
         if (!p) return 0;
         p += strlen(parse_config.key);
         if (*p == '=') p++;
-        return (long long)atoll(p) * 1000; // Scale by 1000 for fixed-point
+        return (long long)atoll(p); 
     }
     /* Common: skip whitespace */
     while (*value == ' ' || *value == '\t') value++;

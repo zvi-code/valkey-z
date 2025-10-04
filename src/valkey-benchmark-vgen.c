@@ -255,7 +255,7 @@ void vgen_cleanup(void) {
  * Replace both key and vector placeholders for ground truth ingestion.
  * This ingests the reserved-range vectors that serve as ground truth neighbors.
  */
-void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size_t key_count,
+void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indices, const size_t key_count,
                                             const size_t *vec_indices, const size_t vec_count,
                                             char *cmd, uint64_t *key_counter,
                                             uint64_t *vector_counter) {
@@ -272,7 +272,6 @@ void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size
     pthread_rwlock_rdlock(&vgen_lock);
     
     /* Get or create ground truth iterator for this thread */
-    int thread_id = 0; /* TODO: Get actual thread ID from config */
     thread_iterator_pool_t *pool = &thread_pools[thread_id];
     
     pthread_mutex_lock(&pool->lock);
@@ -341,14 +340,13 @@ void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size
 /**
  * Replace key placeholder for deletion operations.
  */
-void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
+void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const size_t count,
                                    char *cmd, uint64_t *key_counter) {
     if (!vgen_is_initialized() || count == 0) return;
     
     pthread_rwlock_rdlock(&vgen_lock);
     
     /* Get or create deletion iterator for this thread */
-    int thread_id = 0; /* TODO: Get actual thread ID from config */
     thread_iterator_pool_t *pool = &thread_pools[thread_id];
     
     pthread_mutex_lock(&pool->lock);
@@ -398,14 +396,13 @@ void vgen_replace_key_placeholder(const size_t *indices, const size_t count,
 /**
  * Replace vector placeholder for query operations.
  */
-uint64_t vgen_replace_vector_placeholder_query(const size_t *indices, const size_t count,
+uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indices, const size_t count,
                                             char *cmd, uint64_t *vector_counter) {
     if (!vgen_is_initialized() || count == 0) return UINT64_MAX;
     
     pthread_rwlock_rdlock(&vgen_lock);
     
     /* Get or create query iterator for this thread */
-    int thread_id = 0; /* TODO: Get actual thread ID from config */
     thread_iterator_pool_t *pool = &thread_pools[thread_id];
     
     pthread_mutex_lock(&pool->lock);
@@ -477,7 +474,7 @@ uint64_t vgen_replace_vector_placeholder_query(const size_t *indices, const size
 /**
  * Replace both key and vector placeholders for ingestion operations.
  */
-void vgen_replace_vector_and_key_placeholder(const size_t *key_indices, const size_t key_count,
+void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_indices, const size_t key_count,
                                               const size_t *vec_indices, const size_t vec_count,
                                               char *cmd, uint64_t *key_counter,
                                               uint64_t *vector_counter) {
@@ -494,7 +491,6 @@ void vgen_replace_vector_and_key_placeholder(const size_t *key_indices, const si
     pthread_rwlock_rdlock(&vgen_lock);
     
     /* Get or create ingestion iterator for this thread */
-    int thread_id = 0; /* TODO: Get actual thread ID from config */
     thread_iterator_pool_t *pool = &thread_pools[thread_id];
     
     pthread_mutex_lock(&pool->lock);
@@ -546,9 +542,9 @@ void vgen_replace_vector_and_key_placeholder(const size_t *key_indices, const si
         
         /* Replace vector placeholder */
         if (i < vec_count) {
-            char *vec_placeholder = cmd + vec_indices[i];
             uint32_t dims = vg_get_dimensions(vgen_instance);
             size_t vector_bytes = dims * sizeof(float);
+            char *vec_placeholder = cmd + vec_indices[i];
             
             /* Replace entire vector data */
             memcpy(vec_placeholder, vec.data, vector_bytes);

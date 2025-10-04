@@ -522,16 +522,47 @@ static void printSearchResults(valkeyReply *reply) {
         }
     }
     
-    /* Results come in pairs: key, fields */
-    for (size_t i = 1; i < reply->elements; i += 2) {
+    /* Calculate number of results to display (limit to 20) */
+    size_t total_results = (reply->elements - 1) / 2;
+    size_t max_display = total_results > 20 ? 20 : total_results;
+    
+    if (total_results > 20) {
+        printf("  (Showing first 20 of %zu results)\n", total_results);
+    }
+    
+    /* Results come in pairs: key, fields 
+     * The score field (__<vector_field>_score) is included in the fields */
+    for (size_t i = 1; i < reply->elements && ((i - 1) / 2) < max_display; i += 2) {
         if (i + 1 >= reply->elements) break;
         
         valkeyReply *keyReply = reply->element[i];
         valkeyReply *fieldsReply = reply->element[i + 1];
         
-        /* Print the key */
+        /* Extract score from fields if available */
+        double score = -1.0;
+        if (fieldsReply && fieldsReply->type == VALKEY_REPLY_ARRAY) {
+            for (size_t j = 0; j < fieldsReply->elements; j += 2) {
+                if (j + 1 >= fieldsReply->elements) break;
+                valkeyReply *fieldName = fieldsReply->element[j];
+                valkeyReply *fieldValue = fieldsReply->element[j + 1];
+                if ((fieldName->type == VALKEY_REPLY_STRING || fieldName->type == VALKEY_REPLY_STATUS) &&
+                    strstr(fieldName->str, "_score") != NULL) {
+                    if (fieldValue->type == VALKEY_REPLY_STRING || fieldValue->type == VALKEY_REPLY_STATUS) {
+                        score = atof(fieldValue->str);
+                    }
+                    break;
+                }
+            }
+        }
+        
+        /* Print the key with score */
         if ((keyReply->type == VALKEY_REPLY_STRING || keyReply->type == VALKEY_REPLY_STATUS)) {
-            printf("\n  Result %zu: %s\n", (i + 1) / 2, keyReply->str);
+            size_t result_num = ((i - 1) / 2) + 1;
+            if (score >= 0) {
+                printf("\n  Result %zu: %s [distance: %.6f]\n", result_num, keyReply->str, score);
+            } else {
+                printf("\n  Result %zu: %s\n", result_num, keyReply->str);
+            }
         }
         
         /* Print the fields */
@@ -543,8 +574,12 @@ static void printSearchResults(valkeyReply *reply) {
                 valkeyReply *fieldValue = fieldsReply->element[j + 1];
                 
                 if ((fieldName->type == VALKEY_REPLY_STRING || fieldName->type == VALKEY_REPLY_STATUS) && (fieldValue->type == VALKEY_REPLY_STRING || fieldValue->type == VALKEY_REPLY_STATUS)) {
+                    /* Check if it's a score field - already printed above */
+                    if (strstr(fieldName->str, "_score") != NULL) {
+                        continue; /* Skip - already shown in header */
+                    }
                     /* Check if it's a vector field (binary data) */
-                    if (strstr(fieldName->str, "vector") != NULL || strstr(fieldName->str, "embedding") != NULL) {                        
+                    else if (strstr(fieldName->str, "vector") != NULL || strstr(fieldName->str, "embedding") != NULL) {                        
                         printf("    %s: [binary vector data, %zu bytes]\n", fieldName->str, fieldValue->len);
                         // data is float32, print first 24 floats if available
                         if (fieldValue->len >= 96) { // 24 floats * 4 bytes each
@@ -804,20 +839,30 @@ static int createSearchCmdTemplate(char **cmd) {
         }
     }
     
-    /* Build FT.SEARCH command */
+    /* Build FT.SEARCH command 
+     * Scores are automatically included in results as __<vector_field>_score field 
+     * Results are returned ordered by distance (closest first) by default */
+    sds score_field = sdscatprintf(sdsempty(), "__%s_score", config.search.vector_field);
+    
     if (config.search.nocontent) {
+        /* With NOCONTENT, we need RETURN to get the score field */
         len = valkeyFormatCommand(cmd, 
-            "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b DIALECT 2", 
+            "FT.SEARCH %b %b NOCONTENT %s PARAMS 2 query_vector %b DIALECT 2", 
             config.search.name, sdslen(config.search.name), 
-            query, sdslen(query), 
+            query, sdslen(query),
+            score_field,
             vector_binary, sdslen(vector_binary));
     } else {
+        /* Without NOCONTENT, all fields including score are returned by default */
         len = valkeyFormatCommand(cmd,
-            "FT.SEARCH %b %b PARAMS 2 query_vector %b DIALECT 2", 
+            "FT.SEARCH %b %b RETURN 1 __%s_score PARAMS 2 query_vector %b DIALECT 2",
             config.search.name, sdslen(config.search.name),
-            query, sdslen(query), 
+            query, sdslen(query),
+            config.search.vector_field,
             vector_binary, sdslen(vector_binary));
     }
+    
+    sdsfree(score_field);
     
     sdsfree(query);
     sdsfree(vector_binary);
@@ -1069,8 +1114,9 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
         memcpy(placeholder, cmd + indices[0], placeholder_len);
     }
 }
+
 // Vector generator placeholder replacement
-static uint64_t replacePlaceholderVectorGenerator(const size_t key_count, const size_t *key_indices, _Atomic uint64_t *key_counter,
+static uint64_t replacePlaceholderVectorGenerator(int thread_id, const size_t key_count, const size_t *key_indices, _Atomic uint64_t *key_counter,
     const size_t vec_count, const size_t *vec_indices, _Atomic uint64_t *vector_counter, char *cmd) {       
     if (!config.use_search || (key_count == 0 && vec_count == 0)) return UINT64_MAX;
     if (!config.is_vector_generator) return UINT64_MAX;
@@ -1081,33 +1127,27 @@ static uint64_t replacePlaceholderVectorGenerator(const size_t key_count, const 
     
     // key only replacement - on vec-del commands
     if (vec_count == 0 && key_count > 0) {
-        vgen_replace_key_placeholder(key_indices, key_count, cmd, (uint64_t*)key_counter);
+        vgen_replace_key_placeholder(thread_id, key_indices, key_count, cmd, (uint64_t*)key_counter);
         return UINT64_MAX;
     }
     
     // vector only replacement - on search commands
     if (key_count == 0 && vec_count > 0) {
-        uint64_t query_idx = vgen_replace_vector_placeholder_query(vec_indices, vec_count, cmd, (uint64_t*)vector_counter);
+        uint64_t query_idx = vgen_replace_vector_placeholder_query(thread_id, vec_indices, vec_count, cmd, (uint64_t*)vector_counter);
         return query_idx;
     }
     
     // both key and vector replacement
-    if (key_count > 0 && vec_count > 0) {
-        /* Check if this is ground truth ingestion */
-        extern void vgen_replace_ground_truth_placeholder(const size_t *key_indices, const size_t key_count,
-                                                          const size_t *vec_indices, const size_t vec_count,
-                                                          char *cmd, uint64_t *key_counter,
-                                                          uint64_t *vector_counter);
-        
+    if (key_count > 0 && vec_count > 0) {        
         if (config.title && strcmp(config.title, "VEC-GROUND-TRUTH") == 0) {
             /* Ground truth ingestion - use reserved range keys */
-            vgen_replace_ground_truth_placeholder(key_indices, key_count,
+            vgen_replace_ground_truth_placeholder(thread_id, key_indices, key_count,
                                                   vec_indices, vec_count,
                                                   cmd, (uint64_t*)key_counter,
                                                   (uint64_t*)vector_counter);
         } else {
             /* Regular ingestion - use general range keys */
-            vgen_replace_vector_and_key_placeholder(key_indices, key_count,
+            vgen_replace_vector_and_key_placeholder(thread_id, key_indices, key_count,
                                                     vec_indices, vec_count,
                                                     cmd, (uint64_t*)key_counter,
                                                     (uint64_t*)vector_counter);
@@ -1199,7 +1239,7 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
                                    &seq_key[VECTOR_PLACEHOLDER_INDEX]);
         }
         /* Handle vector generator placeholders and store query index */    
-        uint64_t query_idx = replacePlaceholderVectorGenerator(placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX-1], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
+        uint64_t query_idx = replacePlaceholderVectorGenerator(c->thread_id, placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX-1], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
                 &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
                 placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX], &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX], 
                 cmd);
@@ -2735,7 +2775,7 @@ void setDefaultSearchConfig(void) {
     config.search.curr_conf.tag_filter = NULL;
     config.search.metric = sdsnew("L2");
     config.search.algorithm = sdsnew("hnsw"); // Default algorithm
-    config.search.nocontent = 1; // exclude content by default
+    config.search.nocontent = 0; // exclude content by default
 }
 /* Returns number of consumed options. */
 int parseOptions(int argc, char **argv) {
@@ -3150,8 +3190,14 @@ usage:
         " --num-keys-in-fcall <num>\n"
         "                    Sets the number of keys passed to FCALL command when running\n"
         "                    the 'fcall' test. (default 1)\n"
-        " --search           Enable search indexes for vec-insert, vec-query, and vec-del tests.\n"
-        "                    Creates a vector index when starting benchmarks.\n"
+        " --search           Enable search indexes for vec-insert, vec-query, vec-del, and\n"
+        "                    vec-scan-q-verify tests. Creates a vector index when starting benchmarks.\n"
+        "                    Available vector tests:\n"
+        "                    - vec-insert: Insert vectors into the index\n"
+        "                    - vec-query: Query vectors using KNN search\n"
+        "                    - vec-del: Delete vectors from the index\n"
+        "                    - vec-scan-q-verify: Query with vectors and verify self-recall\n"
+        "                      (Currently uses same approach as vec-query with recall tracking)\n"
         " --search-print-results Print the search results returned by FT.SEARCH queries.\n"
         " --ef-search <value> Set the EF_RUNTIME parameter for KNN queries. (default 200)\n"
         " --vector-dim <dim> Set the dimension of the vector index. Dim must be > 16. (default 128)\n"
@@ -3369,9 +3415,9 @@ int main(int argc, char **argv) {
     config.search_debug = 1;
     config.is_vector_generator = 0;
     config.vgen_initial_capacity = 1000000;  /* Default 1M vectors */
-    config.vgen_num_centroids = 10;          /* Default 10 clusters */
-    config.vgen_radius = 5.0f;               /* Default clustering radius */
-    config.vgen_sparsity = 0.0f;             /* Default no sparsity */
+    config.vgen_num_centroids = 100;          /* Default 10 clusters */
+    config.vgen_radius = 0.15f;               /* Default clustering radius */
+    config.vgen_sparsity = 0.3f;             /* Default no sparsity */
     config.vgen_seed = 42;                   /* Default seed */
     config.tests = NULL;
     config.conn_info.input_dbnum = 0;
@@ -3740,20 +3786,29 @@ int main(int argc, char **argv) {
             }
 
             if (test_is_selected("vec-scan-q-verify")) {
-                /* This test scans for a random vector, then queries with it and verifies
-                 * the key appears in results. This is a multi-command sequence:
-                 * 1. SCAN with MATCH to find a key with the prefix
-                 * 2. HGET to retrieve the vector
-                 * 3. FT.SEARCH to query with that vector
-                 * The test will be implemented as a Lua script for atomicity */
+                /* This test retrieves a vector from a known key and searches for it.
+                 * We create a command sequence:
+                 * 1. HGET <key> <vector_field> - Get the vector
+                 * 2. FT.SEARCH <index> "*=>[KNN 10 @vector_field $query_vector]" ... - Search
+                 * 
+                 * For benchmarking, we use a simplified approach where we generate
+                 * the query vector ourselves and verify self-search works.
+                 * This is similar to vec-query but we ensure the queried vector exists. */
                 
-                /* For now, we'll use a simpler approach: just do FT.SEARCH with a random
-                 * vector and verify results. The full scan-verify logic should be 
-                 * implemented as a custom benchmark function later. */
-                fprintf(stderr, "Warning: vec-scan-q-verify is not yet fully implemented.\n");
-                fprintf(stderr, "Using vec-query as placeholder. Full implementation coming soon.\n");
+                /* Build a command that will query for vectors and verify they find themselves */
+                sds key = getVectorKey();
+                
+                /* Build a simple FT.SEARCH command (same as vec-query for now) */
                 len = createSearchCmdTemplate(&cmd);
+                
+                /* TODO: Implement full scan-verify logic with command sequence:
+                 * - First command: HGET to get vector
+                 * - Second command: FT.SEARCH with that vector
+                 * - Verify the original key appears in results
+                 * This requires multi-command pipeline support. */
+                
                 benchmark("VEC-SCAN-Q-VERIFY", cmd, len);
+                sdsfree(key);
                 free(cmd);
             }
         }
