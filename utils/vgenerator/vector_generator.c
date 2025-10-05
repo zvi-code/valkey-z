@@ -7,6 +7,7 @@
 #include <math.h>
 #include <assert.h>
 #include <errno.h>
+#include <time.h>
 // use zmalloc for Valkey memory tracking
 #include "../../src/zmalloc.h"
 #ifdef __ARM_NEON
@@ -428,6 +429,48 @@ void vg_set_ground_truth_dataset_size(vector_generator_t* gen, uint64_t dataset_
             gen->query_ground_truth[i].computed = false;
         }
     }
+}
+
+/* Precompute all ground truths for query vectors */
+void vg_precompute_all_ground_truths(vector_generator_t* gen) {
+    assert(gen != NULL && "Generator must not be NULL");
+    assert(gen->query_ground_truth != NULL && "Query ground truth must be initialized");
+    
+    if (gen->ground_truth_dataset_size == 0) {
+        fprintf(stderr, "[VG WARNING] Ground truth dataset size not set. Call vg_set_ground_truth_dataset_size() first.\n");
+        return;
+    }
+    
+    fprintf(stderr, "[VG] Precomputing ground truths for %u queries with dataset_size=%lu...\n", 
+            gen->num_query_vectors, gen->ground_truth_dataset_size);
+    
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    
+    /* Compute ground truth for all queries sequentially.
+     * Note: Could be parallelized with OpenMP if needed, but need to ensure
+     * thread safety since compute_query_ground_truth() uses mutexes. */
+    for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
+        /* Skip if already computed */
+        if (gen->query_ground_truth[i].computed) {
+            continue;
+        }
+        
+        compute_query_ground_truth(gen, i);
+        
+        /* Progress update every 100 queries */
+        if ((i + 1) % 100 == 0) {
+            fprintf(stderr, "[VG] Progress: %u/%u queries (%.1f%%)\n", 
+                    i + 1, gen->num_query_vectors, 
+                    100.0 * (i + 1) / gen->num_query_vectors);
+        }
+    }
+    
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    
+    fprintf(stderr, "[VG] Ground truth precomputation complete! Computed %u queries in %.2f seconds (%.0f queries/sec)\n",
+            gen->num_query_vectors, elapsed, gen->num_query_vectors / elapsed);
 }
 
 /* Create ingestion iterator */

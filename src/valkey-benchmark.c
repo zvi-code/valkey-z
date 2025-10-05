@@ -395,6 +395,7 @@ static struct config {
     float vgen_radius;              /* Clustering radius */
     float vgen_sparsity;            /* Sparsity level (0.0-1.0) */
     uint64_t vgen_seed;             /* Random seed for reproducibility */
+    int vgen_precompute;            /* Precompute ground truths (warm-up phase) */
 } config;
 
 
@@ -506,7 +507,7 @@ static void printSearchResults(valkeyReply *reply) {
     
     /* Print ground truth if using vector generator */
     if (config.is_vector_generator) {     
-        uint64_t neighbors[100]; /* NEIGHBORS_PER_QUERY = 10 */
+        uint64_t neighbors[10]; /* NEIGHBORS_PER_QUERY = 10 */
         uint64_t query_idx = vgen_get_current_query_index();
         int neighbor_count = vgen_get_ground_truth(query_idx, neighbors);
         
@@ -2981,6 +2982,8 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--vgen-seed")) {
             if (lastarg) goto invalid;
             config.vgen_seed = strtoull(argv[++i], NULL, 10);
+        } else if (!strcmp(argv[i], "--vgen-precompute")) {
+            config.vgen_precompute = 1;
         } else if (!strcmp(argv[i], "--search-print-results")) {
             config.print_search_results = 1;
         } else if (!strcmp(argv[i], "--search-prefix")) {
@@ -3271,7 +3274,8 @@ usage:
         "                    Cluster radius for vector generation (default 0.5).\n"
         " --vgen-sparsity <value>\n"
         "                    Sparsity ratio for vectors, 0.0-1.0 (default 0.0).\n"
-        " --vgen-seed <num>  Seed for deterministic vector generation (default: random).\n",
+        " --vgen-seed <num>  Seed for deterministic vector generation (default: random).\n"
+        " --vgen-precompute  Precompute ground truths before queries (warm-up phase).\n",
         tls_usage,
         rdma_usage,        
         " --mptcp            Enable an MPTCP connection.\n"
@@ -3485,6 +3489,7 @@ int main(int argc, char **argv) {
     config.vgen_radius = 0.15f;               /* Default clustering radius */
     config.vgen_sparsity = 0.3f;             /* Default no sparsity */
     config.vgen_seed = 42;                   /* Default seed */
+    config.vgen_precompute = 1;              /* Default: lazy evaluation */
     config.tests = NULL;
     config.conn_info.input_dbnum = 0;
     config.stdinarg = 0;
@@ -3838,7 +3843,27 @@ int main(int argc, char **argv) {
                 benchmark("VEC-INSERT", cmd, len);
             }
 
-            if (test_is_selected("vec-query")) {                
+            if (test_is_selected("vec-query")) {
+                /* Set the ground truth dataset size for query recall calculation
+                 * This should match the number of vectors that were ingested.
+                 * Priority: keyspacelen (-r), or vgen_initial_capacity (--vgen-capacity) */
+                if (config.is_vector_generator) {
+                    uint64_t dataset_size = config.keyspacelen > 0 
+                        ? (uint64_t)config.keyspacelen 
+                        : config.vgen_initial_capacity;
+                    vgen_set_ground_truth_size(dataset_size);
+                    
+                    /* Precompute ground truths if requested (warm-up phase) */
+                    if (config.vgen_precompute) {
+                        printf("\n");
+                        printf("====== Warm-up Phase: Precomputing Ground Truths ======\n");
+                        printf("This eliminates lazy computation overhead for consistent query performance.\n");
+                        printf("Progress will be displayed below...\n\n");
+                        vgen_precompute_ground_truths();
+                        printf("\n");
+                        printf("====== Warm-up Complete - Starting Query Benchmark ======\n\n");
+                    }
+                }
                 /* Use custom vector benchmark function */
                 len = createSearchCmdTemplate(&cmd);
                 benchmark("VEC-QUERY", cmd, len);

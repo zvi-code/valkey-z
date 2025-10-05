@@ -58,6 +58,36 @@ void vgen_cleanup(void);
 void vgen_set_ground_truth_size(uint64_t num_vectors);
 
 /**
+ * Precompute all ground truths for query vectors (warm-up phase).
+ * 
+ * This function implements the warm-up phase pattern recommended in the vector
+ * generator USER_GUIDE.md. It eagerly computes ground truth (nearest neighbors)
+ * for all query vectors before benchmarking begins.
+ * 
+ * When to call:
+ *   - AFTER vgen_set_ground_truth_size() has been called
+ *   - AFTER ground truth vectors have been ingested into the database
+ *   - BEFORE starting query performance measurements
+ * 
+ * Benefits:
+ *   - Eliminates lazy computation overhead during query execution
+ *   - Provides more accurate and consistent query performance measurements
+ *   - First queries won't be 100x slower due to ground truth computation
+ * 
+ * Performance:
+ *   - One-time cost: O(num_queries × dataset_size × dimensions)
+ *   - For 1000 queries × 50K dataset × 8 dims ≈ 10-30 seconds
+ *   - Progress updates displayed every 100 queries
+ * 
+ * Example workflow:
+ *   1. vgen_set_ground_truth_size(50000);
+ *   2. Run vec-ground-truth benchmark to ingest 50K vectors
+ *   3. vgen_precompute_ground_truths();  // Warm-up phase
+ *   4. Run vec-query benchmark           // Now fast and consistent!
+ */
+void vgen_precompute_ground_truths(void);
+
+/**
  * Replace both key and vector placeholders for ground truth ingestion.
  * 
  * This function is used to ingest the reserved-range vectors that will serve

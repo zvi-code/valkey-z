@@ -15,7 +15,7 @@
 #define MAX_NUM_THREADS 64
 #define MAX_QUERY_VECTORS 100000
 #define RESERVED_KEY_RANGE 1000000
-#define NEIGHBORS_PER_QUERY 100
+#define NEIGHBORS_PER_QUERY 10
 
 /* Type definitions */
 typedef uint64_t vector_key_t;
@@ -288,6 +288,55 @@ void vg_destroy(vector_generator_t* gen);
  * Thread Safety: Should be called before any concurrent operations
  */
 void vg_set_ground_truth_dataset_size(vector_generator_t* gen, uint64_t dataset_size);
+
+/**
+ * vg_precompute_all_ground_truths - Eagerly compute all query ground truths
+ * 
+ * This function implements the "warm-up phase" pattern recommended in the USER_GUIDE.md.
+ * It precomputes ground truth (nearest neighbors) for all query vectors before benchmarking
+ * begins. This eliminates the lazy computation overhead during query execution, providing
+ * more accurate and consistent performance measurements.
+ * 
+ * When to use:
+ *   - Call AFTER vg_set_ground_truth_dataset_size() has been called
+ *   - Call AFTER ground truth vectors have been ingested into the database
+ *   - Call BEFORE starting query performance measurements
+ * 
+ * Behavior:
+ *   - Computes ground truth for all MAX_QUERY_VECTORS queries
+ *   - Performs brute-force search across ground_truth_dataset_size vectors
+ *   - Displays progress updates every 100 queries
+ *   - Skips queries that already have computed ground truth
+ *   - Reports total time and throughput at completion
+ * 
+ * Performance:
+ *   - Computational cost: O(num_queries × dataset_size × dimensions)
+ *   - For 1000 queries × 50K dataset × 8 dims ≈ 10-30 seconds
+ *   - This is a one-time cost that eliminates per-query overhead
+ * 
+ * @param gen Vector generator instance (must have ground_truth_dataset_size set)
+ * 
+ * Example usage:
+ *   // 1. Initialize generator
+ *   generator_config_t config = {.dimensions = 8, ...};
+ *   vector_generator_t* gen = vg_init(&config);
+ *   
+ *   // 2. Set dataset size (must match ingested vectors)
+ *   vg_set_ground_truth_dataset_size(gen, 50000);
+ *   
+ *   // 3. Ingest ground truth vectors
+ *   // ... insert 50K vectors into database ...
+ *   
+ *   // 4. Precompute all ground truths (warm-up phase)
+ *   vg_precompute_all_ground_truths(gen);
+ *   
+ *   // 5. Now run queries - no ground truth computation overhead!
+ *   // ... benchmark query performance ...
+ * 
+ * Thread Safety: Should be called from a single thread before concurrent query operations.
+ *                The underlying compute_query_ground_truth() uses mutexes for safety.
+ */
+void vg_precompute_all_ground_truths(vector_generator_t* gen);
 
 /**
  * vg_get_ingestion_iterator - Create iterator for vector ingestion

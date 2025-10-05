@@ -398,6 +398,19 @@ void vgen_set_ground_truth_size(uint64_t num_vectors) {
 }
 
 /**
+ * Precompute all ground truths for query vectors (warm-up phase).
+ */
+void vgen_precompute_ground_truths(void) {
+    pthread_rwlock_rdlock(&vgen_lock);
+    if (vgen_instance) {
+        vg_precompute_all_ground_truths(vgen_instance);
+    } else {
+        fprintf(stderr, "[VGEN ERROR] Cannot precompute: generator not initialized\n");
+    }
+    pthread_rwlock_unlock(&vgen_lock);
+}
+
+/**
  * Replace both key and vector placeholders for ground truth ingestion.
  * This ingests the reserved-range vectors that serve as ground truth neighbors.
  * 
