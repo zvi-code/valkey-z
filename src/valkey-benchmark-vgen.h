@@ -47,6 +47,17 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
 void vgen_cleanup(void);
 
 /**
+ * Set the actual number of vectors that will be ingested for ground truth.
+ * 
+ * This MUST be called before any queries are executed, typically right before
+ * starting ground truth ingestion. The value should match the -n parameter
+ * used with the vec-ground-truth benchmark.
+ * 
+ * @param num_vectors Number of vectors to ingest for ground truth
+ */
+void vgen_set_ground_truth_size(uint64_t num_vectors);
+
+/**
  * Replace both key and vector placeholders for ground truth ingestion.
  * 
  * This function is used to ingest the reserved-range vectors that will serve

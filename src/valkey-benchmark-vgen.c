@@ -386,6 +386,18 @@ void vgen_cleanup(void) {
 }
 
 /**
+ * Set ground truth dataset size.
+ */
+void vgen_set_ground_truth_size(uint64_t num_vectors) {
+    pthread_rwlock_rdlock(&vgen_lock);
+    if (vgen_instance) {
+        printf("[VGEN] Setting ground truth dataset size to: %lu\n", num_vectors);
+        vg_set_ground_truth_dataset_size(vgen_instance, num_vectors);
+    }
+    pthread_rwlock_unlock(&vgen_lock);
+}
+
+/**
  * Replace both key and vector placeholders for ground truth ingestion.
  * This ingests the reserved-range vectors that serve as ground truth neighbors.
  * 
@@ -581,9 +593,9 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
             /* DEBUG: Print query key and ground truth */
             static _Atomic int query_debug_count = 0;
             int debug_val = atomic_fetch_add(&query_debug_count, 1);
-            if (debug_val < 30) {
+            if (debug_val < 5) {
                 printf("[VGEN QUERY] Query key: %lu, Expected neighbors: ", query.vector.key);
-                for (int j = 0; j < NEIGHBORS_PER_QUERY && j < 5; j++) {
+                for (int j = 0; j < NEIGHBORS_PER_QUERY && j < 20; j++) {
                     printf("%lu ", query.ground_truth[j].key);
                 }
                 printf("...\n");

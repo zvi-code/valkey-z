@@ -3822,6 +3822,10 @@ int main(int argc, char **argv) {
         }
         if (config.use_search) {
             if (test_is_selected("vec-ground-truth")) {
+                /* Set the ground truth dataset size before ingestion */
+                if (config.is_vector_generator) {
+                    vgen_set_ground_truth_size(config.requests);
+                }
                 /* Ingest ground truth vectors from reserved range */
                 len = createVectorInsertCmdTemplate(&cmd);
                 benchmark("VEC-GROUND-TRUTH", cmd, len);

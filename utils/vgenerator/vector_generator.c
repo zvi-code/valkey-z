@@ -192,6 +192,11 @@ static void compute_query_ground_truth(
     vector_generator_t* gen,
     uint32_t query_idx) {
     
+    /* CRITICAL: Validate dependencies before computation */
+    assert(gen != NULL);
+    assert(query_idx < gen->num_query_vectors);
+    assert(gen->query_ground_truth != NULL);
+    
     query_ground_truth_t* gt = &gen->query_ground_truth[query_idx];
     
     pthread_mutex_lock(&gt->compute_mutex);
@@ -201,6 +206,7 @@ static void compute_query_ground_truth(
     }
     
     float* query_vec = zmalloc(gen->dimensions * sizeof(float));
+    assert(query_vec != NULL && "Failed to allocate memory for query vector");
     vg_generate_vector_from_key(gen, gt->query_key, query_vec);
     
     /* Search ALL reserved keys for actual nearest neighbors */
@@ -209,9 +215,52 @@ static void compute_query_ground_truth(
         float distance;
     } candidate_t;
     
-    uint32_t search_size = 10000; /* Search first 10K reserved keys */
+    /* IMPORTANT: search_size must match the number of vectors actually ingested!
+     * Use the ground_truth_dataset_size if set, otherwise fall back to a reasonable default. */
+    uint32_t search_size;
+    
+    if (gen->ground_truth_dataset_size > 0) {
+        /* Use the explicitly set dataset size (set via vg_set_ground_truth_dataset_size) */
+        search_size = (uint32_t)gen->ground_truth_dataset_size;
+        
+        static _Atomic int debug_once = 0;
+        if (atomic_fetch_add(&debug_once, 1) == 0) {
+            printf("[VG] Computing ground truth with dataset_size: %lu\n", gen->ground_truth_dataset_size);
+        }
+    } else {
+        /* CRITICAL ERROR: Ground truth dataset size MUST be set before queries!
+         * This indicates vg_set_ground_truth_dataset_size() was not called properly. */
+        // fprintf(stderr, "FATAL: Ground truth dataset size not set! Call vg_set_ground_truth_dataset_size() before running queries.\n");
+        // fprintf(stderr, "       This will result in incorrect recall measurements.\n");
+        // fflush(stderr);
+        
+        /* Assert in debug builds, but provide fallback in release */
+        // assert(gen->ground_truth_dataset_size > 0 && "Ground truth dataset size MUST be set before computing ground truth!");
+        
+        /* Fallback: Use pinned_threshold (this is a bug if reached) */
+        search_size = (uint32_t)gen->pinned_threshold;
+        
+        static _Atomic int debug_once2 = 0;
+        if (atomic_fetch_add(&debug_once2, 1) == 0) {
+            printf("[VG] WARNING: Using fallback pinned_threshold: %lu (THIS IS A BUG!)\n", gen->pinned_threshold);
+        }
+        
+        /* Cap at RESERVED_KEY_RANGE to avoid going beyond reserved range */
+        if (search_size > RESERVED_KEY_RANGE) {
+            search_size = RESERVED_KEY_RANGE;
+        }
+        
+        /* Minimum of 1K for reasonable ground truth quality */
+        if (search_size < 1000) {
+            search_size = 1000;
+        }
+    }
+    
     candidate_t* candidates = zmalloc(search_size * sizeof(candidate_t));
+    assert(candidates != NULL && "Failed to allocate memory for candidates");
+    
     float* candidate_vec = zmalloc(gen->dimensions * sizeof(float));
+    assert(candidate_vec != NULL && "Failed to allocate memory for candidate vector");
     
     /* Search all reserved keys including key 0 and the query itself */
     for (uint32_t i = 0; i < search_size; i++) {
@@ -298,16 +347,13 @@ vector_generator_t* vg_init(const generator_config_t* config) {
     memcpy(&gen->config, config, sizeof(generator_config_t));
     gen->dimensions = config->dimensions;
     gen->pinned_threshold = config->initial_capacity / 2;
+    gen->ground_truth_dataset_size = MAX_QUERY_VECTORS;  /* Will be set by vg_set_ground_truth_dataset_size */
     
     /* Set up reserved key ranges */
     gen->query_key_start = 0;
     gen->query_key_end = RESERVED_KEY_RANGE;
     gen->general_key_start = RESERVED_KEY_RANGE;
     gen->num_query_vectors = MAX_QUERY_VECTORS;
-    if (gen->num_query_vectors > config->initial_capacity / 100) {
-        gen->num_query_vectors = config->initial_capacity / 100;
-        if (gen->num_query_vectors < 10) gen->num_query_vectors = 10;
-    }
     
     /* Initialize query ground truth */
     gen->query_ground_truth = zcalloc(gen->num_query_vectors * sizeof(query_ground_truth_t));
@@ -317,9 +363,7 @@ vector_generator_t* vg_init(const generator_config_t* config) {
     for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
         /* Use prime spacing (997) to distribute query keys across reserved range */
         gen->query_ground_truth[i].query_key = (i * 997 + 1) % RESERVED_KEY_RANGE;
-        // if (gen->query_ground_truth[i].query_key == 0) {
-        //     gen->query_ground_truth[i].query_key = 1; /* Avoid key 0 */
-        // }
+
         
         for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
             gen->query_ground_truth[i].neighbor_keys[j] = 
@@ -365,11 +409,37 @@ void vg_destroy(vector_generator_t* gen) {
     zfree(gen);
 }
 
+/* Set ground truth dataset size */
+void vg_set_ground_truth_dataset_size(vector_generator_t* gen, uint64_t dataset_size) {
+    assert(gen != NULL && "Generator must not be NULL");
+    assert(dataset_size > 0 && "Dataset size must be > 0");
+    assert(dataset_size <= RESERVED_KEY_RANGE && "Dataset size must fit in reserved range");
+    
+    /* Cap at RESERVED_KEY_RANGE */
+    if (dataset_size > RESERVED_KEY_RANGE) {
+        dataset_size = RESERVED_KEY_RANGE;
+    }
+    
+    gen->ground_truth_dataset_size = dataset_size;
+    
+    /* Invalidate any already-computed ground truth since dataset size changed */
+    if (gen->query_ground_truth) {
+        for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
+            gen->query_ground_truth[i].computed = false;
+        }
+    }
+}
+
 /* Create ingestion iterator */
 vector_iterator_t* vg_get_ingestion_iterator(
     vector_generator_t* gen,
     uint64_t count,
     generation_order_t order) {
+    
+    /* CRITICAL: Validate dependencies */
+    assert(gen != NULL && "Generator must not be NULL");
+    assert(count > 0 && "Iterator count must be > 0");
+    assert(order == GEN_ORDER_RANDOM || order == GEN_ORDER_CENTROID);
     
     vector_iterator_t* iter = zcalloc(1 * sizeof(vector_iterator_t));
     if (!iter) return NULL;
@@ -386,6 +456,11 @@ vector_iterator_t* vg_get_ingestion_iterator(
         return NULL;
     }
     uint64_t next_key_batch = atomic_fetch_add(&gen->allocator.next_key, count);
+    
+    /* Validate we're not overlapping with reserved range */
+    assert(next_key_batch >= gen->general_key_start && 
+           "Ingestion keys must be in general range, not reserved range!");
+    
     /* Generate keys from general range only */
     for (uint64_t i = 0; i < count; i++) {
         iter->key_sequence[i] = next_key_batch + i;
@@ -398,6 +473,10 @@ vector_iterator_t* vg_get_ingestion_iterator(
 
 /* Get next vector */
 bool vg_iterator_next(vector_iterator_t* iter, vector_t* vec) {
+    assert(iter != NULL && "Iterator must not be NULL");
+    assert(vec != NULL && "Output vector must not be NULL");
+    assert(iter->type == ITER_TYPE_INGESTION && "Wrong iterator type for vg_iterator_next");
+    
     if (iter->current >= iter->count) {
         return false;
     }
@@ -405,7 +484,7 @@ bool vg_iterator_next(vector_iterator_t* iter, vector_t* vec) {
     vector_key_t key = iter->key_sequence[iter->current];
     vec->key = key;
     vec->data = zmalloc(iter->generator->dimensions * sizeof(float));
-    if (!vec->data) return false;
+    assert(vec->data != NULL && "Failed to allocate memory for vector data");
     
     vg_generate_vector_from_key(iter->generator, key, vec->data);
     
@@ -417,6 +496,11 @@ bool vg_iterator_next(vector_iterator_t* iter, vector_t* vec) {
 vector_iterator_t* vg_get_query_iterator(
     vector_generator_t* gen,
     uint64_t count) {
+    
+    /* CRITICAL: Validate dependencies */
+    assert(gen != NULL && "Generator must not be NULL");
+    assert(gen->query_ground_truth != NULL && "Query ground truth must be initialized");
+    assert(gen->num_query_vectors > 0 && "Must have query vectors configured");
     
     vector_iterator_t* iter = zcalloc(1 * sizeof(vector_iterator_t));
     if (!iter) return NULL;
@@ -431,27 +515,42 @@ vector_iterator_t* vg_get_query_iterator(
 
 /* The query iterator should ONLY return reserved keys */
 bool vg_iterator_next_query(vector_iterator_t* iter, query_vector_t* query) {
+    assert(iter != NULL && "Iterator must not be NULL");
+    assert(query != NULL && "Output query must not be NULL");
+    assert(iter->type == ITER_TYPE_QUERY && "Wrong iterator type for vg_iterator_next_query");
+    assert(iter->generator != NULL && "Generator must not be NULL");
+    
     if (iter->current >= iter->count) {
         return false;
     }
     
     /* Always use pre-defined queries from reserved range */
     uint32_t query_idx = iter->current % iter->generator->num_query_vectors;
+    assert(query_idx < iter->generator->num_query_vectors && "Query index out of bounds");
     
     /* Compute ground truth if needed */
     compute_query_ground_truth(iter->generator, query_idx);
     
     query_ground_truth_t* gt = &iter->generator->query_ground_truth[query_idx];
+    assert(gt->computed && "Ground truth must be computed at this point");
     
     /* Return query from RESERVED range */
     query->vector.key = gt->query_key;
+    assert(query->vector.key < RESERVED_KEY_RANGE && "Query key must be in reserved range");
+    
     query->vector.data = zmalloc(iter->generator->dimensions * sizeof(float));
+    assert(query->vector.data != NULL && "Failed to allocate memory for query vector");
+    
     vg_generate_vector_from_key(iter->generator, query->vector.key, query->vector.data);
     
     /* Ground truth neighbors are also from RESERVED range */
     for (int i = 0; i < NEIGHBORS_PER_QUERY; i++) {
         query->ground_truth[i].key = gt->neighbor_keys[i];
         query->ground_truth[i].distance = gt->neighbor_distances[i];
+        
+        /* Validate neighbor keys are in correct range */
+        assert(query->ground_truth[i].key < RESERVED_KEY_RANGE && 
+               "Ground truth neighbor keys must be in reserved range");
     }
     
     iter->current++;

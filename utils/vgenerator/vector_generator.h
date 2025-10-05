@@ -100,6 +100,7 @@ typedef struct vector_generator {
     query_ground_truth_t* query_ground_truth;
     uint32_t num_query_vectors;
     atomic_uint_fast32_t query_index;
+    uint64_t ground_truth_dataset_size;  /* Actual number of vectors ingested for ground truth */
 } vector_generator_t;
 
 typedef enum {
@@ -267,6 +268,26 @@ vector_generator_t* vg_init(const generator_config_t* config);
  *                no other threads are accessing the generator before calling.
  */
 void vg_destroy(vector_generator_t* gen);
+
+/**
+ * vg_set_ground_truth_dataset_size - Set the actual number of vectors in ground truth dataset
+ * 
+ * This function must be called BEFORE any queries are executed to ensure ground truth
+ * is computed against the correct dataset size. The ground truth computation will
+ * search only the specified number of vectors (starting from key 0) to find nearest
+ * neighbors.
+ * 
+ * @param gen Vector generator instance
+ * @param dataset_size Number of vectors actually ingested for ground truth
+ *                     Should match the -n parameter used with vec-ground-truth
+ * 
+ * Example:
+ *   // If you ingest 50K vectors for ground truth:
+ *   vg_set_ground_truth_dataset_size(gen, 50000);
+ * 
+ * Thread Safety: Should be called before any concurrent operations
+ */
+void vg_set_ground_truth_dataset_size(vector_generator_t* gen, uint64_t dataset_size);
 
 /**
  * vg_get_ingestion_iterator - Create iterator for vector ingestion
