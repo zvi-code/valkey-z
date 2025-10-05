@@ -1,0 +1,264 @@
+# Index Rebuild Memory Pattern Scenario
+name: index_rebuild_memory_pattern
+description: |
+  Analyzes memory patterns during index rebuild operations.
+  Tests memory usage during index optimization, rebuilding, and maintenance.
+  Evaluates the impact of different index parameters on memory consumption.
+
+dataset: openai-5m
+timeout_seconds: 2700  # 45 minutes
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 60.0
+
+metadata:
+  author: Index Team
+  version: "1.0"
+  tags: [index, rebuild, optimization, memory]
+  requirements:
+    min_memory_gb: 20
+    min_valkey_version: "7.2"
+    index_rebuild_support: true
+
+steps:
+  # Phase 1: Initial index creation
+  - name: initial_index_build
+    type: workload
+    workload: ingest
+    description: "Build initial index with default parameters"
+    parameters:
+      target_vectors: 3000000
+      index_type: HNSW
+      index_params:
+        M: 16
+        ef_construction: 200
+        
+  - name: initial_index_checkpoint
+    type: checkpoint
+    description: "Baseline index memory usage"
+    parameters:
+      collect_full_metrics: true
+      analyze_index_structure: true
+      tag: initial_index
+      
+  # Phase 2: Index parameter optimization
+  - name: index_optimization_m32
+    type: index_operation
+    operation: rebuild
+    description: "Rebuild with M=32 for better recall"
+    parameters:
+      index_params:
+        M: 32
+        ef_construction: 200
+        preserve_data: true
+        
+  - name: m32_checkpoint
+    type: checkpoint
+    description: "Memory usage with M=32"
+    parameters:
+      collect_full_metrics: true
+      analyze_index_structure: true
+      compare_with: initial_index_checkpoint
+      tag: index_m32
+      
+  # Phase 3: Higher ef_construction impact
+  - name: index_optimization_ef400
+    type: index_operation
+    operation: rebuild
+    description: "Rebuild with ef_construction=400"
+    parameters:
+      index_params:
+        M: 32
+        ef_construction: 400
+        preserve_data: true
+        
+  - name: ef400_checkpoint
+    type: checkpoint
+    description: "Memory usage with ef_construction=400"
+    parameters:
+      collect_full_metrics: true
+      analyze_index_structure: true
+      memory_growth_analysis: true
+      tag: index_ef400
+      
+  # Phase 4: Concurrent operations during rebuild
+  - name: rebuild_with_concurrent_ops
+    type: parallel
+    description: "Index rebuild with concurrent operations"
+    steps:
+      - name: background_rebuild
+        type: index_operation
+        operation: rebuild
+        parameters:
+          index_params:
+            M: 24
+            ef_construction: 300
+          background_mode: true
+          
+      - name: concurrent_queries
+        type: workload
+        workload: query
+        duration_seconds: 600
+        parameters:
+          query_k: 10
+          queries_per_second: 100
+          
+      - name: concurrent_ingestion
+        type: workload
+        workload: ingest
+        parameters:
+          target_vectors: 4000000
+        config:
+          n_threads: 4
+          n_clients: 400
+          
+  - name: concurrent_rebuild_checkpoint
+    type: checkpoint
+    description: "Memory during concurrent rebuild"
+    parameters:
+      collect_full_metrics: true
+      analyze_rebuild_efficiency: true
+      tag: concurrent_rebuild
+      
+  # Phase 5: Index compaction and optimization
+  - name: index_compaction
+    type: index_operation
+    operation: compact
+    description: "Compact index to optimize memory usage"
+    parameters:
+      compaction_strategy: aggressive
+      remove_deleted_vectors: true
+      optimize_memory_layout: true
+      
+  - name: compaction_checkpoint
+    type: checkpoint
+    description: "Memory after index compaction"
+    parameters:
+      collect_full_metrics: true
+      analyze_compaction_effectiveness: true
+      tag: post_compaction
+      
+  # Phase 6: Multiple index rebuild cycles
+  - name: rebuild_cycle_1
+    type: index_operation
+    operation: rebuild
+    description: "Rebuild cycle 1: Focus on speed"
+    parameters:
+      index_params:
+        M: 16
+        ef_construction: 100
+      rebuild_strategy: fast
+      
+  - name: rebuild_cycle_1_checkpoint
+    type: checkpoint
+    description: "Memory after rebuild cycle 1"
+    parameters:
+      collect_full_metrics: true
+      tag: rebuild_cycle_1
+      
+  - name: rebuild_cycle_2
+    type: index_operation
+    operation: rebuild
+    description: "Rebuild cycle 2: Focus on quality"
+    parameters:
+      index_params:
+        M: 48
+        ef_construction: 500
+      rebuild_strategy: quality
+      
+  - name: rebuild_cycle_2_checkpoint
+    type: checkpoint
+    description: "Memory after rebuild cycle 2"
+    parameters:
+      collect_full_metrics: true
+      compare_with: rebuild_cycle_1_checkpoint
+      tag: rebuild_cycle_2
+      
+  # Phase 7: Index fragmentation analysis
+  - name: fragmentation_inducing_ops
+    type: workload
+    workload: mixed
+    description: "Operations designed to fragment the index"
+    duration_seconds: 600
+    parameters:
+      ingest_ratio: 0.3
+      query_ratio: 0.4
+      update_ratio: 0.2
+      delete_ratio: 0.1
+      target_ops_per_second: 200
+      
+  - name: fragmentation_checkpoint
+    type: checkpoint
+    description: "Index fragmentation analysis"
+    parameters:
+      collect_full_metrics: true
+      analyze_index_fragmentation: true
+      tag: fragmented_index
+      
+  - name: defragmentation_rebuild
+    type: index_operation
+    operation: rebuild
+    description: "Defragmentation rebuild"
+    parameters:
+      index_params:
+        M: 32
+        ef_construction: 200
+      defragmentation_mode: true
+      
+  - name: defragmentation_checkpoint
+    type: checkpoint
+    description: "Memory after defragmentation"
+    parameters:
+      collect_full_metrics: true
+      analyze_defragmentation_effectiveness: true
+      compare_with: fragmentation_checkpoint
+      tag: defragmented_index
+      
+  # Phase 8: Large-scale rebuild test
+  - name: large_scale_data_load
+    type: workload
+    workload: ingest
+    description: "Load large dataset before rebuild"
+    parameters:
+      target_vectors: 8000000
+      
+  - name: large_scale_rebuild
+    type: index_operation
+    operation: rebuild
+    description: "Large-scale index rebuild"
+    parameters:
+      index_params:
+        M: 32
+        ef_construction: 200
+      memory_limit_mb: 10240  # 10GB limit
+      progress_monitoring: true
+      
+  - name: large_scale_checkpoint
+    type: checkpoint
+    description: "Memory usage during large-scale rebuild"
+    parameters:
+      collect_full_metrics: true
+      analyze_scalability: true
+      tag: large_scale_rebuild
+      
+  # Phase 9: Final optimization and cleanup
+  - name: final_optimization
+    type: index_operation
+    operation: optimize
+    description: "Final index optimization"
+    parameters:
+      optimization_level: max
+      memory_efficiency_mode: true
+      
+  - name: final_rebuild_analysis
+    type: checkpoint
+    description: "Final index rebuild analysis"
+    parameters:
+      collect_full_metrics: true
+      generate_index_report: true
+      analyze_rebuild_patterns: true
+      compare_with: initial_index_checkpoint
+      tag: final_optimized_index

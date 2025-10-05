@@ -1,0 +1,75 @@
+# Example Configuration for Production Environment
+
+# Valkey cluster configuration
+valkey:
+  cluster_mode: true
+  startup_nodes:
+    - host: valkey-node-1.prod.internal
+      port: 7001
+    - host: valkey-node-2.prod.internal
+      port: 7001
+    - host: valkey-node-3.prod.internal
+      port: 7001
+  password: "${VALKEY_PASSWORD}"
+  ssl: true
+  ssl_cert_reqs: required
+  max_connections: 2000
+  max_connections_per_node: 100
+  socket_timeout: 30.0
+  socket_connect_timeout: 30.0
+  health_check_interval: 30
+  retry_on_timeout: true
+
+# Index optimized for production scale
+index:
+  algorithm: HNSW
+  dimensions: 1536
+  distance_metric: L2
+  m: 16
+  ef_construction: 400
+  ef_runtime: 200
+  initial_cap: 100000
+  block_size: 4096
+
+# High-performance workload settings
+workload:
+  n_threads: 16  # Match production server cores
+  n_clients_per_thread: 125
+  batch_size: 2000  # Large batches for throughput
+  operation_timeout: 60.0
+  max_retries: 3
+  retry_delay: 2.0
+  exponential_backoff: true
+  jitter: true
+
+# Production monitoring
+monitoring:
+  collection_enabled: true
+  sampling_interval: 10.0
+  buffer_size: 10000
+  memory_metrics:
+    - rss_mb
+    - active_mb
+    - resident_mb
+    - allocated_mb
+    - fragmentation_ratio
+    - peak_allocated_mb
+    - cache_hit_ratio
+  performance_metrics:
+    - operations_per_second
+    - latency_p50
+    - latency_p95
+    - latency_p99
+    - latency_max
+    - error_rate
+    - connection_count
+  export_format: prometheus
+  prometheus_port: 8080
+  retention_days: 30
+
+# Resource limits for production
+resource_limits:
+  max_memory_usage_mb: 16384  # 16GB limit
+  memory_warning_threshold: 0.8
+  max_cpu_usage_percent: 80
+  disk_warning_threshold_percent: 85

@@ -1,0 +1,196 @@
+# Cluster Memory Distribution Scenario
+name: cluster_memory_distribution
+description: |
+  Tests memory distribution patterns across a Valkey cluster.
+  Analyzes how vector data is distributed and how memory usage varies
+  across different cluster nodes under various workload patterns.
+
+dataset: openai-5m
+timeout_seconds: 3600  # 60 minutes
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 45.0
+  cluster_mode: true
+  cluster_nodes: 3
+
+metadata:
+  author: Cluster Team
+  version: "1.0"
+  tags: [cluster, distribution, scalability, memory]
+  requirements:
+    min_memory_gb_per_node: 8
+    min_cluster_nodes: 3
+    valkey_cluster_mode: true
+
+steps:
+  # Phase 1: Cluster initialization and baseline
+  - name: cluster_bootstrap
+    type: workload
+    workload: ingest
+    description: "Bootstrap cluster with initial data"
+    parameters:
+      target_vectors: 1000000
+      ensure_even_distribution: true
+      
+  - name: cluster_baseline_checkpoint
+    type: checkpoint
+    description: "Baseline memory across all nodes"
+    parameters:
+      collect_full_metrics: true
+      collect_cluster_metrics: true
+      analyze_distribution: true
+      tag: cluster_baseline
+      
+  # Phase 2: Uneven load distribution test
+  - name: skewed_ingestion
+    type: workload
+    workload: ingest
+    description: "Intentionally skewed data ingestion"
+    parameters:
+      target_vectors: 2000000
+      distribution_strategy: skewed
+      target_node_ratio: [0.6, 0.3, 0.1]  # 60%, 30%, 10% distribution
+      
+  - name: skewed_distribution_checkpoint
+    type: checkpoint
+    description: "Memory after skewed distribution"
+    parameters:
+      collect_full_metrics: true
+      collect_cluster_metrics: true
+      analyze_skew: true
+      tag: skewed_distribution
+      
+  # Phase 3: Rebalancing simulation
+  - name: cluster_rebalance_simulation
+    type: workload
+    workload: rebalance
+    description: "Simulate cluster rebalancing"
+    parameters:
+      target_distribution: even
+      rebalance_threshold: 0.2  # 20% imbalance threshold
+      
+  - name: post_rebalance_checkpoint
+    type: checkpoint
+    description: "Memory after rebalancing"
+    parameters:
+      collect_full_metrics: true
+      collect_cluster_metrics: true
+      analyze_rebalance_effectiveness: true
+      tag: post_rebalance
+      
+  # Phase 4: High-throughput cluster test
+  - name: cluster_high_throughput
+    type: parallel
+    description: "High-throughput operations across cluster"
+    steps:
+      - name: distributed_ingestion
+        type: workload
+        workload: ingest
+        parameters:
+          target_vectors: 5000000
+          distribution_strategy: round_robin
+        config:
+          n_threads: 12
+          n_clients: 1500
+          
+      - name: distributed_queries
+        type: workload
+        workload: query
+        duration_seconds: 600
+        parameters:
+          query_k: 10
+          queries_per_second: 500
+          distribute_queries: true
+        config:
+          n_threads: 8
+          n_clients: 800
+          
+  - name: high_throughput_cluster_checkpoint
+    type: checkpoint
+    description: "Cluster memory under high load"
+    parameters:
+      collect_full_metrics: true
+      collect_cluster_metrics: true
+      analyze_node_performance: true
+      tag: cluster_high_load
+      
+  # Phase 5: Node failure simulation
+  - name: node_failure_simulation
+    type: conditional
+    condition:
+      cluster_health: healthy
+      min_nodes_available: 3
+    if_true:
+      - name: simulate_node_failure
+        type: cluster_operation
+        operation: disable_node
+        parameters:
+          node_index: 2  # Disable third node
+          
+      - name: failure_response_test
+        type: workload
+        workload: mixed
+        duration_seconds: 300
+        parameters:
+          ingest_ratio: 0.3
+          query_ratio: 0.7
+          target_ops_per_second: 300
+          
+      - name: node_failure_checkpoint
+        type: checkpoint
+        description: "Memory during node failure"
+        parameters:
+          collect_full_metrics: true
+          collect_cluster_metrics: true
+          analyze_failure_impact: true
+          tag: node_failure
+          
+      - name: restore_node
+        type: cluster_operation
+        operation: restore_node
+        parameters:
+          node_index: 2
+          
+  # Phase 6: Memory pressure across nodes
+  - name: memory_pressure_test
+    type: workload
+    workload: ingest
+    description: "Push each node to memory limits"
+    parameters:
+      target_vectors: 10000000
+      memory_limit_per_node: 6144  # 6GB per node
+      distribution_strategy: even
+      
+  - name: memory_pressure_checkpoint
+    type: checkpoint
+    description: "Memory pressure analysis"
+    parameters:
+      collect_full_metrics: true
+      collect_cluster_metrics: true
+      analyze_memory_pressure: true
+      check_node_limits: true
+      tag: memory_pressure
+      
+  # Phase 7: Cleanup and final analysis
+  - name: cluster_cleanup
+    type: workload
+    workload: shrink
+    description: "Coordinated cluster cleanup"
+    parameters:
+      target_vectors: 2000000
+      cleanup_strategy: coordinated
+      maintain_distribution: true
+      
+  - name: final_cluster_analysis
+    type: checkpoint
+    description: "Final cluster memory analysis"
+    parameters:
+      collect_full_metrics: true
+      collect_cluster_metrics: true
+      generate_cluster_report: true
+      analyze_distribution_efficiency: true
+      compare_with: cluster_baseline
+      tag: final_cluster_state

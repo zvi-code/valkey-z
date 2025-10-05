@@ -1,0 +1,49 @@
+# Grow-Shrink-Grow Scenario
+name: grow_shrink_grow
+description: Test memory patterns with 2x growth, 50% shrink, then 1.5x growth
+
+dataset: openai-5m
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+
+steps:
+  # Initial data load
+  - name: initial_load
+    type: workload
+    workload: ingest
+    parameters:
+      target_vectors: 5000000
+      
+  # Grow 2x
+  - name: grow_2x
+    type: workload
+    workload: ingest
+    parameters:
+      expansion_factor: 2
+      use_expansion: true
+      
+  # Shrink 50%
+  - name: shrink_50_percent
+    type: workload
+    workload: shrink
+    parameters:
+      shrink_ratio: 0.5
+      
+  # Grow 1.5x
+  - name: grow_1_5x
+    type: workload
+    workload: ingest
+    parameters:
+      expansion_factor: 1.5
+      use_expansion: true
+      
+  # Query workload throughout
+  - name: continuous_queries
+    type: workload
+    workload: query
+    parameters:
+      queries_per_second: 1000
+      duration_seconds: 300

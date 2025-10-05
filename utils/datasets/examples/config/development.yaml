@@ -1,0 +1,44 @@
+# Example Configuration for Development Environment
+
+# Valkey connection optimized for local development
+valkey:
+  host: localhost
+  port: 6379
+  db: 1  # Use database 1 to avoid conflicts
+  max_connections: 50
+  password: null
+  ssl: false
+  socket_timeout: 10.0
+  connection_timeout: 5.0
+
+# Index settings for quick testing
+index:
+  algorithm: HNSW
+  dimensions: 1536
+  distance_metric: L2
+  m: 8  # Lower for faster builds
+  ef_construction: 100  # Faster construction
+  ef_runtime: 50  # Faster search
+  initial_cap: 1000
+
+# Workload optimized for development
+workload:
+  n_threads: 2  # Conservative for development
+  n_clients_per_thread: 10
+  batch_size: 100  # Smaller batches
+  operation_timeout: 10.0
+  max_retries: 2
+
+# Monitoring with detailed logging
+monitoring:
+  collection_enabled: true
+  sampling_interval: 1.0  # Frequent sampling for debugging
+  memory_metrics:
+    - rss_mb
+    - allocated_mb
+    - fragmentation_ratio
+  performance_metrics:
+    - operations_per_second
+    - latency_p95
+  export_format: json
+  detailed_logging: true

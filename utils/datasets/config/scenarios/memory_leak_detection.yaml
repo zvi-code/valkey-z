@@ -1,0 +1,247 @@
+# Memory Leak Detection Scenario
+name: memory_leak_detection
+description: |
+  Long-running stress test designed to detect memory leaks in Valkey-Search.
+  Performs repetitive cycles of operations to identify gradual memory growth.
+  Monitors for memory that is not properly released after operations.
+
+dataset: openai-5m
+timeout_seconds: 14400  # 4 hours
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 60.0
+
+metadata:
+  author: QA Team
+  version: "1.0"
+  tags: [memory-leak, long-running, stability, qa]
+  requirements:
+    min_memory_gb: 16
+    min_test_duration_hours: 4
+    continuous_monitoring: true
+
+steps:
+  # Phase 1: Establish stable baseline
+  - name: initial_stable_load
+    type: workload
+    workload: ingest
+    description: "Initial stable load"
+    parameters:
+      target_vectors: 1000000
+      
+  - name: stability_wait
+    type: wait
+    description: "Wait for memory stabilization"
+    parameters:
+      duration_seconds: 300
+      wait_for_memory_stable: true
+      memory_stability_window: 120
+      
+  - name: baseline_checkpoint
+    type: checkpoint
+    description: "Stable baseline measurement"
+    parameters:
+      collect_full_metrics: true
+      force_gc: true
+      tag: stable_baseline
+      
+  # Phase 2: Repeated cycle 1 (30 minutes)
+  - name: cycle_1_ingest
+    type: workload
+    workload: ingest
+    description: "Cycle 1: Additional ingestion"
+    parameters:
+      target_vectors: 2000000
+      
+  - name: cycle_1_queries
+    type: workload
+    workload: query
+    description: "Cycle 1: Heavy query load"
+    duration_seconds: 600
+    parameters:
+      query_k: 10
+      queries_per_second: 200
+      
+  - name: cycle_1_shrink
+    type: workload
+    workload: shrink
+    description: "Cycle 1: Shrink back to baseline"
+    parameters:
+      target_vectors: 1000000
+      
+  - name: cycle_1_stabilization
+    type: wait
+    description: "Cycle 1: Stabilization wait"
+    parameters:
+      duration_seconds: 180
+      wait_for_memory_stable: true
+      
+  - name: cycle_1_checkpoint
+    type: checkpoint
+    description: "Cycle 1: Memory check"
+    parameters:
+      collect_full_metrics: true
+      force_gc: true
+      compare_with: baseline_checkpoint
+      detect_memory_growth: true
+      tag: cycle_1
+      
+  # Phase 3: Repeated cycle 2 (30 minutes)
+  - name: cycle_2_mixed_ops
+    type: workload
+    workload: mixed
+    description: "Cycle 2: Mixed operations"
+    duration_seconds: 1200
+    parameters:
+      ingest_ratio: 0.4
+      query_ratio: 0.5
+      update_ratio: 0.1
+      target_ops_per_second: 500
+      
+  - name: cycle_2_burst_ingest
+    type: workload
+    workload: ingest
+    description: "Cycle 2: Burst ingestion"
+    parameters:
+      target_vectors: 3000000
+    config:
+      n_clients: 2000
+      batch_size: 2000
+      
+  - name: cycle_2_cleanup
+    type: workload
+    workload: shrink
+    description: "Cycle 2: Aggressive cleanup"
+    parameters:
+      target_vectors: 1000000
+      
+  - name: cycle_2_checkpoint
+    type: checkpoint
+    description: "Cycle 2: Memory check"
+    parameters:
+      collect_full_metrics: true
+      force_gc: true
+      compare_with: [baseline_checkpoint, cycle_1_checkpoint]
+      detect_memory_growth: true
+      tag: cycle_2
+      
+  # Phase 4: Repeated cycle 3 with expansion (45 minutes)
+  - name: cycle_3_expansion_ingest
+    type: workload
+    workload: ingest
+    description: "Cycle 3: Expansion ingestion"
+    parameters:
+      target_vectors: 2500000
+      use_expansion: true
+      expansion_factor: 2.0
+      
+  - name: cycle_3_expansion_queries
+    type: workload
+    workload: query
+    description: "Cycle 3: Queries on expanded vectors"
+    duration_seconds: 900
+    parameters:
+      query_k: 15
+      queries_per_second: 150
+      use_expanded_queries: true
+      
+  - name: cycle_3_partial_cleanup
+    type: workload
+    workload: shrink
+    description: "Cycle 3: Partial cleanup"
+    parameters:
+      target_vectors: 1500000
+      removal_strategy: expansion_priority
+      
+  - name: cycle_3_final_cleanup
+    type: workload
+    workload: shrink
+    description: "Cycle 3: Final cleanup"
+    parameters:
+      target_vectors: 1000000
+      
+  - name: cycle_3_checkpoint
+    type: checkpoint
+    description: "Cycle 3: Memory check"
+    parameters:
+      collect_full_metrics: true
+      force_gc: true
+      compare_with: [baseline_checkpoint, cycle_1_checkpoint, cycle_2_checkpoint]
+      detect_memory_growth: true
+      analyze_memory_trends: true
+      tag: cycle_3
+      
+  # Phase 5: Repeated cycle 4 with high concurrency (45 minutes)
+  - name: cycle_4_high_concurrency
+    type: parallel
+    description: "Cycle 4: High concurrency operations"
+    steps:
+      - name: concurrent_ingest
+        type: workload
+        workload: ingest
+        parameters:
+          target_vectors: 2000000
+        config:
+          n_threads: 12
+          n_clients: 1500
+          
+      - name: concurrent_queries
+        type: workload
+        workload: query
+        duration_seconds: 1800
+        parameters:
+          query_k: 10
+          queries_per_second: 300
+        config:
+          n_threads: 8
+          n_clients: 800
+          
+  - name: cycle_4_memory_pressure
+    type: workload
+    workload: ingest
+    description: "Cycle 4: Memory pressure test"
+    parameters:
+      target_vectors: 4000000
+      
+  - name: cycle_4_cleanup
+    type: workload
+    workload: shrink
+    description: "Cycle 4: Complete cleanup"
+    parameters:
+      target_vectors: 1000000
+      
+  - name: cycle_4_checkpoint
+    type: checkpoint
+    description: "Cycle 4: Memory check"
+    parameters:
+      collect_full_metrics: true
+      force_gc: true
+      compare_with: [baseline_checkpoint, cycle_1_checkpoint, cycle_2_checkpoint, cycle_3_checkpoint]
+      detect_memory_growth: true
+      analyze_memory_trends: true
+      tag: cycle_4
+      
+  # Phase 6: Final leak detection analysis
+  - name: final_stabilization
+    type: wait
+    description: "Final stabilization period"
+    parameters:
+      duration_seconds: 600
+      wait_for_memory_stable: true
+      memory_stability_window: 300
+      
+  - name: final_leak_analysis
+    type: checkpoint
+    description: "Comprehensive leak detection analysis"
+    parameters:
+      collect_full_metrics: true
+      force_gc: true
+      detect_memory_leaks: true
+      analyze_memory_trends: true
+      generate_leak_report: true
+      compare_with: stable_baseline
+      statistical_analysis: true
+      tag: final_leak_analysis

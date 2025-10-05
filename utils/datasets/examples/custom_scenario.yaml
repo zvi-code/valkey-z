@@ -1,0 +1,42 @@
+# Example Custom Scenario
+name: custom_test
+description: Example of a custom scenario configuration
+
+dataset: openai-5m
+
+global_config:
+  n_threads: 4
+  n_clients: 500
+  batch_size: 500
+
+steps:
+  # Load initial dataset
+  - name: load_data
+    type: workload
+    workload: ingest
+    parameters:
+      target_vectors: 1000000
+      
+  # Run custom mixed workload
+  - name: mixed_operations
+    type: workload
+    workload: custom_mixed
+    duration_seconds: 600
+    parameters:
+      query_k: 10
+      update_batch_size: 100
+      
+  # Wait for stabilization
+  - name: wait_stabilize
+    type: wait
+    wait_condition:
+      type: duration
+      seconds: 30
+      
+  # Final measurement
+  - name: final_queries
+    type: workload
+    workload: query
+    duration_seconds: 120
+    parameters:
+      queries_per_second: 500

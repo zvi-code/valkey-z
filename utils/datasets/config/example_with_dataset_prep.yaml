@@ -1,0 +1,120 @@
+# Example configuration file for Valkey Search Delete Stress Test with Dataset Preparation
+# This configuration includes all sections including the new S3 and dataset preparation settings
+
+# Valkey connection settings
+valkey:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: null  # Set if auth is required
+  max_connections: 1000
+  socket_timeout: 30.0
+  socket_connect_timeout: 10.0
+
+# Vector index configuration
+index:
+  algorithm: "HNSW"  # HNSW or FLAT
+  m: 16
+  ef_construction: 356
+  ef_runtime: 200
+  distance_metric: "COSINE"  # L2, IP, or COSINE
+  dimensions: 1536
+  initial_cap: 10000
+
+# Workload execution settings
+workload:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 30.0
+  query_k: 10
+
+# Monitoring and metrics collection
+monitoring:
+  sampling_interval: 10.0
+  memory_metrics:
+    - "rss_mb"
+    - "active_mb" 
+    - "resident_mb"
+    - "allocated_mb"
+    - "fragmentation_ratio"
+  export_format: "csv"  # csv, prometheus, or both
+  prometheus_pushgateway: null  # Optional Prometheus Push Gateway URL
+
+# Output and logging settings
+output:
+  csv_path: "output/metrics.csv"
+  summary_path: "output/summary.csv"
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# S3 configuration for dataset storage
+s3:
+  bucket_name: "vss-datasets"
+  region: "us-east-1"
+  
+  # AWS credentials (usually from environment variables or IAM roles)
+  access_key_id: null  # Set from AWS_ACCESS_KEY_ID env var
+  secret_access_key: null  # Set from AWS_SECRET_ACCESS_KEY env var  
+  session_token: null  # Set from AWS_SESSION_TOKEN env var if using temporary credentials
+  
+  # Upload/download performance settings
+  multipart_threshold: 67108864  # 64MB - files larger than this use multipart upload
+  max_concurrency: 10
+  multipart_chunksize: 67108864  # 64MB chunk size for multipart uploads
+  download_threads: 4
+  
+  # Retry settings
+  max_retries: 3
+  retry_delay: 1.0
+
+# Dataset preparation configuration  
+datasets:
+  # Default processing settings
+  default_compression: "zstd"  # none, zstd, or lz4
+  default_block_size: 1000
+  
+  # Valkey connection for RDB generation
+  valkey_host: "localhost"
+  valkey_port: 6379
+  valkey_password: null
+  memory_limit_gb: null  # Optional memory limit for RDB generation
+  batch_size: 1000
+  
+  # Index creation defaults
+  create_index_by_default: true
+  default_index_algorithm: "HNSW"
+  default_distance_metric: "COSINE"
+  default_hnsw_m: 16
+  default_hnsw_ef_construction: 200
+  
+  # Processing limits and timeouts
+  max_vector_dimensions: 4096
+  max_dataset_size_gb: 1000.0
+  processing_timeout_minutes: 480  # 8 hours
+
+# Example scenario configurations
+scenarios:
+  - name: "sift_1m_benchmark"
+    dataset: "sift-128d"
+    description: "zSIFT 1M dataset benchmark with mixed workload"
+    steps:
+      - name: "warm_up"
+        type: "workload"
+        workload:
+          type: "insert"
+          duration: 60
+          rate: 1000
+      - name: "mixed_load"
+        type: "workload" 
+        workload:
+          type: "mixed"
+          duration: 300
+          insert_rate: 500
+          query_rate: 1000
+          delete_rate: 100
+      - name: "query_only"
+        type: "workload"
+        workload:
+          type: "query"
+          duration: 180
+          rate: 2000

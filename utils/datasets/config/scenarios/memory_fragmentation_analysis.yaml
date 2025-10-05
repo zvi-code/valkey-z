@@ -1,0 +1,159 @@
+# Memory Fragmentation Analysis Scenario
+name: memory_fragmentation_analysis
+description: |
+  Advanced memory fragmentation testing with multiple grow-shrink cycles.
+  Tests memory allocation patterns, fragmentation behavior, and cleanup efficiency.
+  Specifically designed to stress test jemalloc behavior under vector workloads.
+
+dataset: openai-5m
+timeout_seconds: 7200  # 2 hours
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 45.0
+
+metadata:
+  author: Performance Team
+  version: "1.0"
+  tags: [memory, fragmentation, stress-test, production]
+  requirements:
+    min_memory_gb: 16
+    min_valkey_version: "7.2"
+    recommended_jemalloc: true
+
+steps:
+  # Phase 1: Baseline establishment
+  - name: baseline_load
+    type: workload
+    workload: ingest
+    description: "Establish baseline memory usage"
+    parameters:
+      target_vectors: 1000000
+      
+  - name: baseline_checkpoint
+    type: checkpoint
+    description: "Capture baseline metrics"
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      tag: baseline
+      
+  # Phase 2: First fragmentation cycle
+  - name: rapid_growth_1
+    type: workload
+    workload: ingest
+    description: "Rapid growth to 5M vectors"
+    parameters:
+      target_vectors: 5000000
+      
+  - name: checkpoint_5m
+    type: checkpoint
+    description: "Checkpoint at 5M vectors"
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      tag: growth_5m
+      
+  - name: aggressive_shrink_1
+    type: workload
+    workload: shrink
+    description: "Aggressive shrink to 500K vectors"
+    parameters:
+      target_vectors: 500000
+      removal_strategy: random
+      
+  - name: post_shrink_checkpoint_1
+    type: checkpoint
+    description: "Post-shrink fragmentation analysis"
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      force_gc: true
+      tag: post_shrink_1
+      
+  # Phase 3: Second fragmentation cycle with different pattern
+  - name: moderate_growth_2
+    type: workload
+    workload: ingest
+    description: "Moderate growth to 3M vectors"
+    parameters:
+      target_vectors: 3000000
+      
+  - name: concurrent_query_load
+    type: workload
+    workload: query
+    description: "Concurrent queries during stability"
+    duration_seconds: 300
+    parameters:
+      query_k: 10
+      queries_per_second: 200
+      
+  - name: checkpoint_3m_concurrent
+    type: checkpoint
+    description: "Checkpoint during concurrent load"
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      tag: concurrent_3m
+      
+  - name: gradual_shrink_2
+    type: workload
+    workload: shrink
+    description: "Gradual shrink to 1M vectors"
+    parameters:
+      target_vectors: 1000000
+      removal_strategy: oldest
+      
+  # Phase 4: Vector expansion impact
+  - name: expansion_growth
+    type: workload
+    workload: ingest
+    description: "Growth using vector expansion"
+    parameters:
+      target_vectors: 4000000
+      use_expansion: true
+      expansion_factor: 2.0
+      
+  - name: expansion_checkpoint
+    type: checkpoint
+    description: "Memory impact of vector expansion"
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      tag: expansion_4m
+      
+  # Phase 5: Final stress cycle
+  - name: maximum_growth
+    type: workload
+    workload: ingest
+    description: "Maximum capacity test"
+    parameters:
+      target_vectors: 10000000
+      
+  - name: peak_memory_checkpoint
+    type: checkpoint
+    description: "Peak memory usage analysis"
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      tag: peak_10m
+      
+  - name: complete_cleanup
+    type: workload
+    workload: shrink
+    description: "Complete data cleanup"
+    parameters:
+      target_vectors: 100000
+      
+  - name: final_fragmentation_analysis
+    type: checkpoint
+    description: "Final fragmentation and cleanup analysis"
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      force_gc: true
+      generate_report: true
+      compare_with: baseline_checkpoint
+      tag: final_cleanup

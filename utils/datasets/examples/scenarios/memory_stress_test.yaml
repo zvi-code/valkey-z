@@ -1,0 +1,177 @@
+# Memory Stress Testing Scenario
+# Tests memory allocation, growth, and cleanup patterns
+
+name: memory_stress_test
+description: |
+  Comprehensive memory stress testing scenario that evaluates:
+  - Memory allocation patterns during data ingestion
+  - Memory growth behavior under load
+  - Memory cleanup and fragmentation after deletions
+  - Long-term memory stability
+
+dataset: openai-1m
+timeout_seconds: 7200  # 2 hours
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 30.0
+
+metadata:
+  purpose: memory_analysis
+  target_environment: production
+  estimated_duration_minutes: 90
+  requirements:
+    min_memory_gb: 8
+    min_valkey_version: "7.0"
+
+steps:
+  # Baseline measurement
+  - name: baseline_checkpoint
+    type: checkpoint
+    description: Capture initial system state
+    parameters:
+      collect_full_metrics: true
+      force_gc: true
+      tag: baseline
+
+  # Phase 1: Initial data load
+  - name: initial_load
+    type: workload
+    workload: ingest
+    description: Load initial dataset to establish baseline
+    parameters:
+      target_vectors: 500000
+      
+  - name: post_load_checkpoint
+    type: checkpoint
+    description: Analyze memory after initial load
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      tag: post_initial_load
+
+  # Phase 2: Gradual growth
+  - name: growth_phase_1
+    type: workload
+    workload: ingest
+    description: First growth phase
+    parameters:
+      target_vectors: 1000000
+      
+  - name: growth_checkpoint_1
+    type: checkpoint
+    description: Memory analysis after first growth
+    parameters:
+      collect_full_metrics: true
+      compare_with: post_load_checkpoint
+      tag: growth_1
+
+  # Phase 3: Mixed workload with continued growth
+  - name: mixed_workload_phase
+    type: workload
+    workload: mixed
+    duration_seconds: 900  # 15 minutes
+    description: Mixed operations during growth
+    parameters:
+      ingest_ratio: 0.4
+      query_ratio: 0.5
+      update_ratio: 0.1
+      query_k: 10
+      
+  - name: mixed_checkpoint
+    type: checkpoint
+    description: Memory state after mixed workload
+    parameters:
+      collect_full_metrics: true
+      analyze_performance: true
+      tag: mixed_workload
+
+  # Phase 4: Heavy load
+  - name: heavy_load_phase
+    type: workload
+    workload: ingest
+    description: Heavy load to stress memory
+    parameters:
+      target_vectors: 2000000
+      
+  - name: heavy_load_checkpoint
+    type: checkpoint
+    description: Peak memory usage analysis
+    parameters:
+      collect_full_metrics: true
+      detect_memory_leaks: true
+      tag: peak_load
+
+  # Phase 5: Data reduction and cleanup
+  - name: shrink_phase_1
+    type: workload
+    workload: shrink
+    description: Remove half the data
+    parameters:
+      target_vectors: 1000000
+      removal_strategy: random
+      
+  - name: shrink_checkpoint_1
+    type: checkpoint
+    description: Memory state after first shrink
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      tag: shrink_1
+
+  # Wait for memory stabilization
+  - name: stabilization_wait
+    type: wait
+    description: Allow memory to stabilize
+    parameters:
+      duration_seconds: 300  # 5 minutes
+      wait_for_memory_stable: true
+      memory_stability_window: 60
+
+  # Phase 6: Further reduction
+  - name: shrink_phase_2
+    type: workload
+    workload: shrink
+    description: Further data reduction
+    parameters:
+      target_vectors: 250000
+      removal_strategy: oldest
+      
+  - name: shrink_checkpoint_2
+    type: checkpoint
+    description: Memory state after major cleanup
+    parameters:
+      collect_full_metrics: true
+      analyze_fragmentation: true
+      compare_with: baseline_checkpoint
+      tag: final_shrink
+
+  # Phase 7: Recovery test
+  - name: recovery_phase
+    type: workload
+    workload: ingest
+    description: Test memory reallocation after cleanup
+    parameters:
+      target_vectors: 1500000
+      
+  - name: recovery_checkpoint
+    type: checkpoint
+    description: Memory state after recovery
+    parameters:
+      collect_full_metrics: true
+      analyze_memory_trends: true
+      tag: recovery
+
+  # Final analysis
+  - name: final_checkpoint
+    type: checkpoint
+    description: Comprehensive final analysis
+    parameters:
+      collect_full_metrics: true
+      generate_report: true
+      detect_memory_leaks: true
+      analyze_fragmentation: true
+      compare_all_checkpoints: true
+      tag: final_analysis

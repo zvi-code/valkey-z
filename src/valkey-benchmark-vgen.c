@@ -527,13 +527,13 @@ void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const si
         /* We need to replace just the 16-byte VGEN_KEY_PLACEHOLDER + 4 byte length */
         char *placeholder = cmd + indices[i];
         
-        /* Write the actual key number into the 16-byte placeholder space */
-        memset(placeholder, 0, 16);  /* Clear placeholder first */
-        memcpy(placeholder, key_buf, key_len < 16 ? key_len : 16);
+        /* Write the actual key number into the 12-byte placeholder space */
+        memset(placeholder, 0, 12);  /* Clear placeholder first */
+        memcpy(placeholder, key_buf, key_len < 12 ? key_len : 12);
         
         /* Write the actual key length in the 4-byte length field */
         uint32_t actual_key_len = (uint32_t)key_len;
-        memcpy(placeholder + 16, &actual_key_len, 4);
+        memcpy(placeholder + 12, &actual_key_len, 4);
     }
     
     (void)key_counter; /* Unused for vgen */

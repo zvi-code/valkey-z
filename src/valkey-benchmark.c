@@ -94,11 +94,12 @@ static long long nstime(void) {
     A replace will use the vector dimension from the index configuration and will 
     override the entire vector with generated vector provided by vgen.
  */
-#define VGEN_KEY_PLACEHOLDER "__v_gen_key_ph__"  // followed by 4 bytes total key length
+#define VGEN_KEY_PLACEHOLDER    "__v_gen_key_ph__"  // followed by 4 bytes total key length
 #define VGEN_VECTOR_PLACEHOLDER "__v_gen_vec_ph__"  // Exactly 16 characters for 2 floats
+#define VGEN_KEY_PLACEHOLDER_INDEX 12
 #define VGEN_VECTOR_PLACEHOLDER_INDEX 13
 
-#define DATASET_KEY_PLACEHOLDER "__d_key_ph____"      // 16 bytes to fit 16-digit ID
+#define DATASET_KEY_PLACEHOLDER    "__d_key_ph__"      // 12 bytes to fit 
 #define DATASET_VECTOR_PLACEHOLDER "__d_vec_ph__"   // 12 bytes
 #define DATASET_KEY_PLACEHOLDER_INDEX 14
 #define DATASET_VECTOR_PLACEHOLDER_INDEX 15
@@ -121,15 +122,24 @@ static long long nstime(void) {
 static const struct {
     const char *name;
     int len;
-} PLACEHOLDERS[PLACEHOLDER_NUM_OF] = {
-    {"__rand_int__", 12}, {"__rand_1st__", 12}, {"__rand_2nd__", 12}, {"__rand_3rd__", 12}, {"__rand_4th__", 12},
-    {"__rand_5th__", 12}, {"__rand_6th__", 12}, {"__rand_7th__", 12}, {"__rand_8th__", 12}, {"__rand_9th__", 12},
-    {CLUSTER_PLACEHOLDER, 5},
-    {VECTOR_PLACEHOLDER, 8},  // Vector placeholder
-    {VGEN_KEY_PLACEHOLDER, 16},
-    {VGEN_VECTOR_PLACEHOLDER, 16},
-    {DATASET_KEY_PLACEHOLDER, 16},
-    {DATASET_VECTOR_PLACEHOLDER, 12},
+} PLACEHOLDERS[] = {
+    // initialize the array in exact positions
+    [0] = {"__rand_int__", 12}, 
+    [1] = {"__rand_1st__", 12}, 
+    [2] = {"__rand_2nd__", 12}, 
+    [3] = {"__rand_3rd__", 12}, 
+    [4] = {"__rand_4th__", 12},
+    [5] = {"__rand_5th__", 12}, 
+    [6] = {"__rand_6th__", 12}, 
+    [7] = {"__rand_7th__", 12}, 
+    [8] = {"__rand_8th__", 12}, 
+    [9] = {"__rand_9th__", 12},
+    [CLUSTER_PLACEHOLDER_INDEX] = {CLUSTER_PLACEHOLDER, 5},
+    [VECTOR_PLACEHOLDER_INDEX] = {VECTOR_PLACEHOLDER, 8},  // Vector placeholder
+    [VGEN_KEY_PLACEHOLDER_INDEX] = {VGEN_KEY_PLACEHOLDER, 16},
+    [VGEN_VECTOR_PLACEHOLDER_INDEX] = {VGEN_VECTOR_PLACEHOLDER, 16},
+    [DATASET_KEY_PLACEHOLDER_INDEX] = {DATASET_KEY_PLACEHOLDER, 12},
+    [DATASET_VECTOR_PLACEHOLDER_INDEX] = {DATASET_VECTOR_PLACEHOLDER, 12},
 };
 
 struct benchmarkThread;
@@ -490,7 +500,7 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
         config.dataset_num_neighbors * sizeof(uint64_t)
     );
     float dummy_query[1];
-    dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx, dummy_query, gt_neighbors);
+    dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx, dummy_query);
 
     /* Extract returned vector IDs from search results */
     int k = config.search.k;
@@ -552,36 +562,21 @@ static int dictSdsKeyCompare(const void *key1, const void *key2);
 static sds createVectorTemplate(uint64_t key_idx) {
     /* Dataset mode - placeholder for entire vector */
     if (config.use_dataset) {
-        float *vector = zmalloc(config.search.vector_dim * sizeof(float));
-
-        /* Mark first 12 bytes with placeholder for identification */
-        memcpy(vector, DATASET_VECTOR_PLACEHOLDER, 12);
+        sds vec = sdsnewlen(NULL, config.search.vector_dim * sizeof(float));
+        vec = sdscatprintf(vec, "%s", PLACEHOLDERS[DATASET_VECTOR_PLACEHOLDER_INDEX].name);
         /* Fill rest with recognizable pattern */
-        memset((uint8_t*)vector + 12, 0xDD,
-               config.search.vector_dim * sizeof(float) - 12);
-
-        sds vector_data = sdsnewlen(vector,
-                                    config.search.vector_dim * sizeof(float));
-        zfree(vector);
-        return vector_data;
+        memset((uint8_t*)vec + PLACEHOLDERS[DATASET_VECTOR_PLACEHOLDER_INDEX].len, 0xDD,
+               config.search.vector_dim * sizeof(float) - PLACEHOLDERS[DATASET_VECTOR_PLACEHOLDER_INDEX].len);
+        return vec;
     }
-
-    // If vector generator is enabled, use VGEN_VECTOR_PLACEHOLDER
+    /* Generated mode - placeholder for entire vector */
     if (config.is_vector_generator) {
-        /* Allocate vector with placeholder for vgen replacement */
-        float *vector = zmalloc(config.search.vector_dim * sizeof(float));
-
-        /* Insert VGEN_VECTOR_PLACEHOLDER at the beginning (16 bytes = 4 floats) */
-        memcpy(vector, VGEN_VECTOR_PLACEHOLDER, 16);
-
-        /* Fill rest with non-zero pattern so strstr works (avoid NULL bytes) */
-        memset(vector + 4, 0xFF, (config.search.vector_dim - 4) * sizeof(float));
-
-        sds vector_data = sdsnewlen(vector, config.search.vector_dim * sizeof(float));
-        zfree(vector);
-
-        assert(sdslen(vector_data) == config.search.vector_dim * sizeof(float));
-        return vector_data;
+        sds vec = sdsnewlen(NULL, config.search.vector_dim * sizeof(float));
+        vec = sdscatprintf(vec, "%s", PLACEHOLDERS[VGEN_VECTOR_PLACEHOLDER_INDEX].name);
+        /* Fill rest with recognizable pattern */
+        memset((uint8_t*)vec + PLACEHOLDERS[VGEN_VECTOR_PLACEHOLDER_INDEX].len, 0xDD,
+               config.search.vector_dim * sizeof(float) - PLACEHOLDERS[VGEN_VECTOR_PLACEHOLDER_INDEX].len);
+        return vec;
     }
     
     // Original implementation for non-vgen mode
@@ -872,7 +867,7 @@ static sds getVectorKey(void) {
             key = sdscatprintf(sdsempty(), "%s", config.search.prefix);
         }
         /* Append placeholder (will be replaced with vector ID) */
-        key = sdscatlen(key, DATASET_KEY_PLACEHOLDER, 16);
+        key = sdscatlen(key, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].name, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
         return key;
     }
 
@@ -886,7 +881,7 @@ static sds getVectorKey(void) {
             /* Standalone mode: prefix + placeholder + length */
             key = sdscatprintf(sdsempty(), "%s", config.search.prefix);
         }
-        key = sdscatlen(key, VGEN_KEY_PLACEHOLDER, 16);
+        key = sdscatlen(key, PLACEHOLDERS[VGEN_KEY_PLACEHOLDER_INDEX].name, PLACEHOLDERS[VGEN_KEY_PLACEHOLDER_INDEX].len-4);
 
         /* Append 4 bytes for length - use non-zero pattern to avoid breaking strstr */
         uint32_t placeholder_len = 0xFFFFFFFF;  /* Will be overwritten by vgen */
@@ -1385,7 +1380,16 @@ static void replacePlaceholderVector(const size_t *indices, const size_t count,
 
 
 /* Main dataset replacement function */
-static uint64_t replacePlaceholderDataset(
+// here we need to update the keys and vectors with data from dataset.
+// we will need to update in place, on the cmd buffer.
+// the indices are tell us the offesets in the cmd buffer to update.
+// the count tells us how many commands there are. This is why we expect keys and vectors to be the same count. in case of insert\overwrite.
+// in case of search, we will only have indices for vectors, and count for vectors.
+// in case of delete, we will only have indices for keys, and count for keys
+// Ideally, there should be no memory allocation here, we just need to copy the data to the appropriate place in the cmd buffer.
+// the dataset api hides all the key association (what key to provide so it will match the vector, because we will need later to use this to calculate recall)
+
+static void replacePlaceholderDataset(
     int thread_id,
     const size_t key_count, const size_t *key_indices,
     _Atomic uint64_t *key_counter,
@@ -1393,107 +1397,73 @@ static uint64_t replacePlaceholderDataset(
     _Atomic uint64_t *vector_counter,
     char *cmd)
 {
-    if (!config.use_dataset) return UINT64_MAX;
+    assert(config.use_dataset);
 
     /* Validate placeholder consistency */
     assert((key_count == vec_count) || (vec_count == 0) || (key_count == 0));
 
     /* INSERT/PREFILL: both key and vector replacement */
     if (key_count > 0 && vec_count > 0) {
-        /* Atomic fetch - no thread conflicts */
-        uint64_t dataset_idx = atomic_fetch_add(
-            &config.dataset_prefill_counter, 1
-        );
-
-        /* Check bounds - no wrapping for insert */
-        if (dataset_idx >= config.dataset_num_vectors) {
-            return UINT64_MAX;  /* Exhausted dataset */
-        }
-
-        uint64_t vector_id;
-        float *vector = zmalloc(config.search.vector_dim * sizeof(float));
-
-        /* O(1) mmap read - thread-safe */
-        if (dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
-                           &vector_id, vector) != 0) {
-            zfree(vector);
-            return UINT64_MAX;
-        }
-
-        /* Replace key placeholder: vec:0000001234567890 */
         for (size_t i = 0; i < key_count; i++) {
-            char *key_ph = cmd + key_indices[i];
-            /* Use memcpy to avoid null terminator issues in binary data */
-            char temp_id[17];
-            snprintf(temp_id, sizeof(temp_id), "%016lu", vector_id);
-            memcpy(key_ph, temp_id, 16);  /* Copy exactly 16 bytes, no null terminator */
-        }
+            uint64_t vector_id;
+            /* Self-check: ensure placeholder is exactly 12 bytes */
+            char *key_write_pos = cmd + key_indices[i];
+            float *vec_write_pos = (float *)(cmd + vec_indices[i]);
+            /* Atomic fetch - no thread conflicts */
+            uint64_t dataset_idx = atomic_fetch_add(
+                &config.dataset_prefill_counter, 1
+            );
+            dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
+                            &vector_id, vec_write_pos);
+            char key_buf[32];
+            int key_len = snprintf(key_buf, sizeof(key_buf), "%lu", vector_id);
 
-        /* Replace vector data (memcpy from mmap) */
-        for (size_t i = 0; i < vec_count; i++) {
-            char *vec_ph = cmd + vec_indices[i];
-            memcpy(vec_ph, vector, config.search.vector_dim * sizeof(float));
-        }
+            /* Clear and write key string to 16-byte placeholder space */
+            memcpy(key_write_pos, key_buf, key_len < 8 ? key_len : 8);
 
-        zfree(vector);
-        return UINT64_MAX;
+            /* Write actual key length to 4-byte length field */
+            uint32_t actual_key_len = (uint32_t)key_len;
+            memcpy(key_write_pos + 8, &actual_key_len, 4);
+
+            static int debug_count = 0;
+            if (debug_count < 5) {
+                printf("DEBUG INSERT: dataset_idx=%lu, vector_id=%lu, key_len=%d, key_buf='%s'\n",
+                    dataset_idx, vector_id, key_len, key_buf);
+                debug_count++;
+            }
+            
+        }
     }
 
-    /* QUERY: only vector, return query_idx for recall */
+    /* SEARCH: only vector replacement */
     if (vec_count > 0 && key_count == 0) {
-        uint64_t query_idx = atomic_fetch_add(
-            &config.dataset_query_counter, 1
-        );
-        query_idx %= config.dataset_num_queries;  /* Wrap for repeated queries */
-
-        float *query_vector = zmalloc(config.search.vector_dim * sizeof(float));
-        uint64_t *neighbors = zmalloc(
-            config.dataset_num_neighbors * sizeof(uint64_t)
-        );
-
-        if (dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx,
-                         query_vector, neighbors) != 0) {
-            zfree(query_vector);
-            zfree(neighbors);
-            return UINT64_MAX;
-        }
-
-        /* Replace vector placeholder */
         for (size_t i = 0; i < vec_count; i++) {
-            char *vec_ph = cmd + vec_indices[i];
-            memcpy(vec_ph, query_vector,
-                   config.search.vector_dim * sizeof(float));
+            /* Self-check: ensure placeholder is exactly 8 bytes */
+            float *vec_write_pos = (float *)(cmd + vec_indices[i]);
+            uint64_t query_idx = atomic_fetch_add(&config.dataset_query_counter, 1);
+            // will fetch neighbors later when response arrives if need to calc recall
+            dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx,
+                         vec_write_pos);
         }
-
-        zfree(query_vector);
-        zfree(neighbors);
-        return query_idx;  /* For recall tracking */
     }
 
     /* DELETE: only key replacement */
     if (key_count > 0 && vec_count == 0) {
-        uint64_t dataset_idx = atomic_fetch_add(
-            &config.dataset_prefill_counter, 1
-        );
-
-        if (dataset_idx >= config.dataset_num_vectors) {
-            return UINT64_MAX;
-        }
-
-        uint64_t vector_id;
-        float dummy;
-        dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx, &vector_id, &dummy);
-
         for (size_t i = 0; i < key_count; i++) {
-            char *key_ph = cmd + key_indices[i];
-            /* Use memcpy to avoid null terminator issues in binary data */
-            char temp_id[17];
-            snprintf(temp_id, sizeof(temp_id), "%016lu", vector_id);
-            memcpy(key_ph, temp_id, 16);  /* Copy exactly 16 bytes, no null terminator */
-        }
-    }
+            /* Self-check: ensure placeholder is exactly 12 bytes */
+            char *key_write_pos = cmd + key_indices[i];
 
-    return UINT64_MAX;
+            uint64_t dataset_idx = atomic_fetch_add(
+            &config.dataset_num_vectors, 1);
+            char key_buf[32];
+            int key_len = snprintf(key_buf, sizeof(key_buf), "%lu", dataset_idx);
+            memcpy(key_write_pos, key_buf, key_len < 8 ? key_len : 8);
+
+            /* Write actual key length to 4-byte length field */
+            uint32_t actual_key_len = (uint32_t)key_len;
+            memcpy(key_write_pos + 8, &actual_key_len, 4);
+        }
+    }        
 }
 
 static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
@@ -1530,34 +1500,36 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
                                    &seq_key[VECTOR_PLACEHOLDER_INDEX]);
         }
         /* Handle vector generator placeholders and store query index */    
-        uint64_t query_idx = replacePlaceholderVectorGenerator(c->thread_id, placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX-1], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
-                &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX-1], 
+        uint64_t query_idx = replacePlaceholderVectorGenerator(c->thread_id, placeholders.count[VGEN_KEY_PLACEHOLDER_INDEX], 
+            placeholders.indices[VGEN_KEY_PLACEHOLDER_INDEX], 
+                &seq_key[VGEN_KEY_PLACEHOLDER_INDEX], 
                 placeholders.count[VGEN_VECTOR_PLACEHOLDER_INDEX], placeholders.indices[VGEN_VECTOR_PLACEHOLDER_INDEX], &seq_key[VGEN_VECTOR_PLACEHOLDER_INDEX], 
                 cmd);
+
+
+        replacePlaceholderDataset(
+            c->thread_id,
+            placeholders.count[DATASET_KEY_PLACEHOLDER_INDEX],
+            placeholders.indices[DATASET_KEY_PLACEHOLDER_INDEX],
+            &seq_key[DATASET_KEY_PLACEHOLDER_INDEX],
+            placeholders.count[DATASET_VECTOR_PLACEHOLDER_INDEX],
+            placeholders.indices[DATASET_VECTOR_PLACEHOLDER_INDEX],
+            &seq_key[DATASET_VECTOR_PLACEHOLDER_INDEX],
+            cmd
+            );                
         /* Enqueue query index for recall tracking (handles pipelining) */
         if (query_idx != UINT64_MAX) {
             c->vgen_query_indices[(c->vgen_query_tail++) % c->vgen_query_capacity] = query_idx;
         }
 
         /* Handle dataset placeholders (AFTER vgen check) */
-        if (config.use_dataset) {
-            uint64_t dataset_query_idx = replacePlaceholderDataset(
-                c->thread_id,
-                placeholders.count[DATASET_KEY_PLACEHOLDER_INDEX],
-                placeholders.indices[DATASET_KEY_PLACEHOLDER_INDEX],
-                &seq_key[DATASET_KEY_PLACEHOLDER_INDEX],
-                placeholders.count[DATASET_VECTOR_PLACEHOLDER_INDEX],
-                placeholders.indices[DATASET_VECTOR_PLACEHOLDER_INDEX],
-                &seq_key[DATASET_VECTOR_PLACEHOLDER_INDEX],
-                cmd
-            );
-
-            /* Enqueue query index for recall tracking */
-            if (dataset_query_idx != UINT64_MAX) {
-                c->vgen_query_indices[(c->vgen_query_tail++) %
-                                      c->vgen_query_capacity] = dataset_query_idx;
-            }
+        static int debug_dataset_call = 0;
+        if (debug_dataset_call < 3) {
+            printf("DEBUG: config.use_dataset=%d, dataset_ctx=%p\n",
+                   config.use_dataset, config.dataset_ctx);
+            debug_dataset_call++;
         }
+
     }
 }
 
@@ -4189,6 +4161,7 @@ int main(int argc, char **argv) {
                 /* Use custom vector benchmark function */
                 len = createVectorInsertCmdTemplate(&cmd);
                 benchmark("VEC-INSERT", cmd, len);
+                zfree(cmd);
             }
 
             if (test_is_selected("vec-query")) {

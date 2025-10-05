@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+
+.git/
+*.egg
+
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Project specific
+*.h5
+*.hdf5
+output/
+logs/
+*.csv
+
+.cloud/
+_test_download/
+build/
+_datasets_downloads/
+_output/
+_archived_old/
+*.log
+*.tmp
+*.bak
+*.cache
+*.db
+*.sqlite3
+*.ipynb_checkpoints
+*.DS_Store

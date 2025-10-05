@@ -1,0 +1,192 @@
+# Production Simulation Scenario
+name: production_simulation
+description: |
+  Realistic production workload simulation with mixed operations.
+  Models real-world usage patterns with varying load intensities.
+  Tests memory behavior under production-like conditions.
+
+dataset: openai-5m
+timeout_seconds: 3600  # 60 minutes
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 30.0
+
+metadata:
+  author: Production Team
+  version: "1.0"
+  tags: [production, realistic, mixed-workload, performance]
+  requirements:
+    min_memory_gb: 12
+    min_valkey_version: "7.2"
+
+steps:
+  # Phase 1: Morning data load simulation
+  - name: morning_bootstrap
+    type: workload
+    workload: ingest
+    description: "Morning data bootstrap"
+    parameters:
+      target_vectors: 1500000
+    config:
+      n_threads: 6
+      n_clients: 800
+      batch_size: 1500
+      
+  - name: morning_checkpoint
+    type: checkpoint
+    description: "Morning load baseline"
+    parameters:
+      collect_full_metrics: true
+      tag: morning_baseline
+      
+  # Phase 2: Business hours - mixed light load
+  - name: business_hours_light
+    type: workload
+    workload: mixed
+    description: "Light business hours load"
+    duration_seconds: 600
+    parameters:
+      ingest_ratio: 0.2
+      query_ratio: 0.7
+      update_ratio: 0.1
+      target_ops_per_second: 200
+      query_k: 10
+    config:
+      n_threads: 4
+      n_clients: 400
+      
+  - name: light_load_checkpoint
+    type: checkpoint
+    description: "Light load memory usage"
+    parameters:
+      collect_full_metrics: true
+      tag: light_load
+      
+  # Phase 3: Peak hours - heavy mixed load
+  - name: peak_hours_heavy
+    type: workload
+    workload: mixed
+    description: "Peak hours heavy load"
+    duration_seconds: 900
+    parameters:
+      ingest_ratio: 0.3
+      query_ratio: 0.6
+      update_ratio: 0.1
+      target_ops_per_second: 800
+      query_k: 10
+    config:
+      n_threads: 12
+      n_clients: 1500
+      batch_size: 1000
+      
+  - name: peak_load_checkpoint
+    type: checkpoint
+    description: "Peak load memory usage"
+    parameters:
+      collect_full_metrics: true
+      analyze_performance: true
+      tag: peak_load
+      
+  # Phase 4: Data growth simulation
+  - name: afternoon_data_growth
+    type: workload
+    workload: ingest
+    description: "Afternoon data accumulation"
+    parameters:
+      target_vectors: 3000000
+    config:
+      n_threads: 8
+      n_clients: 1000
+      batch_size: 2000
+      
+  - name: growth_checkpoint
+    type: checkpoint
+    description: "Post-growth memory state"
+    parameters:
+      collect_full_metrics: true
+      tag: afternoon_growth
+      
+  # Phase 5: Analytics workload simulation
+  - name: analytics_burst
+    type: workload
+    workload: query
+    description: "Analytics burst queries"
+    duration_seconds: 300
+    parameters:
+      query_k: 50  # Larger K for analytics
+      queries_per_second: 100
+      record_latencies: true
+    config:
+      n_threads: 6
+      n_clients: 300
+      
+  - name: analytics_checkpoint
+    type: checkpoint
+    description: "Analytics load memory impact"
+    parameters:
+      collect_full_metrics: true
+      tag: analytics_burst
+      
+  # Phase 6: Evening maintenance simulation
+  - name: maintenance_operations
+    type: parallel
+    description: "Evening maintenance operations"
+    steps:
+      - name: background_optimization
+        type: workload
+        workload: query
+        duration_seconds: 600
+        parameters:
+          query_k: 5
+          queries_per_second: 50
+          
+      - name: data_cleanup
+        type: workload
+        workload: shrink
+        parameters:
+          target_vectors: 2500000
+          removal_strategy: oldest
+          
+  - name: maintenance_checkpoint
+    type: checkpoint
+    description: "Post-maintenance memory state"
+    parameters:
+      collect_full_metrics: true
+      tag: maintenance
+      
+  # Phase 7: Night low-activity period
+  - name: night_low_activity
+    type: workload
+    workload: mixed
+    description: "Night low activity"
+    duration_seconds: 450
+    parameters:
+      ingest_ratio: 0.1
+      query_ratio: 0.8
+      update_ratio: 0.1
+      target_ops_per_second: 50
+      query_k: 5
+    config:
+      n_threads: 2
+      n_clients: 100
+      
+  - name: night_checkpoint
+    type: checkpoint
+    description: "Night activity memory usage"
+    parameters:
+      collect_full_metrics: true
+      tag: night_activity
+      
+  # Phase 8: Final production summary
+  - name: final_production_summary
+    type: checkpoint
+    description: "Production simulation summary"
+    parameters:
+      collect_full_metrics: true
+      generate_performance_report: true
+      analyze_daily_patterns: true
+      compare_with: morning_baseline
+      tag: production_summary

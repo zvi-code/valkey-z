@@ -1,0 +1,41 @@
+# Continuous Growth Scenario
+name: continuous_growth
+description: Test memory patterns with continuous data growth
+
+dataset: openai-5m
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+
+steps:
+  # Initial small load
+  - name: initial_load
+    type: workload
+    workload: ingest
+    parameters:
+      target_vectors: 1000000
+      
+  # Continuous growth phases
+  - name: growth_phase_1
+    type: workload
+    workload: ingest
+    parameters:
+      target_vectors: 2000000
+      
+  - name: checkpoint_1
+    type: checkpoint
+    parameters:
+      collect_full_metrics: true
+      
+  - name: growth_phase_2
+    type: workload
+    workload: ingest
+    parameters:
+      target_vectors: 3000000
+      
+  - name: checkpoint_2
+    type: checkpoint
+    parameters:
+      collect_full_metrics: true

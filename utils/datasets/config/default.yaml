@@ -1,0 +1,34 @@
+# Default configuration for Valkey Search Delete Stress Test
+
+valkey:
+  host: localhost
+  port: 6379
+  db: 0
+  max_connections: 1000
+  
+index:
+  algorithm: HNSW
+  dimensions: 1536
+  distance_metric: L2
+  m: 16
+  ef_construction: 356
+  ef_runtime: 200
+  
+workload:
+  n_threads: 8
+  n_clients_per_thread: 125
+  batch_size: 1000
+  operation_timeout: 30.0
+  
+monitoring:
+  sampling_interval: 10.0
+  memory_metrics:
+    - rss_mb
+    - active_mb
+    - resident_mb
+    - allocated_mb
+    - fragmentation_ratio
+    
+output:
+  csv_path: output/metrics.csv
+  summary_path: output/summary.csv

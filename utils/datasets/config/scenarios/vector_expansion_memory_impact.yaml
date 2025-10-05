@@ -1,0 +1,199 @@
+# Vector Expansion Memory Impact Scenario
+name: vector_expansion_memory_impact
+description: |
+  Comprehensive analysis of memory usage when using vector expansion features.
+  Tests memory efficiency of expand_n datasets and their impact on queries.
+  Measures memory overhead of extended vectors with ||Vn||₂ > NormMax.
+
+dataset: openai-5m
+timeout_seconds: 4800  # 80 minutes
+
+global_config:
+  n_threads: 8
+  n_clients: 1000
+  batch_size: 1000
+  operation_timeout: 45.0
+
+metadata:
+  author: Research Team
+  version: "1.0"
+  tags: [vector-expansion, memory-efficiency, research]
+  requirements:
+    min_memory_gb: 24
+    min_valkey_version: "7.2"
+    openai_dataset_required: true
+
+steps:
+  # Phase 1: Baseline with original vectors
+  - name: original_vectors_load
+    type: workload
+    workload: ingest
+    description: "Load original OpenAI vectors"
+    parameters:
+      target_vectors: 2000000
+      use_expansion: false
+      
+  - name: original_baseline_checkpoint
+    type: checkpoint
+    description: "Baseline memory with original vectors"
+    parameters:
+      collect_full_metrics: true
+      analyze_vector_memory_efficiency: true
+      tag: original_baseline
+      
+  - name: original_query_performance
+    type: workload
+    workload: query
+    description: "Query performance on original vectors"
+    duration_seconds: 180
+    parameters:
+      query_k: 10
+      queries_per_second: 100
+      record_latencies: true
+      calculate_recall: true
+      
+  - name: original_query_checkpoint
+    type: checkpoint
+    description: "Memory during original vector queries"
+    parameters:
+      collect_full_metrics: true
+      tag: original_queries
+      
+  # Phase 2: 2x Vector expansion analysis
+  - name: expansion_2x_load
+    type: workload
+    workload: ingest
+    description: "Load with 2x vector expansion"
+    parameters:
+      target_vectors: 2000000
+      use_expansion: true
+      expansion_factor: 2.0
+      
+  - name: expansion_2x_checkpoint
+    type: checkpoint
+    description: "Memory usage with 2x expansion"
+    parameters:
+      collect_full_metrics: true
+      analyze_expansion_overhead: true
+      compare_with: original_baseline_checkpoint
+      tag: expansion_2x
+      
+  - name: expansion_2x_queries
+    type: workload
+    workload: query
+    description: "Query performance on 2x expanded vectors"
+    duration_seconds: 180
+    parameters:
+      query_k: 10
+      queries_per_second: 100
+      record_latencies: true
+      calculate_recall: true
+      use_expanded_queries: true
+      
+  # Phase 3: 5x Vector expansion analysis
+  - name: expansion_5x_additional
+    type: workload
+    workload: ingest
+    description: "Add 5x expanded vectors"
+    parameters:
+      target_vectors: 4000000  # Additional 2M with 5x expansion
+      use_expansion: true
+      expansion_factor: 5.0
+      
+  - name: expansion_5x_checkpoint
+    type: checkpoint
+    description: "Memory usage with mixed expansions"
+    parameters:
+      collect_full_metrics: true
+      analyze_expansion_overhead: true
+      analyze_memory_distribution: true
+      tag: expansion_mixed
+      
+  - name: mixed_expansion_queries
+    type: workload
+    workload: query
+    description: "Queries on mixed expansion dataset"
+    duration_seconds: 300
+    parameters:
+      query_k: 10
+      queries_per_second: 80
+      record_latencies: true
+      calculate_recall: true
+      use_expanded_queries: true
+      
+  # Phase 4: Extreme expansion testing
+  - name: expansion_10x_load
+    type: workload
+    workload: ingest
+    description: "Load with 10x vector expansion"
+    parameters:
+      target_vectors: 6000000  # Additional 2M with 10x expansion
+      use_expansion: true
+      expansion_factor: 10.0
+      
+  - name: expansion_10x_checkpoint
+    type: checkpoint
+    description: "Memory with extreme expansion"
+    parameters:
+      collect_full_metrics: true
+      analyze_expansion_overhead: true
+      check_memory_efficiency: true
+      tag: expansion_10x
+      
+  # Phase 5: Expansion with concurrent operations
+  - name: concurrent_expansion_ops
+    type: parallel
+    description: "Concurrent expansion operations"
+    steps:
+      - name: background_expansion
+        type: workload
+        workload: ingest
+        parameters:
+          target_vectors: 8000000
+          use_expansion: true
+          expansion_factor: 3.0
+          
+      - name: expansion_queries
+        type: workload
+        workload: query
+        duration_seconds: 400
+        parameters:
+          query_k: 20
+          queries_per_second: 150
+          use_expanded_queries: true
+          
+  - name: concurrent_expansion_checkpoint
+    type: checkpoint
+    description: "Memory during concurrent expansion ops"
+    parameters:
+      collect_full_metrics: true
+      analyze_query_memory_impact: true
+      tag: concurrent_expansion
+      
+  # Phase 6: Cleanup and efficiency analysis
+  - name: selective_expansion_cleanup
+    type: workload
+    workload: shrink
+    description: "Remove high-expansion vectors"
+    parameters:
+      target_vectors: 4000000
+      removal_strategy: expansion_priority
+      prefer_high_expansion: true
+      
+  - name: post_cleanup_checkpoint
+    type: checkpoint
+    description: "Memory after expansion cleanup"
+    parameters:
+      collect_full_metrics: true
+      analyze_cleanup_efficiency: true
+      tag: post_expansion_cleanup
+      
+  - name: final_expansion_analysis
+    type: checkpoint
+    description: "Final expansion memory analysis"
+    parameters:
+      collect_full_metrics: true
+      generate_expansion_report: true
+      analyze_memory_per_expansion_factor: true
+      compare_with: original_baseline_checkpoint
+      tag: final_expansion_analysis
