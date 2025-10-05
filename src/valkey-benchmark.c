@@ -317,6 +317,10 @@ typedef struct _client {
     int vgen_query_head;          /* Head position in query index queue */
     int vgen_query_tail;          /* Tail position in query index queue */
     int vgen_query_capacity;      /* Capacity of query index queue */
+    uint64_t *dataset_query_indices; /* Queue of dataset query indices for recall tracking */
+    int dataset_query_head;           /* Head position in dataset query index queue */
+    int dataset_query_tail;           /* Tail position in dataset query index queue */
+    int dataset_query_capacity;       /* Capacity of dataset query index queue */
     uint64_t paused : 1;
     uint64_t reuse : 1;
 } *client;
@@ -1410,6 +1414,7 @@ static void replacePlaceholderVector(const size_t *indices, const size_t count,
 // the dataset api hides all the key association (what key to provide so it will match the vector, because we will need later to use this to calculate recall)
 
 static void replacePlaceholderDataset(
+    client c,
     int thread_id,
     const size_t key_count, const size_t *key_indices,
     _Atomic uint64_t *key_counter,
@@ -1452,12 +1457,15 @@ static void replacePlaceholderDataset(
     /* SEARCH: only vector replacement */
     if (vec_count > 0 && key_count == 0) {
         for (size_t i = 0; i < vec_count; i++) {
-            /* Self-check: ensure placeholder is exactly 8 bytes */
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
             uint64_t query_idx = atomic_fetch_add(&config.dataset_query_counter, 1);
-            // will fetch neighbors later when response arrives if need to calc recall
-            dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx,
-                         vec_write_pos);
+
+            /* Enqueue query index for recall tracking */
+            if (c && c->dataset_query_indices) {
+                c->dataset_query_indices[(c->dataset_query_tail++) % c->dataset_query_capacity] = query_idx;
+            }
+
+            dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx, vec_write_pos);
         }
     }
 
@@ -1523,6 +1531,7 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
         if (config.use_dataset && (placeholders.count[DATASET_KEY_PLACEHOLDER_INDEX] > 0 ||
                                   placeholders.count[DATASET_VECTOR_PLACEHOLDER_INDEX] > 0)) {
             replacePlaceholderDataset(
+                c,
                 c->thread_id,
                 placeholders.count[DATASET_KEY_PLACEHOLDER_INDEX],
                 placeholders.indices[DATASET_KEY_PLACEHOLDER_INDEX],
@@ -1573,6 +1582,7 @@ static void freeClient(client c) {
     sdsfree(c->obuf);
     zfree(c->stagptr);
     if (c->vgen_query_indices) zfree(c->vgen_query_indices);
+    if (c->dataset_query_indices) zfree(c->dataset_query_indices);
     zfree(c);
     if (config.num_threads) pthread_mutex_lock(&(config.liveclients_mutex));
     config.liveclients--;
@@ -1606,6 +1616,9 @@ static void resetClient(client c) {
     /* Reset query index queue for vector generator */
     c->vgen_query_head = 0;
     c->vgen_query_tail = 0;
+    /* Reset query index queue for dataset */
+    c->dataset_query_head = 0;
+    c->dataset_query_tail = 0;
 }
 
 /* Acquires the specified number of tokens from the token bucket or calculates the wait time if tokens are not available.
@@ -1757,9 +1770,9 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 }
 
                 /* Compute recall if using dataset */
-                if (config.use_dataset && c->vgen_query_head < c->vgen_query_tail) {
-                    uint64_t query_idx = c->vgen_query_indices[
-                        (c->vgen_query_head++) % c->vgen_query_capacity
+                if (config.use_dataset && c->dataset_query_head < c->dataset_query_tail) {
+                    uint64_t query_idx = c->dataset_query_indices[
+                        (c->dataset_query_head++) % c->dataset_query_capacity
                     ];
                     dataset_compute_recall(reply, query_idx);
                 }
@@ -2000,6 +2013,12 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
     c->vgen_query_indices = zcalloc(sizeof(uint64_t) * c->vgen_query_capacity);
     c->vgen_query_head = 0;
     c->vgen_query_tail = 0;
+
+    /* Initialize query index queue for dataset recall tracking */
+    c->dataset_query_capacity = config.pipeline * 2;  /* 2x pipeline for safety */
+    c->dataset_query_indices = zcalloc(sizeof(uint64_t) * c->dataset_query_capacity);
+    c->dataset_query_head = 0;
+    c->dataset_query_tail = 0;
     /* Suppress libvalkey cleanup of unused buffers for max speed. */
     c->context->reader->maxbuf = 0;
 
