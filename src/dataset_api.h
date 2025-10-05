@@ -56,6 +56,7 @@ typedef struct dataset_ctx dataset_ctx_t;
 dataset_ctx_t* dataset_init(const char *dataset_name, dataset_info_t *info);
 int dataset_prefill(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out);
 int dataset_query(dataset_ctx_t *ctx, uint64_t query_index, float *query_vec_out);
+int dataset_get_neighbors(dataset_ctx_t *ctx, uint64_t query_index, uint64_t *neighbors_out);
 int dataset_get_info(dataset_ctx_t *ctx, dataset_info_t *info);
 void dataset_destroy(dataset_ctx_t *ctx);
 

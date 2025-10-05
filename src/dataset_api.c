@@ -168,6 +168,19 @@ int dataset_get_info(dataset_ctx_t *ctx, dataset_info_t *info) {
     return 0;
 }
 
+int dataset_get_neighbors(dataset_ctx_t *ctx, uint64_t query_index, uint64_t *neighbors_out) {
+    if (!ctx || !neighbors_out) return -1;
+    if (query_index >= ctx->header->num_queries) return -1;
+
+    /* Copy ground truth neighbors for this query */
+    int64_t *gt_start = ctx->ground_truth + query_index * ctx->header->num_neighbors;
+    for (uint32_t i = 0; i < ctx->header->num_neighbors; i++) {
+        neighbors_out[i] = (uint64_t)gt_start[i];
+    }
+
+    return 0;
+}
+
 void dataset_destroy(dataset_ctx_t *ctx) {
     if (!ctx) return;
 
