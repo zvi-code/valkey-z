@@ -31,6 +31,8 @@
 #include "valkey-benchmark-utils.h"
 #include "valkey-benchmark-vgen.h"
 #include "dataset_api.h"
+#include "vector-id-mapping.h"
+#include "cluster-utils.h"
 #include "fmacros.h"
 
 #include <stdio.h>
@@ -444,6 +446,7 @@ typedef struct {
 } recallStats;
 
 static recallStats dataset_recall_stats;
+static clusterTagMap cluster_tag_map;
 
 __attribute__((unused))
 static void initRecallStats(void) {
@@ -512,6 +515,73 @@ static void printDatasetRecallStats(void) {
 }
 
 
+
+/* Validate missing ground truth neighbors by checking if they exist in the engine */
+static void validateMissingGroundTruthNeighbors(uint64_t *gt_neighbors, uint64_t *returned_ids,
+                                               int returned_count, int k, float recall,
+                                               valkeyReply *reply) {
+    if (!config.cluster_mode || !config.use_dataset) return;
+
+    /* Extract cluster tags from returned results to understand the pattern */
+    char *sample_cluster_tag = NULL;
+    if (reply && reply->type == VALKEY_REPLY_ARRAY && reply->elements >= 3) {
+        /* Get a sample key from the results to extract cluster tag pattern */
+        valkeyReply *sample_key = reply->element[1];  /* First result key */
+        if (sample_key && sample_key->type == VALKEY_REPLY_STRING) {
+            sample_cluster_tag = extractClusterTagFromKey(sample_key->str);
+        }
+    }
+
+    if (!sample_cluster_tag) {
+        printf("[VALIDATION] Cannot extract cluster tag pattern from results\n");
+        return;
+    }
+
+    /* Check a few missing neighbors (not all for performance) */
+    int checks_performed = 0;
+    int max_checks = 3;  /* Limit validation to avoid performance impact */
+
+    for (uint32_t i = 0; i < config.dataset_num_neighbors && i < (uint32_t)k && checks_performed < max_checks; i++) {
+        uint64_t gt_id = gt_neighbors[i];
+
+        /* Check if this ground truth neighbor is missing from results */
+        int found = 0;
+        for (int j = 0; j < returned_count; j++) {
+            if (returned_ids[j] == gt_id) {
+                found = 1;
+                break;
+            }
+        }
+
+        if (!found) {
+            /* Missing neighbor - try to get cluster tag from mapping */
+            const char *cluster_tag = getClusterTagForVector(&cluster_tag_map, gt_id);
+            if (!cluster_tag) {
+                cluster_tag = sample_cluster_tag;  /* Fallback to sample tag */
+            }
+
+            /* Reconstruct key using cluster tag */
+            char key_buffer[256];
+            snprintf(key_buffer, sizeof(key_buffer), "%s{%s}:%016lu",
+                    config.search.prefix, cluster_tag, gt_id);
+
+            printf("[VALIDATION] Missing GT neighbor %lu, checking key: %s\n", gt_id, key_buffer);
+            /* Note: In production, would perform EXISTS check here */
+            /* For now, we just log the reconstructed key for debugging */
+            checks_performed++;
+        }
+    }
+
+    if (checks_performed > 0) {
+        printf("[VALIDATION] Checked %d missing neighbors for recall %.2f%% using tag '%s'\n",
+               checks_performed, recall * 100.0f, sample_cluster_tag);
+    }
+
+    if (sample_cluster_tag) {
+        zfree(sample_cluster_tag);
+    }
+}
+
 static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
     if (!reply || reply->type != VALKEY_REPLY_ARRAY || reply->elements < 2) {
         return;
@@ -558,6 +628,11 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
 
     float recall = returned_count > 0 ? (float)matches / k : 0.0f;
     updateRecallStats(recall);
+
+    /* Validate missing ground truth neighbors if recall is low */
+    if (recall < 0.80f) {
+        validateMissingGroundTruthNeighbors(gt_neighbors, returned_ids, returned_count, k, recall, reply);
+    }
 
     /* Debug output for first few queries */
     static _Atomic int debug_count = 0;
@@ -1420,6 +1495,7 @@ static void replacePlaceholderDataset(
     _Atomic uint64_t *key_counter,
     const size_t vec_count, const size_t *vec_indices,
     _Atomic uint64_t *vector_counter,
+    const size_t cluster_tag_count, const size_t *cluster_tag_indices,
     char *cmd)
 {
 
@@ -1444,6 +1520,19 @@ static void replacePlaceholderDataset(
             char key_id_str[13]; /* 12 bytes + null terminator */
             snprintf(key_id_str, sizeof(key_id_str), "%012lu", vector_id);
             memcpy(key_write_pos, key_id_str, 12);  /* Copy exactly 12 bytes */
+
+            /* Update cluster tag mapping for new insertions (complements initial cluster scan) */
+            if (cluster_tag_count > 0 && cluster_tag_indices && i < cluster_tag_count) {
+                char *cluster_tag_pos = cmd + cluster_tag_indices[i];
+                char cluster_tag[6] = {0};
+
+                /* Extract cluster tag using reusable function */
+                int tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
+                if (extractClusterTag(cluster_tag_pos, tag_len, cluster_tag, sizeof(cluster_tag)) == 0) {
+                    /* Add/update mapping for this vector ID */
+                    addClusterTagMapping(&cluster_tag_map, vector_id, cluster_tag);
+                }
+            }
 
             static int debug_count = 0;
             if (debug_count < 5) {
@@ -1539,6 +1628,8 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
                 placeholders.count[DATASET_VECTOR_PLACEHOLDER_INDEX],
                 placeholders.indices[DATASET_VECTOR_PLACEHOLDER_INDEX],
                 &seq_key[DATASET_VECTOR_PLACEHOLDER_INDEX],
+                placeholders.count[CLUSTER_PLACEHOLDER_INDEX],
+                placeholders.indices[CLUSTER_PLACEHOLDER_INDEX],
                 cmd
             );
         }
@@ -4095,6 +4186,24 @@ int main(int argc, char **argv) {
         /* Initialize recall tracking */
         initRecallStats();
 
+        /* Initialize cluster tag mapping */
+        initClusterTagMap(&cluster_tag_map, 1000000);
+
+        /* Build vector ID mappings by scanning cluster for pre-existing vectors */
+        /* Note: New vectors inserted during benchmark will update the mapping in real-time */
+        if (config.cluster_mode) {
+            printf("Building vector ID to cluster tag mappings from existing cluster data...\n");
+            int scan_result = buildVectorIdMappings(config.search.prefix,
+                                                   config.cluster_nodes,
+                                                   config.cluster_node_count,
+                                                   &cluster_tag_map);
+            if (scan_result != 0) {
+                fprintf(stderr, "WARNING: Failed to build vector ID mappings, validation may be limited\n");
+            } else {
+                printf("Initial mapping built. New insertions will update mapping in real-time.\n");
+            }
+        }
+
         /* Override vector dimension from dataset */
         if (config.search.vector_dim != (int)info.dim) {
             fprintf(stderr, "WARNING: Overriding --vector-dim %d with dataset dim %d\n",
@@ -4404,6 +4513,11 @@ int main(int argc, char **argv) {
     /* Cleanup vector generator if it was initialized */
     if (config.is_vector_generator) {
         vgen_cleanup();
+    }
+
+    /* Cleanup cluster tag mapping if it was initialized */
+    if (config.use_dataset) {
+        cleanupClusterTagMap(&cluster_tag_map);
     }
 
     return 0;

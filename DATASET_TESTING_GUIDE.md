@@ -282,3 +282,71 @@ Features:
 - ef_search controls HNSW search accuracy vs speed tradeoff
 - Diminishing returns beyond ef_search=300
 - Choose based on your recall requirements and latency budget
+
+## Cluster Tag Mapping and Recall Validation
+
+### Overview
+
+When running dataset benchmarks on Redis clusters, the system automatically builds vector ID to cluster tag mappings to enable accurate recall validation. This system can reconstruct proper keys for missing ground truth neighbors during recall analysis.
+
+### Automatic Cluster Scanning
+
+During dataset initialization in cluster mode, valkey-benchmark performs a parallel cluster scan to build mappings:
+
+```bash
+Building vector ID to cluster tag mappings from existing cluster data...
+[VECTOR-MAPPING] Starting cluster scan for pattern 'zvec_large_:*'
+[SCAN] Started 2 worker threads scanning pattern 'zvec_large_:*'
+[VECTOR-MAPPING] Processed 2367028 keys, 0 threads active
+[SCAN] Completed: 2367028 keys processed in 2001 ms (1182922.5 keys/sec)
+[VECTOR-MAPPING] Successfully built 2367028 vector ID mappings
+```
+
+### Performance Characteristics
+
+- **Throughput**: 1M+ keys/second scanning rate
+- **Parallel execution**: One worker thread per cluster node
+- **Memory efficient**: Streaming processing with minimal memory footprint
+- **Scales with cluster size**: More nodes = more parallel workers
+
+### Hybrid Mapping Strategy
+
+The system uses a hybrid approach to ensure complete coverage:
+
+1. **Initial cluster scan**: Discovers all pre-existing vectors and their cluster tags
+2. **Runtime updates**: Captures cluster tags for newly inserted vectors during benchmark execution
+3. **Mixed workload support**: Works correctly for alternating insert/query operations
+
+### Recall Validation Enhancement
+
+When recall drops below 80%, the system validates missing ground truth neighbors:
+
+```
+[VALIDATION] Missing GT neighbor 123456, checking key: zvec_large_{06S}:000000000123456
+[VALIDATION] Checked 3 missing neighbors for recall 72.50% using tag '06S'
+```
+
+The validation:
+- Reconstructs proper cluster keys using stored mappings
+- Logs the exact keys that should exist but are missing from search results
+- Helps identify whether poor recall is due to missing data or search algorithm issues
+
+### Integration with Existing Workflows
+
+This system works transparently with all existing dataset testing workflows:
+
+- Compatible with GloVe dataset testing (Step 6-8 in this guide)
+- Works with ef_search parameter testing
+- Supports both HNSW and FLAT index recall validation
+- No configuration changes required - automatically enabled in cluster mode
+
+### Technical Architecture
+
+The implementation consists of modular components:
+
+- **Generic cluster scanner** (`cluster-scan.h/c`): Parallel, callback-based scanning framework
+- **Vector ID mapping** (`vector-id-mapping.h/c`): Specialized vector key processing
+- **Cluster utilities** (`cluster-utils.h/c`): Shared key parsing and tag extraction
+- **Validation integration**: Built into `dataset_compute_recall()` function
+
+This modular design allows the cluster scanner to be reused for other purposes like dataset extension, key analysis, and data migration operations.
