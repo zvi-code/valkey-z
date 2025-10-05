@@ -478,9 +478,9 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
     
     /* Generate vectors for reserved range keys */
     for (size_t i = 0; i < key_count; i++) {
-        /* Use sequential keys from reserved range starting at 1 */
+        /* Use sequential keys from reserved range starting at 0 (not 1) to match ground truth */
         uint64_t current_index = atomic_fetch_add(&ground_truth_key_index, 1);
-        vector_key_t key = (current_index % 1000000) + 1; /* Reserved range: 1-1000000 */
+        vector_key_t key = current_index % 1000000; /* Reserved range: 0-999999 */
         
         /* DEBUG: Print ground truth key being generated */
         static _Atomic int gt_debug_count = 0;
@@ -778,10 +778,14 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
     
     /* Extract returned keys from the reply */
     /* Format: [count, key1, fields1, key2, fields2, ...] */
+    /* Note: HNSW includes the query document in results, but ground truth excludes it */
     vector_key_t returned_keys[NEIGHBORS_PER_QUERY];
     int returned_count = 0;
     
-    /* Parse the reply to extract keys (skip element 0 which is the count) */
+    /* Parse the reply to extract keys 
+     * Start from i=1 to get: element[0]=count, element[1]=result1_key (could be query itself), 
+     * element[2]=fields1, element[3]=result2_key, element[4]=fields2, etc.
+     */
     for (size_t i = 1; i < r->elements && returned_count < NEIGHBORS_PER_QUERY; i += 2) {
         if (i >= r->elements) break;
         
@@ -804,22 +808,23 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
     /* Debug output for first 20 queries */
     static _Atomic int debug_count = 0;
     int current_debug = atomic_fetch_add(&debug_count, 1);
-    int should_debug = (current_debug < 20);
+    int should_debug = (current_debug < 5);  /* Show first 5 queries in detail */
     
     if (should_debug) {
         printf("\n[RECALL DEBUG #%d] Query idx=%lu, query_key=%lu\n", 
                current_debug, query_idx, query_key);
+        printf("  Reply elements: %zu, returned_count: %d\n", r->elements, returned_count);
+        
         printf("  Expected neighbors (%d): ", expected_neighbors);
-        for (int j = 0; j < expected_neighbors && j < 5; j++) {
+        for (int j = 0; j < expected_neighbors; j++) {
             printf("%lu ", expected_neighbors_arr[j].key);
         }
-        if (expected_neighbors > 5) printf("...");
         printf("\n");
+        
         printf("  Returned neighbors (%d): ", returned_count);
-        for (int i = 0; i < returned_count && i < 5; i++) {
+        for (int i = 0; i < returned_count; i++) {
             printf("%lu ", returned_keys[i]);
         }
-        if (returned_count > 5) printf("...");
         printf("\n");
     }
     
@@ -827,6 +832,10 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
         for (int j = 0; j < expected_neighbors; j++) {
             if (returned_keys[i] == expected_neighbors_arr[j].key) {
                 matches++;
+                if (should_debug) {
+                    printf("  ✓ Match: returned[%d]=%lu == expected[%d]=%lu\n", 
+                           i, returned_keys[i], j, expected_neighbors_arr[j].key);
+                }
                 break;
             }
         }

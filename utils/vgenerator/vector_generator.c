@@ -212,9 +212,9 @@ static void compute_query_ground_truth(
     candidate_t* candidates = malloc(search_size * sizeof(candidate_t));
     float* candidate_vec = malloc(gen->dimensions * sizeof(float));
     
+    /* Search all reserved keys including key 0 and the query itself */
     for (uint32_t i = 0; i < search_size; i++) {
-        vector_key_t key = i + 1;
-        if (key == gt->query_key) continue; /* Skip self */
+        vector_key_t key = i;  /* Start from 0 to include all keys */
         
         vg_generate_vector_from_key(gen, key, candidate_vec);
         candidates[i].key = key;

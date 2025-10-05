@@ -1396,7 +1396,6 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(fd);
     UNUSED(mask);
-    // TODO[is_vector_generator]: if using vector generater and search command, we need to check recall. Recall is checked with appropriate vgen api.
     /* Calculate latency only for the first read event. This means that the
      * server already sent the reply and we need to parse it. Parsing overhead
      * is not part of the latency, so calculate it only once, here. */
@@ -2034,7 +2033,12 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
         printf("Search background indexing status: before=%lld after=%lld (diff=%+lld)\n",
                search_background_indexing_status, after_search_background_indexing_status, after_search_background_indexing_status - search_background_indexing_status);
     }
-    // TODO[is_vector_generator]:show recall report?
+    
+    /* Show recall statistics if using vector generator */
+    if (config.is_vector_generator) {
+        vgen_print_recall_report();
+    }
+    
     showLatencyReport();
     freeAllClients();
     if (config.threads) freeBenchmarkThreads();
@@ -2055,7 +2059,8 @@ static benchmarkThread *createBenchmarkThread(int index) {
     thread->index = index;
     thread->el = aeCreateEventLoop(1024 * 10);
     thread->paused_clients = listCreate();
-    // TODO[is_vector_generator]: also add recall?
+    /* Note: Recall statistics are aggregated globally and shown in main output,
+     * not per-thread, since recall is computed across all queries. */
     aeCreateTimeEvent(thread->el, 1, showThroughput, (void *)thread, NULL);
     return thread;
 }
