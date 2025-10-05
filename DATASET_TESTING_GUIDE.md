@@ -71,24 +71,28 @@ export HOST="your-cluster-endpoint.com"
 
 ## Step 6: Insert the Full Dataset (Ground Truth Phase)
 
+**CRITICAL**: You must populate the engine with vectors before running ef_search tests.
+
 Clear any existing data and insert all 1.18M vectors:
 
 ```bash
 # Clear the cluster
 ./bin/valkey-cli -h $HOST -c --no-auth-warning FLUSHALL
 
-# Insert entire dataset (takes ~2-3 minutes)
-./bin/valkey-benchmark -h $HOST --cluster --rfr no \
-  --dataset large_dataset.bin \
-  -t vec-ground-truth --search --vector-dim 25 \
-  --search-name large_scale_25 --search-prefix zvec_large_: \
-  -n 1183514 -c 10 --clean
+# Insert entire dataset (takes ~2-3 minutes) - SINGLE LINE COMMAND
+./bin/valkey-benchmark -h $HOST --cluster --rfr no --dataset large_dataset.bin -t vec-ground-truth --search --vector-dim 25 --search-name large_scale_25 --search-prefix zvec_large_: -n 1183514 -c 10 --clean
 ```
+
+**Important Notes:**
+- Use SINGLE LINE commands (no backslash continuations)
+- This step is REQUIRED before running any ef_search tests
+- Takes 2-3 minutes to insert 1.18M vectors
+- Creates both HNSW and FLAT indexes automatically
 
 Expected output:
 - RPS: ~11-15K insertions per second
 - Progress updates every few seconds
-- Final confirmation of 1.18M vectors inserted
+- Final confirmation: "✓ Dataset loaded: 1,183,514 vectors, 10,000 queries, 25 dims, 100 neighbors"
 
 ## Step 7: Verify Dataset Insertion
 
@@ -235,3 +239,46 @@ To test with other datasets:
 - Integrate into CI/CD pipeline for regression testing
 
 This testing framework validates that vector search maintains quality at scale and provides reproducible benchmarks for performance optimization.
+
+## ef_search Parameter Testing
+
+After completing the basic dataset testing, you can analyze how the ef_search parameter affects recall and performance.
+
+### Quick ef_search Demo (30 seconds)
+
+```bash
+cd /home/ubuntu/valkey/build-debug
+../demo_ef_search_simple.sh
+```
+
+Shows:
+- 3 ef_search values (50, 200, 500)
+- Recall percentage for each
+- QPS and key latency metrics (avg, p99)
+
+### Full ef_search Analysis (5-10 minutes)
+
+```bash
+cd /home/ubuntu/valkey/build-debug
+../test_ef_search_working.sh
+```
+
+Features:
+- Tests 8 ef_search values (50, 100, 150, 200, 250, 300, 400, 500)
+- Configurable query count (edit NUM_QUERIES in script)
+- Complete latency breakdown: avg, p50, p95, p99, max
+- Saves results to timestamped CSV file
+- Provides recommendations
+
+### ef_search Results Interpretation
+
+| ef_search | Use Case | Expected Recall | Expected Latency |
+|-----------|----------|----------------|------------------|
+| 50-100    | High throughput | ~70-73% | 1-2ms avg |
+| 150-250   | Balanced workload | ~73-74% | 2-3ms avg |
+| 300-500   | High accuracy | ~74-75% | 3-4ms avg |
+
+**Key Insights:**
+- ef_search controls HNSW search accuracy vs speed tradeoff
+- Diminishing returns beyond ef_search=300
+- Choose based on your recall requirements and latency budget
