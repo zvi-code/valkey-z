@@ -472,23 +472,41 @@ static void updateRecallStats(float recall) {
     pthread_mutex_unlock(&dataset_recall_stats.mutex);
 }
 
-/* Extract vector ID from fully formatted key */
-static uint64_t extract_vector_id_from_key(const char *key, size_t keylen) {
-    const char *id_start = key;
-
-    /* Skip prefix (vec:) */
-    const char *colon = strchr(key, ':');
-    if (colon) {
-        id_start = colon + 1;
-        /* Skip cluster tag {tag}: if present */
-        if (*id_start == '{') {
-            colon = strchr(id_start, ':');
-            if (colon) id_start = colon + 1;
-        }
+static void printDatasetRecallStats(void) {
+    if (!config.use_dataset || dataset_recall_stats.total_queries == 0) {
+        return;
     }
 
-    return strtoull(id_start, NULL, 10);
+    double avg_recall = dataset_recall_stats.sum_recall /
+                       dataset_recall_stats.total_queries;
+
+    printf("\n====== DATASET RECALL STATISTICS ======\n");
+    printf("  Dataset: %s\n", config.dataset_name ? config.dataset_name : "unknown");
+    printf("  Queries evaluated: %lu\n", dataset_recall_stats.total_queries);
+    printf("  \n");
+    printf("  Recall@%d:\n", config.search.k);
+    printf("    Average:  %.2f%%\n", avg_recall * 100.0);
+    printf("    Min:      %.2f%%\n", dataset_recall_stats.min_recall * 100.0);
+    printf("    Max:      %.2f%%\n", dataset_recall_stats.max_recall * 100.0);
+    printf("  \n");
+    printf("  Query distribution:\n");
+    printf("    Perfect recall (100%%): %lu (%.1f%%)\n",
+           dataset_recall_stats.perfect_recalls,
+           (float)dataset_recall_stats.perfect_recalls /
+           dataset_recall_stats.total_queries * 100.0);
+    printf("    Zero recall (0%%):      %lu (%.1f%%)\n",
+           dataset_recall_stats.zero_recalls,
+           (float)dataset_recall_stats.zero_recalls /
+           dataset_recall_stats.total_queries * 100.0);
+    printf("  \n");
+    printf("  Total matches: %lu/%lu (%.2f%%)\n",
+           dataset_recall_stats.total_matches,
+           dataset_recall_stats.total_queries * config.search.k,
+           (float)dataset_recall_stats.total_matches /
+           (dataset_recall_stats.total_queries * config.search.k) * 100.0);
+    printf("==========================================\n");
 }
+
 
 static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
     if (!reply || reply->type != VALKEY_REPLY_ARRAY || reply->elements < 2) {
@@ -499,8 +517,10 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
     uint64_t *gt_neighbors = zmalloc(
         config.dataset_num_neighbors * sizeof(uint64_t)
     );
-    float dummy_query[1];
-    dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx, dummy_query);
+    if (dataset_get_neighbors((dataset_ctx_t*)config.dataset_ctx, query_idx, gt_neighbors) != 0) {
+        zfree(gt_neighbors);
+        return;
+    }
 
     /* Extract returned vector IDs from search results */
     int k = config.search.k;
@@ -511,8 +531,13 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
     for (size_t i = 1; i < reply->elements && returned_count < k; i += 2) {
         valkeyReply *key_reply = reply->element[i];
         if (key_reply->type == VALKEY_REPLY_STRING) {
-            returned_ids[returned_count++] =
-                extract_vector_id_from_key(key_reply->str, key_reply->len);
+            /* Extract vector ID from key format: "prefix:{tag}:000000000000" */
+            const char *key_str = key_reply->str;
+            const char *last_colon = strrchr(key_str, ':');
+            if (last_colon != NULL) {
+                uint64_t vector_id = (uint64_t)atoll(last_colon + 1);
+                returned_ids[returned_count++] = vector_id;
+            }
         }
     }
 
@@ -529,6 +554,24 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
 
     float recall = returned_count > 0 ? (float)matches / k : 0.0f;
     updateRecallStats(recall);
+
+    /* Debug output for first few queries */
+    static _Atomic int debug_count = 0;
+    int current_debug = atomic_fetch_add(&debug_count, 1);
+    if (current_debug < 3) {
+        printf("\n[DATASET RECALL #%d] Query idx=%lu\n", current_debug, query_idx);
+        printf("  Reply elements: %zu, returned_count: %d, k: %d\n",
+               reply->elements, returned_count, k);
+        printf("  Returned IDs: ");
+        for (int i = 0; i < returned_count; i++) {
+            printf("%lu ", returned_ids[i]);
+        }
+        printf("\n  Ground truth: ");
+        for (uint32_t j = 0; j < config.dataset_num_neighbors && j < 10; j++) {
+            printf("%lu ", gt_neighbors[j]);
+        }
+        printf("\n  Matches: %d, Recall: %.2f%%\n", matches, recall * 100.0f);
+    }
 
     zfree(gt_neighbors);
     zfree(returned_ids);
@@ -4030,6 +4073,9 @@ int main(int argc, char **argv) {
         config.dataset_num_queries = info.num_queries;
         config.dataset_num_neighbors = info.num_neighbors;
 
+        /* Initialize recall tracking */
+        initRecallStats();
+
         /* Override vector dimension from dataset */
         if (config.search.vector_dim != (int)info.dim) {
             fprintf(stderr, "WARNING: Overriding --vector-dim %d with dataset dim %d\n",
@@ -4333,6 +4379,9 @@ int main(int argc, char **argv) {
     if (base_vector != NULL) zfree(base_vector);
     resetPlaceholders();
     
+    /* Print dataset recall statistics if dataset mode was used */
+    printDatasetRecallStats();
+
     /* Cleanup vector generator if it was initialized */
     if (config.is_vector_generator) {
         vgen_cleanup();
