@@ -34,7 +34,7 @@ static char vgen_prefix[256] = "";
 
 /* Ground truth storage for recall calculation */
 /* Note: ground_truth_entry_t is defined in vector_generator.h */
-#define MAX_GROUND_TRUTH_ENTRIES 100000
+#define MAX_GROUND_TRUTH_ENTRIES (RESERVED_KEY_RANGE * NEIGHBORS_PER_QUERY)
 typedef struct {
     vector_key_t query_key;
     ground_truth_entry_t neighbors[NEIGHBORS_PER_QUERY];  /* Store top-10 neighbors */
@@ -166,6 +166,8 @@ static int vgen_init_iterator_pool(int num_threads) {
     for (int i = 0; i < pool_size; i++) {
         atomic_init(&iterator_pool->query_in_use[i], 0);
         atomic_init(&iterator_pool->insert_in_use[i], 0);
+        iterator_pool->query_iterators[i] = vg_get_query_iterator(vgen_instance, MAX_DATASET_VECTORS);
+        iterator_pool->insert_iterators[i] = vg_get_ingestion_iterator(vgen_instance, MAX_DATASET_VECTORS, GEN_ORDER_RANDOM);
     }
     
     return 1;
@@ -182,18 +184,10 @@ static int vgen_init_iterator_pool(int num_threads) {
  * If the preferred slot is busy, searches for a free slot.
  */
 static vector_iterator_t* vgen_get_thread_iterator(int thread_id, IteratorType type) {
-    if (!iterator_pool || !vgen_instance) return NULL;
-    
-    #ifdef DEBUG
-    /* Debug assertion: Warn if thread_id exceeds pool size */
-    if (thread_id >= iterator_pool->pool_size) {
-        fprintf(stderr, "WARN: thread_id %d exceeds pool size %d\n", 
-                thread_id, iterator_pool->pool_size);
-    }
-    #endif
-    
+    assert(iterator_pool && vgen_instance);
+    assert(thread_id < iterator_pool->pool_size);
     /* Calculate preferred slot based on thread_id */
-    int slot = (thread_id >= 0) ? thread_id % iterator_pool->pool_size : 0;
+    int slot = thread_id;
     
     vector_iterator_t **pool = (type == ITER_QUERY) 
         ? iterator_pool->query_iterators 
@@ -201,48 +195,18 @@ static vector_iterator_t* vgen_get_thread_iterator(int thread_id, IteratorType t
     _Atomic int *in_use = (type == ITER_QUERY)
         ? iterator_pool->query_in_use
         : iterator_pool->insert_in_use;
-    
-    /* Try to acquire preferred slot atomically */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&in_use[slot], &expected, 1)) {
-        /* Preferred slot is busy, find a free slot */
-        int found = 0;
-        for (int i = 0; i < iterator_pool->pool_size; i++) {
-            expected = 0;
-            if (atomic_compare_exchange_strong(&in_use[i], &expected, 1)) {
-                slot = i;
-                found = 1;
-                break;
-            }
-        }
-        
-        if (!found) {
-            /* All slots busy - this shouldn't happen if pool_size >= num_threads */
-            #ifdef DEBUG
-            fprintf(stderr, "WARN: All iterator slots busy (pool_size=%d, thread_id=%d)\n", 
-                    iterator_pool->pool_size, thread_id);
-            #endif
-            return NULL;
-        }
-    }
-    
     /* Lazy allocation on first use */
-    if (!pool[slot]) {
-        if (type == ITER_QUERY) {
-            pool[slot] = vg_get_query_iterator(vgen_instance, UINT64_MAX);
-        } else {
-            /* For INSERT iterators, use random order generation */
-            pool[slot] = vg_get_ingestion_iterator(vgen_instance, UINT64_MAX, GEN_ORDER_RANDOM);
-        }
-        
-        if (!pool[slot]) {
-            /* Failed to create iterator, release slot */
-            atomic_store(&in_use[slot], 0);
-            fprintf(stderr, "Error: Failed to create iterator (type=%d)\n", type);
-            return NULL;
-        }
+    assert(pool[slot]);
+    /* Try to acquire preferred slot atomically */
+    int expected = 0;    
+    if (!atomic_compare_exchange_strong(&in_use[slot], &expected, 1)) {
+        fprintf(stderr, "Error: Failed to acquire iterator slot (thread_id=%d, slot=%d)\n", 
+                thread_id, slot);
+        fflush(stdout);
+        fflush(stderr);
+        assert(0);
     }
-    
+    /* Successfully acquired slot */       
     return pool[slot];
 }
 
@@ -255,7 +219,7 @@ static vector_iterator_t* vgen_get_thread_iterator(int thread_id, IteratorType t
  * Thread Safety: Uses atomic operations for lock-free release.
  */
 static void vgen_release_thread_iterator(int thread_id, IteratorType type) {
-    if (!iterator_pool) return;
+    assert(iterator_pool && vgen_instance);
     
     /* Calculate slot based on thread_id */
     int slot = (thread_id >= 0) ? thread_id % iterator_pool->pool_size : 0;
@@ -274,7 +238,7 @@ static void vgen_release_thread_iterator(int thread_id, IteratorType type) {
  * Thread Safety: Must be called when no threads are actively using the pools.
  */
 static void vgen_cleanup_iterator_pool(void) {
-    if (!iterator_pool) return;
+    assert(iterator_pool);
     
     /* Destroy query iterators */
     for (int i = 0; i < iterator_pool->pool_size; i++) {
@@ -303,13 +267,10 @@ static void vgen_cleanup_iterator_pool(void) {
 int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
                            uint32_t num_centroids, float radius,
                            float sparsity, uint64_t seed,
-                           int cluster_mode, const char *prefix, int num_threads) {
-    pthread_rwlock_wrlock(&vgen_lock);
-    
+                           int cluster_mode, const char *prefix, int num_threads) {    
     if (vgen_instance != NULL) {
         fprintf(stderr, "Warning: Vector generator already initialized\n");
-        pthread_rwlock_unlock(&vgen_lock);
-        return 0;
+        assert(0);
     }
     
     /* Store configuration values for later use */
@@ -332,23 +293,20 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
     if (vgen_config.dimensions < 4 || vgen_config.dimensions > 2048) {
         fprintf(stderr, "Error: Vector dimensions must be between 4 and 2048 (got %u)\n", 
                 vgen_config.dimensions);
-        pthread_rwlock_unlock(&vgen_lock);
-        return -1;
+        assert(0);
     }
     
     if (vgen_config.sparsity < 0.0f || vgen_config.sparsity > 1.0f) {
         fprintf(stderr, "Error: Sparsity must be between 0.0 and 1.0 (got %.2f)\n", 
                 vgen_config.sparsity);
-        pthread_rwlock_unlock(&vgen_lock);
-        return -1;
+        assert(0);
     }
     
     /* Initialize the vector generator */
     vgen_instance = vg_init(&vgen_config);
     if (vgen_instance == NULL) {
         fprintf(stderr, "Error: Failed to initialize vector generator\n");
-        pthread_rwlock_unlock(&vgen_lock);
-        return -1;
+        assert(0);
     }
     
     /* Initialize iterator pool */
@@ -357,8 +315,7 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
             fprintf(stderr, "Error: Failed to initialize iterator pool\n");
             vg_destroy(vgen_instance);
             vgen_instance = NULL;
-            pthread_rwlock_unlock(&vgen_lock);
-            return -1;
+            assert(0);
         }
     } else {
         /* Default pool size of 8 for single-threaded mode */
@@ -366,8 +323,7 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
             fprintf(stderr, "Error: Failed to initialize iterator pool\n");
             vg_destroy(vgen_instance);
             vgen_instance = NULL;
-            pthread_rwlock_unlock(&vgen_lock);
-            return -1;
+            assert(0);
         }
     }
     
@@ -379,9 +335,7 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
         fprintf(stderr, "Error: Failed to allocate ground truth storage\n");
         vgen_cleanup_iterator_pool();
         vg_destroy(vgen_instance);
-        vgen_instance = NULL;
-        pthread_rwlock_unlock(&vgen_lock);
-        return -1;
+        assert(0);
     }
     
     /* Initialize recall tracker */
@@ -395,8 +349,6 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
     printf("  Radius: %.2f\n", vgen_config.radius);
     printf("  Sparsity: %.2f\n", vgen_config.sparsity);
     printf("  Seed: %lu\n", vgen_config.seed);
-    
-    pthread_rwlock_unlock(&vgen_lock);
     return 0;
 }
 
@@ -416,7 +368,7 @@ void vgen_cleanup(void) {
     
     /* Cleanup ground truth storage */
     if (ground_truth.entries) {
-        free(ground_truth.entries);
+        zfree(ground_truth.entries);
         ground_truth.entries = NULL;
         atomic_store(&ground_truth.count, 0);
         ground_truth.capacity = 0;
@@ -450,14 +402,14 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
                                             const size_t *vec_indices, const size_t vec_count,
                                             char *cmd, uint64_t *key_counter,
                                             uint64_t *vector_counter) {
-    if (!vgen_is_initialized()) return;
+    assert(iterator_pool && vgen_instance);
     if (key_count == 0 && vec_count == 0) return;
     
     /* Should have matching counts */
     if (key_count != vec_count) {
         fprintf(stderr, "Warning: key_count (%zu) != vec_count (%zu) in ground truth ingestion\n",
                 key_count, vec_count);
-        return;
+        assert(key_count == vec_count);
     }
     
     /* For ground truth, we need to iterate over ALL possible neighbor keys from reserved range.
@@ -480,12 +432,12 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
     for (size_t i = 0; i < key_count; i++) {
         /* Use sequential keys from reserved range starting at 0 (not 1) to match ground truth */
         uint64_t current_index = atomic_fetch_add(&ground_truth_key_index, 1);
-        vector_key_t key = current_index % 1000000; /* Reserved range: 0-999999 */
+        vector_key_t key = current_index; 
         
         /* DEBUG: Print ground truth key being generated */
         static _Atomic int gt_debug_count = 0;
         int current_debug_count = atomic_fetch_add(&gt_debug_count, 1);
-        if (current_debug_count < 10) {
+        if (current_debug_count < 20) {
             printf("[VGEN GROUND_TRUTH] Ingesting reserved key: %lu (iteration %d)\n", key, current_debug_count);
         }
         
@@ -507,11 +459,11 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
             char *vec_placeholder = cmd + vec_indices[i];
             
             /* Generate vector from the reserved key (thread-safe) */
-            float *vector_data = malloc(dims * sizeof(float));
+            float *vector_data = zmalloc(dims * sizeof(float));
             if (vector_data) {
                 vg_generate_vector_from_key(vgen_instance, key, vector_data);
                 memcpy(vec_placeholder, vector_data, dims * sizeof(float));
-                free(vector_data);
+                zfree(vector_data);
             }
         }
     }
@@ -532,10 +484,9 @@ void vgen_replace_ground_truth_placeholder(int thread_id, const size_t *key_indi
  */
 void vgen_replace_key_placeholder(int thread_id, const size_t *indices, const size_t count,
                                    char *cmd, uint64_t *key_counter) {
-    if (!vgen_is_initialized() || count == 0) return;
-    
+    assert(vgen_is_initialized() && count > 0);
     /* Use a simple atomic counter for deletion keys (lock-free) */
-    static _Atomic uint64_t deletion_key_counter = 1000001;  /* Start after reserved range */
+    static _Atomic uint64_t deletion_key_counter = 1000000;  /* Start after reserved range */
     
     /* Get keys and replace placeholders */
     for (size_t i = 0; i < count; i++) {
@@ -582,7 +533,7 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
     vector_iterator_t *iter = vgen_get_thread_iterator(thread_id, ITER_QUERY);
     if (iter == NULL) {
         fprintf(stderr, "Error: Failed to get query iterator for thread %d\n", thread_id);
-        return UINT64_MAX;
+        assert(0);
     }
     
     uint64_t query_idx = UINT64_MAX;
@@ -598,12 +549,20 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
         /* Access thread-local iterator (no lock needed) */
         int success = vg_iterator_next_query(iter, &query);
         if (!success) {
+            fprintf(stderr, "Error: Failed to get query vector (thread_id=%d)\n", thread_id);
+            fflush(stderr);
+            fflush(stdout);
+            assert(0);
             /* Iterator exhausted, reset it to cycle through queries again */
             iter->current = 0;
             success = vg_iterator_next_query(iter, &query);
         }
         
         if (!success) {
+            fprintf(stderr, "Error: No query vectors available after reset (thread_id=%d)\n", thread_id);
+            fflush(stderr);
+            fflush(stdout);
+            assert(0);
             /* Still no vectors available - skip */
             continue;
         }
@@ -638,7 +597,7 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
     }
     
     /* Free the allocated vector data (allocated by vg_iterator_next_query) */
-    free(query.vector.data);
+    zfree(query.vector.data);
     query.vector.data = NULL;
 }    /* Release iterator back to pool (lock-free using atomics) */
     vgen_release_thread_iterator(thread_id, ITER_QUERY);
@@ -663,21 +622,16 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
                                               const size_t *vec_indices, const size_t vec_count,
                                               char *cmd, uint64_t *key_counter,
                                               uint64_t *vector_counter) {
-    if (!vgen_is_initialized()) return;
-    if (key_count == 0 && vec_count == 0) return;
+    assert(vgen_is_initialized() && !(key_count == 0 && vec_count == 0));
     
     /* Should have matching counts for ingestion */
-    if (key_count != vec_count) {
-        fprintf(stderr, "Warning: key_count (%zu) != vec_count (%zu) in ingestion\n",
-                key_count, vec_count);
-        return;
-    }
+    assert(key_count == vec_count);
     
     /* Get ingestion iterator from pool (lock-free using atomics) */
     vector_iterator_t *iter = vgen_get_thread_iterator(thread_id, ITER_INSERT);
     if (iter == NULL) {
         fprintf(stderr, "Error: Failed to get ingestion iterator for thread %d\n", thread_id);
-        return;
+        assert(0);
     }
     
     /* Get dimensions (read-only after init, no lock needed) */
@@ -693,6 +647,10 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
             /* Iterator exhausted, reset it */
             iter->current = 0;
             if (!vg_iterator_next(iter, &vec)) {
+                fprintf(stderr, "Error: No vectors available after reset (thread_id=%d)\n", thread_id);
+                fflush(stderr);
+                fflush(stdout);
+                assert(0);
                 /* Still no vectors available - skip */
                 continue;
             }
@@ -706,7 +664,7 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
             
             /* DEBUG: Print key being generated for ingestion */
             static int debug_count = 0;
-            if (debug_count < 10) {
+            if (debug_count < 20) {
                 printf("[VGEN INGESTION] Generated key: %lu (iteration %d)\n", vec.key, debug_count);
                 debug_count++;
             }
@@ -747,12 +705,18 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
     
     /* FT.SEARCH returns an array: [total_count, key1, fields1, key2, fields2, ...] */
     if (r->type != VALKEY_REPLY_ARRAY || r->elements < 1) {
-        return;
+        fprintf(stderr, "Error: Invalid reply format (query_idx=%lu)\n", query_idx);
+        fflush(stderr);
+        fflush(stdout);
+        assert(0);
     }
     
     /* Skip if no valid query index */
     if (query_idx == UINT64_MAX) {
-        return;
+        fprintf(stderr, "Error: Invalid query index (query_idx=%lu)\n", query_idx);
+        fflush(stderr);
+        fflush(stdout);
+        assert(0);
     }
     
     /* Copy ground truth data while holding lock (minimize lock time) */
@@ -773,7 +737,11 @@ void vgen_compute_recall(uint64_t query_idx, void *reply) {
     }
     
     if (expected_neighbors == 0) {
-        return;  /* No neighbors to compare */
+        fprintf(stderr, "Error: No ground truth neighbors for query_idx=%lu (query_idx=%lu)\n", 
+                query_idx, query_idx);
+        fflush(stderr);
+        fflush(stdout);
+        assert(0);
     }
     
     /* Extract returned keys from the reply */
@@ -951,9 +919,7 @@ void vgen_get_stats(uint64_t *total_generated, uint64_t *total_deleted,
  * Check if vector generator is initialized.
  */
 int vgen_is_initialized(void) {
-    pthread_rwlock_rdlock(&vgen_lock);
     int initialized = (vgen_instance != NULL);
-    pthread_rwlock_unlock(&vgen_lock);
     return initialized;
 }
 

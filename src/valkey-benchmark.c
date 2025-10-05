@@ -49,6 +49,7 @@
 #include "ae.h"
 #include "util.h"
 #include <valkey/valkey.h>
+#include <valkey/alloc.h>
 #ifdef USE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -381,6 +382,7 @@ static struct config {
     atomic_uint_fast64_t last_time_ns;
     uint64_t time_per_token;
     uint64_t time_per_burst;
+    int clean;
     int use_search; /* Use search indexes */
     int is_vector_generator; /* Use vector generator for vector placeholders */
     searchIndex search;
@@ -504,7 +506,7 @@ static void printSearchResults(valkeyReply *reply) {
     
     /* Print ground truth if using vector generator */
     if (config.is_vector_generator) {     
-        uint64_t neighbors[10]; /* NEIGHBORS_PER_QUERY = 10 */
+        uint64_t neighbors[100]; /* NEIGHBORS_PER_QUERY = 10 */
         uint64_t query_idx = vgen_get_current_query_index();
         int neighbor_count = vgen_get_ground_truth(query_idx, neighbors);
         
@@ -667,7 +669,7 @@ valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_
                 fprintf(stderr, "Node %s replied with error:\n%s\n", ip_or_path, reply->str);
             freeReplyObject(reply);
             valkeyFree(ctx);
-            exit(1);
+            assert(0);
         }
         freeReplyObject(reply);
         return ctx;
@@ -908,7 +910,9 @@ static void createDefaultSearchIndexes(void) {
         fprintf(stderr, "No existing connection context, creating new\n");
         ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
         if (ctx == NULL) {
-            exit(1);
+            fprintf(stderr, "Failed to connect to server for index creation\n");
+            fflush(stderr);
+            assert(0);
         }
     }
     int num_indexes = 1;
@@ -935,6 +939,21 @@ static void createDefaultSearchIndexes(void) {
                 if (strcmp(list_reply->element[j]->str, indexes_to_create[i]) == 0) {
                     index_exists = 1;
                     getFullInfo(indexes_to_create[i], config.cluster_node_count, config.cluster_nodes, config.ct);
+                    if (config.clean) {
+                        printf("Dropping existing index '%s' as --clean is specified\n", indexes_to_create[i]);
+                        valkeyReply *drop_reply = valkeyCommand(ctx, "FT.DROPINDEX %s", indexes_to_create[i]);
+                        if (drop_reply && (drop_reply->type == VALKEY_REPLY_STRING || drop_reply->type == VALKEY_REPLY_STATUS)) {
+                            printf("Index dropped successfully\n");
+                            index_exists = 0; /* Will recreate */
+                        } else {
+                            fprintf(stderr, "Failed to drop index: %s\n", 
+                                    drop_reply ? drop_reply->str : "Unknown error");
+                            assert(0);
+                        }
+                        if (drop_reply) freeReplyObject(drop_reply);
+                    } else {
+                        printf("Index '%s' already exists, skipping creation.\n", indexes_to_create[i]);
+                    }
                 }            
             }
             printf("\n");
@@ -981,7 +1000,7 @@ static void createDefaultSearchIndexes(void) {
                 printf("Index '%s' already exists, ignoring error.\n", indexes_to_create[i]);
             } else {
                 fprintf(stderr, "Error creating index: %s\n", reply ? reply->str : "Unknown error");
-                exit(1);
+                assert(0);
             }
         }
         if (reply) freeReplyObject(reply);    
@@ -1135,7 +1154,14 @@ static uint64_t replacePlaceholderVectorGenerator(int thread_id, const size_t ke
     }
     
     // both key and vector replacement
-    if (key_count > 0 && vec_count > 0) {        
+    if (key_count > 0 && vec_count > 0) {
+        static int debug_count = 0;
+        if (debug_count < 5) {
+            printf("DEBUG: replacePlaceholderVectorGenerator - title='%s', key_count=%zu, vec_count=%zu, thread_id=%d\n",
+                   config.title ? config.title : "NULL", key_count, vec_count, thread_id);
+            debug_count++;
+        }
+        
         if (config.title && strcmp(config.title, "VEC-GROUND-TRUTH") == 0) {
             /* Ground truth ingestion - use reserved range keys */
             vgen_replace_ground_truth_placeholder(thread_id, key_indices, key_count,
@@ -1403,17 +1429,17 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     if (valkeyBufferRead(c->context) != VALKEY_OK) {
         fprintf(stderr, "Error: %s\n", c->context->errstr);
-        exit(1);
+        assert(0);
     } else {
         while (c->pending) {
             if (valkeyGetReply(c->context, &reply) != VALKEY_OK) {
                 fprintf(stderr, "Error: %s\n", c->context->errstr);
-                exit(1);
+                assert(0);
             }
             if (reply != NULL) {
                 if (reply == (void *)VALKEY_REPLY_ERROR) {
                     fprintf(stderr, "Unexpected error reply, exiting...\n");
-                    exit(1);
+                    assert(0);
                 }
                 valkeyReply *r = reply;
                 if (r->type == VALKEY_REPLY_ERROR) {
@@ -1436,14 +1462,19 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                                     c->cluster_node->port, r->str);
                         }
                         if (do_wait) sleep(1);
-                        if (fetch_slots && !fetchClusterSlotsConfiguration(c)) exit(1);
+                        if (fetch_slots && !fetchClusterSlotsConfiguration(c)) {
+                            fprintf(stderr, "Error from server %s:%d: %s\n", c->cluster_node->ip,
+                                    c->cluster_node->port, r->str);
+                            fflush(stderr);
+                            assert(0);
+                        }
                     } else {
                         if (c->cluster_node) {
                             fprintf(stderr, "Error from server %s:%d: %s\n", c->cluster_node->ip, c->cluster_node->port,
                                     r->str);
                         } else
                             fprintf(stderr, "Error from server: %s\n", r->str);
-                        exit(1);
+                        assert(0);
                     }
                 }
                 if (config.print_search_results) {
@@ -1675,13 +1706,13 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
             fprintf(stderr, "%s:%d: %s\n", ip, port, c->context->errstr);
         else
             fprintf(stderr, "%s: %s\n", ip, c->context->errstr);
-        exit(1);
+        assert(0);
     }
     if (config.tls == 1) {
         const char *err = NULL;
         if (cliSecureConnection(c->context, config.sslconfig, &err) == VALKEY_ERR && err) {
             fprintf(stderr, "Could not negotiate a TLS connection: %s\n", err);
-            exit(1);
+            assert(0);
         }
     }
     c->paused = 0;
@@ -1711,7 +1742,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         else
             len = valkeyFormatCommand(&buf, "AUTH %s %s", config.conn_info.user, config.conn_info.auth);
         c->obuf = sdscatlen(c->obuf, buf, len);
-        free(buf);
+        zfree(buf);
         c->prefix_pending++;
     }
 
@@ -1719,7 +1750,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         char *buf = NULL;
         int len = valkeyFormatCommand(&buf, "CLIENT TRACKING on");
         c->obuf = sdscatlen(c->obuf, buf, len);
-        free(buf);
+        zfree(buf);
         c->prefix_pending++;
     }
 
@@ -1737,7 +1768,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         char *buf = NULL;
         int len = valkeyFormatCommand(&buf, "HELLO 3");
         c->obuf = sdscatlen(c->obuf, buf, len);
-        free(buf);
+        zfree(buf);
         c->prefix_pending++;
     }
 
@@ -1746,7 +1777,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         int len;
         len = valkeyFormatCommand(&buf, "READONLY");
         c->obuf = sdscatlen(c->obuf, buf, len);
-        free(buf);
+        zfree(buf);
         c->prefix_pending++;
     }
 
@@ -1947,7 +1978,7 @@ static void startBenchmarkThreads(void) {
         benchmarkThread *t = config.threads[i];
         if (pthread_create(&(t->thread), NULL, execBenchmarkThread, t)) {
             fprintf(stderr, "FATAL: Failed to start thread %d.\n", i);
-            exit(1);
+            assert(0);
         }
     }
     for (i = 0; i < config.num_threads; i++) pthread_join(config.threads[i]->thread, NULL);
@@ -2194,7 +2225,10 @@ static int fetchCMDNodesConfiguration(void) {
         fprintf(stderr, "No existing connection context, creating new\n");
         ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
         if (ctx == NULL) {
-            exit(1);
+            fprintf(stderr, "ERROR: Failed to create connection context to %s:%d\n",
+                    config.conn_info.hostip, config.conn_info.hostport);
+            fflush(stderr);
+            assert(0);
         }
     }
 
@@ -2264,7 +2298,7 @@ static int setupElastiCacheCMDNodes(void) {
                 reader_hostname, config.conn_info.hostport);
         sdsfree(reader_hostname);
         if (test_ctx) valkeyFree(test_ctx);
-        exit(1);
+        assert(0);
         // return 1; /* Non-fatal - primary still usable */
     }
     valkeyFree(test_ctx);
@@ -2276,7 +2310,7 @@ static int setupElastiCacheCMDNodes(void) {
                 reader_hostname, config.conn_info.hostport);
         sdsfree(reader_hostname);
         fflush(stderr);
-        exit(1);
+        assert(0);
         // sdsfree(reader_hostname);
         // return 0;
     }
@@ -2449,7 +2483,7 @@ static int fetchClusterConfiguration(void) {
         fprintf(stderr, "No existing connection context, creating new\n");
         ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
         if (ctx == NULL) {
-            exit(1);
+            assert(0);
         }
     }
 
@@ -2691,7 +2725,7 @@ static void parseTagDistributions(const char *distributions_str) {
         char *colon = strchr(token, ':');
         if (!colon) {
             fprintf(stderr, "Invalid tag distribution format: %s\n", token);
-            exit(1);
+            assert(0);
         }
         
         *colon = '\0';
@@ -2816,7 +2850,7 @@ int parseOptions(int argc, char **argv) {
             config.conn_info.hostport = atoi(argv[++i]);
             if (config.conn_info.hostport < 0 || config.conn_info.hostport > 65535) {
                 fprintf(stderr, "Invalid server port.\n");
-                exit(1);
+                assert(0);
             }
         } else if (!strcmp(argv[i], "-s")) {
             if (lastarg) goto invalid;
@@ -2838,7 +2872,7 @@ int parseOptions(int argc, char **argv) {
             parseUri(argv[++i], "valkey-benchmark", &config.conn_info, &config.tls);
             if (config.conn_info.hostport < 0 || config.conn_info.hostport > 65535) {
                 fprintf(stderr, "Invalid server port.\n");
-                exit(1);
+                assert(0);
             }
             config.input_dbnumstr = sdsfromlonglong(config.conn_info.input_dbnum);
         } else if (!strcmp(argv[i], "-3")) {
@@ -2925,6 +2959,8 @@ int parseOptions(int argc, char **argv) {
                 goto invalid;
         } else if (!strcmp(argv[i], "--enable-tracking")) {
             config.enable_tracking = 1;
+        } else if (!strcmp(argv[i], "--clean")) {
+            config.clean = 1;
         } else if (!strcmp(argv[i], "--search")) {
             // TODO: Is search is enabled and -t is not, do not run default tests
             config.use_search = 1;
@@ -3047,7 +3083,7 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--rdma")) {
             if (valkeyInitiateRdma() != VALKEY_OK) {
                 fprintf(stderr, "Failed to initialize RDMA support from libvalkey\n");
-                exit(1);
+                assert(0);
             }
             config.ct = VALKEY_CONN_RDMA;
 #endif
@@ -3302,7 +3338,7 @@ long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clie
 
     if (liveclients == 0 && requests_finished != config.requests) {
         fprintf(stderr, "All clients disconnected... aborting.\n");
-        exit(1);
+        assert(0);
     }
     if (config.num_threads && requests_finished >= config.requests) {
         aeStop(eventLoop);
@@ -3385,12 +3421,34 @@ int test_is_selected(const char *name) {
     return strstr(config.tests, buf) != NULL;
 }
 
+/* Wrapper for zcalloc to match libvalkey's calloc signature */
+static void *zcalloc_wrapper(size_t nmemb, size_t size) {
+    /* Overflow check */
+    if (nmemb != 0 && size > SIZE_MAX / nmemb) {
+        return NULL;
+    }
+    return zcalloc(nmemb * size);
+}
+
 int main(int argc, char **argv) {
     int i;
     char *data, *cmd, *tag;
     int len;
     memset(&config, 0, sizeof(config));
     client c;
+
+    /* Configure libvalkey to use jemalloc allocators.
+     * This ensures valkeyFormatCommand() and other libvalkey functions
+     * allocate memory using the same allocator (jemalloc) that we use
+     * for zfree(), preventing allocator mismatch crashes. */
+    valkeyAllocFuncs jemalloc_fns = {
+        .mallocFn = zmalloc,
+        .callocFn = zcalloc_wrapper,
+        .reallocFn = zrealloc,
+        .strdupFn = zstrdup,
+        .freeFn = zfree,
+    };
+    valkeySetAllocators(&jemalloc_fns);
 
     srandom(time(NULL) ^ getpid());
     init_genrand64(ustime() ^ getpid());
@@ -3418,6 +3476,7 @@ int main(int argc, char **argv) {
     config.conn_info.hostip = sdsnew("127.0.0.1");
     config.conn_info.hostport = 6379;
     config.use_search = 0;
+    config.clean = 0;
     config.print_search_results = 0;
     config.search_debug = 1;
     config.is_vector_generator = 0;
@@ -3465,7 +3524,7 @@ int main(int argc, char **argv) {
     
     if (config.mptcp && (config.ct != VALKEY_CONN_TCP)) {
         fprintf(stderr, "Options --mptcp is only supported by TCP\n");
-        exit(1);
+        assert(0);
     }
 
     if (config.cluster_mode) {
@@ -3485,11 +3544,11 @@ int main(int argc, char **argv) {
                         "%s\n",
                         config.conn_info.hostip);
             }
-            exit(1);
+            assert(0);
         }
         if (config.cluster_node_count == 0) {
             fprintf(stderr, "Invalid cluster: %d node(s).\n", config.cluster_node_count);
-            exit(1);
+            assert(0);
         }       
     } else if (isElastiCacheEndpoint(config.conn_info.hostip)) {
         int res = setupElastiCacheCMDNodes();
@@ -3498,7 +3557,7 @@ int main(int argc, char **argv) {
                     "Failed to fetch cluster configuration from "
                     "%s:%d\n",
                     config.conn_info.hostip, config.conn_info.hostport);
-            exit(1);
+            assert(0);
         }
     } else {
         int res = fetchCMDNodesConfiguration();
@@ -3514,7 +3573,7 @@ int main(int argc, char **argv) {
                         "%s\n",
                         config.conn_info.hostip);
             }
-            exit(1);
+            assert(0);
         }
         // config.server_config = getServerConfig(config.ct, config.conn_info.hostip, config.conn_info.hostport);
         // if (config.server_config == NULL) {
@@ -3535,7 +3594,7 @@ int main(int argc, char **argv) {
         clusterNode *node = config.cluster_nodes[i];
         if (!node) {
             fprintf(stderr, "Invalid cluster node #%d\n", i);
-            exit(1);
+            assert(0);
         }
         const char *node_type = (node->replicate == NULL ? "Primary" : "Replica");
         printf("Node %d(%s): ", i, node_type);
@@ -3628,7 +3687,7 @@ int main(int argc, char **argv) {
                     cmd_seq = sdscatlen(cmd_seq, cmd, len);
                 }
                 seq_len += repeat;
-                free(cmd);
+                zfree(cmd);
                 start = i + 1;
                 repeat = 1;
             } else if (strstr(sds_args[i], "__data__")) {
@@ -3680,20 +3739,18 @@ int main(int argc, char **argv) {
         last_info_all = getInfoCluster(config.cluster_node_count, config.cluster_nodes, config.ct);
 
         /* Initialize vector generator if enabled */
-        if (config.is_vector_generator) {
-            printf("Initializing vector generator for search workload...\n");
-            if (vgen_init_from_config(config.search.vector_dim,
-                                       config.vgen_initial_capacity,
-                                       config.vgen_num_centroids,
-                                       config.vgen_radius,
-                                       config.vgen_sparsity,
-                                       config.vgen_seed,
-                                       config.cluster_mode,
-                                       config.search.prefix,
-                                       config.num_threads) != 0) {
-                fprintf(stderr, "Failed to initialize vector generator\n");
-                exit(1);
-            }
+        printf("Initializing vector generator for search workload...\n");
+        if (vgen_init_from_config(config.search.vector_dim,
+                                    config.vgen_initial_capacity,
+                                    config.vgen_num_centroids,
+                                    config.vgen_radius,
+                                    config.vgen_sparsity,
+                                    config.vgen_seed,
+                                    config.cluster_mode,
+                                    config.search.prefix,
+                                    config.num_threads) != 0) {
+            fprintf(stderr, "Failed to initialize vector generator\n");
+            assert(0);
         }
     }
     /* Run default benchmark suite. */
@@ -3707,68 +3764,68 @@ int main(int argc, char **argv) {
         if (test_is_selected("ping_mbulk") || test_is_selected("ping")) {
             len = valkeyFormatCommand(&cmd, "PING");
             benchmark("PING_MBULK", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("set")) {
             len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
             benchmark("SET", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("get")) {
             len = valkeyFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
             benchmark("GET", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("incr")) {
             len = valkeyFormatCommand(&cmd, "INCR counter%s:__rand_int__", tag);
             benchmark("INCR", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("lpush")) {
             len = valkeyFormatCommand(&cmd, "LPUSH mylist%s %s", tag, data);
             benchmark("LPUSH", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("rpush")) {
             len = valkeyFormatCommand(&cmd, "RPUSH mylist%s %s", tag, data);
             benchmark("RPUSH", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("lpop")) {
             len = valkeyFormatCommand(&cmd, "LPOP mylist%s", tag);
             benchmark("LPOP", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("rpop")) {
             len = valkeyFormatCommand(&cmd, "RPOP mylist%s", tag);
             benchmark("RPOP", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("sadd")) {
             len = valkeyFormatCommand(&cmd, "SADD myset%s element:__rand_int__", tag);
             benchmark("SADD", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("hset")) {
             len = valkeyFormatCommand(&cmd, "HSET myhash%s element:__rand_int__ %s", tag, data);
             benchmark("HSET", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
         if (config.use_search) {
             if (test_is_selected("vec-ground-truth")) {
                 /* Ingest ground truth vectors from reserved range */
                 len = createVectorInsertCmdTemplate(&cmd);
                 benchmark("VEC-GROUND-TRUTH", cmd, len);
-                free(cmd);
+                zfree(cmd);
             }
             
             if (test_is_selected("vec-insert")) {
@@ -3781,7 +3838,7 @@ int main(int argc, char **argv) {
                 /* Use custom vector benchmark function */
                 len = createSearchCmdTemplate(&cmd);
                 benchmark("VEC-QUERY", cmd, len);
-                free(cmd);
+                zfree(cmd);
             }
 
             if (test_is_selected("vec-del")) {
@@ -3789,7 +3846,7 @@ int main(int argc, char **argv) {
                 len = valkeyFormatCommand(&cmd, "DEL %s", key);
                 benchmark("VEC-DEL", cmd, len);
                 sdsfree(key);
-                free(cmd);
+                zfree(cmd);
             }
 
             if (test_is_selected("vec-scan-q-verify")) {
@@ -3816,13 +3873,13 @@ int main(int argc, char **argv) {
                 
                 benchmark("VEC-SCAN-Q-VERIFY", cmd, len);
                 sdsfree(key);
-                free(cmd);
+                zfree(cmd);
             }
         }
         if (test_is_selected("spop")) {
             len = valkeyFormatCommand(&cmd, "SPOP myset%s", tag);
             benchmark("SPOP", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("zadd")) {
@@ -3830,44 +3887,44 @@ int main(int argc, char **argv) {
             if (config.replace_placeholders) score = "__rand_int__";
             len = valkeyFormatCommand(&cmd, "ZADD myzset%s %s element:__rand_1st__", tag, score);
             benchmark("ZADD", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("zpopmin")) {
             len = valkeyFormatCommand(&cmd, "ZPOPMIN myzset%s", tag);
             benchmark("ZPOPMIN", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_100") || test_is_selected("lrange_300") ||
             test_is_selected("lrange_500") || test_is_selected("lrange_600")) {
             len = valkeyFormatCommand(&cmd, "LPUSH mylist%s %s", tag, data);
             benchmark("LPUSH (needed to benchmark LRANGE)", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_100")) {
             len = valkeyFormatCommand(&cmd, "LRANGE mylist%s 0 99", tag);
             benchmark("LRANGE_100 (first 100 elements)", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_300")) {
             len = valkeyFormatCommand(&cmd, "LRANGE mylist%s 0 299", tag);
             benchmark("LRANGE_300 (first 300 elements)", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_500")) {
             len = valkeyFormatCommand(&cmd, "LRANGE mylist%s 0 499", tag);
             benchmark("LRANGE_500 (first 500 elements)", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("lrange") || test_is_selected("lrange_600")) {
             len = valkeyFormatCommand(&cmd, "LRANGE mylist%s 0 599", tag);
             benchmark("LRANGE_600 (first 600 elements)", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("mset")) {
@@ -3880,7 +3937,7 @@ int main(int argc, char **argv) {
             }
             len = valkeyFormatCommandArgv(&cmd, 21, cmd_argv, NULL);
             benchmark("MSET (10 keys)", cmd, len);
-            free(cmd);
+            zfree(cmd);
             sdsfree(key_placeholder);
         }
 
@@ -3893,14 +3950,14 @@ int main(int argc, char **argv) {
             }
             len = valkeyFormatCommandArgv(&cmd, 11, cmd_argv, NULL);
             benchmark("MGET (10 keys)", cmd, len);
-            free(cmd);
+            zfree(cmd);
             sdsfree(key_placeholder);
         }
 
         if (test_is_selected("xadd")) {
             len = valkeyFormatCommand(&cmd, "XADD mystream%s * myfield %s", tag, data);
             benchmark("XADD", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("function_load")) {
@@ -3908,7 +3965,7 @@ int main(int argc, char **argv) {
             len = valkeyFormatCommand(&cmd, "function load replace %s", script);
             benchmark("FUNCTION LOAD", cmd, len);
             zfree(script);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (test_is_selected("fcall")) {
@@ -3919,7 +3976,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "No existing connection context, creating new\n");
                 ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
                 if (ctx == NULL) {
-                    exit(1);
+                    assert(0);
                 }
             }
 
@@ -3943,12 +4000,12 @@ int main(int argc, char **argv) {
             }
             len = valkeyFormatCommandArgv(&cmd, config.num_keys_in_fcall + 3, (const char **)cmd_argv, NULL);
             for (int i = 0; i < config.num_keys_in_fcall + 3; i++) {
-                free(cmd_argv[i]);
+                zfree(cmd_argv[i]);
             }
             zfree(cmd_argv);
 
             benchmark("FCALL", cmd, len);
-            free(cmd);
+            zfree(cmd);
         }
 
         if (!config.csv) printf("\n");

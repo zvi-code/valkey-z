@@ -156,14 +156,20 @@ Ingested: 10,000 vectors in ~1.25 seconds
 
 **ACTUAL OUTPUT:**
 ```
+Summary:
+  throughput summary: 400.00 requests per second
+  latency summary (msec):
+          avg       min       p50       p95       p99       max
+        0.739     0.608     0.727     0.903     0.935     1.007
+
 ====== Recall Statistics ======
   Total queries: 100
-  Average recall: 90.00%
-  Min recall: 90.00%
-  Max recall: 90.00%
+  Average recall: 100.00%
+  Min recall: 100.00%
+  Max recall: 100.00%
 ```
 
-**Analysis:** HIGH recall (90%) achieved! Consistent across all 100 queries.
+**Analysis:** HIGH recall (100%) achieved! Consistent across all 100 queries.
 
 ### Test 2.4: Debug Analysis (First 5 Queries)
 ```bash

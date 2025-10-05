@@ -7,7 +7,8 @@
 #include <math.h>
 #include <assert.h>
 #include <errno.h>
-
+// use zmalloc for Valkey memory tracking
+#include "../../src/zmalloc.h"
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -66,15 +67,15 @@ static inline float uint32_to_float(uint32_t val) {
 
 /* Bloom filter operations */
 static bloom_filter_t* bloom_create(size_t expected_items) {
-    bloom_filter_t *bloom = malloc(sizeof(bloom_filter_t));
+    bloom_filter_t *bloom = zmalloc(sizeof(bloom_filter_t));
     if (!bloom) return NULL;
     
     bloom->size_bytes = (expected_items * 10) / 8;
     if (bloom->size_bytes < 1024) bloom->size_bytes = 1024;
     
-    bloom->bits = calloc(bloom->size_bytes, 1);
+    bloom->bits = zcalloc(bloom->size_bytes * 1);
     if (!bloom->bits) {
-        free(bloom);
+        zfree(bloom);
         return NULL;
     }
     
@@ -84,8 +85,8 @@ static bloom_filter_t* bloom_create(size_t expected_items) {
 
 static void bloom_destroy(bloom_filter_t *bloom) {
     if (bloom) {
-        free(bloom->bits);
-        free(bloom);
+        zfree(bloom->bits);
+        zfree(bloom);
     }
 }
 
@@ -199,7 +200,7 @@ static void compute_query_ground_truth(
         return;
     }
     
-    float* query_vec = malloc(gen->dimensions * sizeof(float));
+    float* query_vec = zmalloc(gen->dimensions * sizeof(float));
     vg_generate_vector_from_key(gen, gt->query_key, query_vec);
     
     /* Search ALL reserved keys for actual nearest neighbors */
@@ -209,8 +210,8 @@ static void compute_query_ground_truth(
     } candidate_t;
     
     uint32_t search_size = 10000; /* Search first 10K reserved keys */
-    candidate_t* candidates = malloc(search_size * sizeof(candidate_t));
-    float* candidate_vec = malloc(gen->dimensions * sizeof(float));
+    candidate_t* candidates = zmalloc(search_size * sizeof(candidate_t));
+    float* candidate_vec = zmalloc(gen->dimensions * sizeof(float));
     
     /* Search all reserved keys including key 0 and the query itself */
     for (uint32_t i = 0; i < search_size; i++) {
@@ -243,9 +244,9 @@ static void compute_query_ground_truth(
     gt->computed = true;
     pthread_mutex_unlock(&gt->compute_mutex);
     
-    free(query_vec);
-    free(candidate_vec);
-    free(candidates);
+    zfree(query_vec);
+    zfree(candidate_vec);
+    zfree(candidates);
 }
 
 /* Compute ground truth for a specific query - alternative implementation */
@@ -267,10 +268,10 @@ static void compute_query_ground_truth2(
         return;
     }
     
-    float* query_vec = malloc(gen->dimensions * sizeof(float));
+    float* query_vec = zmalloc(gen->dimensions * sizeof(float));
     vg_generate_vector_from_key(gen, gt->query_key, query_vec);
     
-    float* neighbor_vec = malloc(gen->dimensions * sizeof(float));
+    float* neighbor_vec = zmalloc(gen->dimensions * sizeof(float));
     for (int i = 0; i < NEIGHBORS_PER_QUERY; i++) {
         vg_generate_vector_from_key(gen, gt->neighbor_keys[i], neighbor_vec);
         gt->neighbor_distances[i] = vg_compute_l2_distance(
@@ -280,8 +281,8 @@ static void compute_query_ground_truth2(
     gt->computed = true;
     pthread_mutex_unlock(&gt->compute_mutex);
     
-    free(query_vec);
-    free(neighbor_vec);
+    zfree(query_vec);
+    zfree(neighbor_vec);
 }
 
 /* Initialize generator */
@@ -291,7 +292,7 @@ vector_generator_t* vg_init(const generator_config_t* config) {
         return NULL;
     }
     
-    vector_generator_t* gen = calloc(1, sizeof(vector_generator_t));
+    vector_generator_t* gen = zcalloc(1 * sizeof(vector_generator_t));
     if (!gen) return NULL;
     
     memcpy(&gen->config, config, sizeof(generator_config_t));
@@ -299,9 +300,9 @@ vector_generator_t* vg_init(const generator_config_t* config) {
     gen->pinned_threshold = config->initial_capacity / 2;
     
     /* Set up reserved key ranges */
-    gen->query_key_start = 1;
+    gen->query_key_start = 0;
     gen->query_key_end = RESERVED_KEY_RANGE;
-    gen->general_key_start = RESERVED_KEY_RANGE + 1;
+    gen->general_key_start = RESERVED_KEY_RANGE;
     gen->num_query_vectors = MAX_QUERY_VECTORS;
     if (gen->num_query_vectors > config->initial_capacity / 100) {
         gen->num_query_vectors = config->initial_capacity / 100;
@@ -309,16 +310,16 @@ vector_generator_t* vg_init(const generator_config_t* config) {
     }
     
     /* Initialize query ground truth */
-    gen->query_ground_truth = calloc(gen->num_query_vectors, sizeof(query_ground_truth_t));
+    gen->query_ground_truth = zcalloc(gen->num_query_vectors * sizeof(query_ground_truth_t));
     if (!gen->query_ground_truth) goto error;
     
     /* Pre-assign query and neighbor keys using prime number spacing for better distribution */
     for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
         /* Use prime spacing (997) to distribute query keys across reserved range */
         gen->query_ground_truth[i].query_key = (i * 997 + 1) % RESERVED_KEY_RANGE;
-        if (gen->query_ground_truth[i].query_key == 0) {
-            gen->query_ground_truth[i].query_key = 1; /* Avoid key 0 */
-        }
+        // if (gen->query_ground_truth[i].query_key == 0) {
+        //     gen->query_ground_truth[i].query_key = 1; /* Avoid key 0 */
+        // }
         
         for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
             gen->query_ground_truth[i].neighbor_keys[j] = 
@@ -356,12 +357,12 @@ void vg_destroy(vector_generator_t* gen) {
         for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
             pthread_mutex_destroy(&gen->query_ground_truth[i].compute_mutex);
         }
-        free(gen->query_ground_truth);
+        zfree(gen->query_ground_truth);
     }
     
     bloom_destroy(gen->deleted_keys);
     pthread_rwlock_destroy(&gen->delete_lock);
-    free(gen);
+    zfree(gen);
 }
 
 /* Create ingestion iterator */
@@ -370,7 +371,7 @@ vector_iterator_t* vg_get_ingestion_iterator(
     uint64_t count,
     generation_order_t order) {
     
-    vector_iterator_t* iter = calloc(1, sizeof(vector_iterator_t));
+    vector_iterator_t* iter = zcalloc(1 * sizeof(vector_iterator_t));
     if (!iter) return NULL;
     
     iter->generator = gen;
@@ -379,15 +380,15 @@ vector_iterator_t* vg_get_ingestion_iterator(
     iter->count = count;
     iter->current = 0;
     
-    iter->key_sequence = malloc(count * sizeof(uint64_t));
+    iter->key_sequence = zmalloc(count * sizeof(uint64_t));
     if (!iter->key_sequence) {
-        free(iter);
+        zfree(iter);
         return NULL;
     }
-    
+    uint64_t next_key_batch = atomic_fetch_add(&gen->allocator.next_key, count);
     /* Generate keys from general range only */
     for (uint64_t i = 0; i < count; i++) {
-        iter->key_sequence[i] = atomic_fetch_add(&gen->allocator.next_key, 1);
+        iter->key_sequence[i] = next_key_batch + i;
     }
     
     atomic_fetch_add(&gen->allocator.active_count, count);
@@ -403,7 +404,7 @@ bool vg_iterator_next(vector_iterator_t* iter, vector_t* vec) {
     
     vector_key_t key = iter->key_sequence[iter->current];
     vec->key = key;
-    vec->data = malloc(iter->generator->dimensions * sizeof(float));
+    vec->data = zmalloc(iter->generator->dimensions * sizeof(float));
     if (!vec->data) return false;
     
     vg_generate_vector_from_key(iter->generator, key, vec->data);
@@ -417,7 +418,7 @@ vector_iterator_t* vg_get_query_iterator(
     vector_generator_t* gen,
     uint64_t count) {
     
-    vector_iterator_t* iter = calloc(1, sizeof(vector_iterator_t));
+    vector_iterator_t* iter = zcalloc(1 * sizeof(vector_iterator_t));
     if (!iter) return NULL;
     
     iter->generator = gen;
@@ -444,7 +445,7 @@ bool vg_iterator_next_query(vector_iterator_t* iter, query_vector_t* query) {
     
     /* Return query from RESERVED range */
     query->vector.key = gt->query_key;
-    query->vector.data = malloc(iter->generator->dimensions * sizeof(float));
+    query->vector.data = zmalloc(iter->generator->dimensions * sizeof(float));
     vg_generate_vector_from_key(iter->generator, query->vector.key, query->vector.data);
     
     /* Ground truth neighbors are also from RESERVED range */
@@ -474,7 +475,7 @@ vector_iterator_t* vg_get_deletion_iterator(
         count = max_delete;
     }
     
-    vector_iterator_t* iter = calloc(1, sizeof(vector_iterator_t));
+    vector_iterator_t* iter = zcalloc(1 * sizeof(vector_iterator_t));
     if (!iter) return NULL;
     
     iter->generator = gen;
@@ -482,9 +483,9 @@ vector_iterator_t* vg_get_deletion_iterator(
     iter->count = count;
     iter->current = 0;
     
-    iter->key_sequence = malloc(count * sizeof(uint64_t));
+    iter->key_sequence = zmalloc(count * sizeof(uint64_t));
     if (!iter->key_sequence) {
-        free(iter);
+        zfree(iter);
         return NULL;
     }
     
@@ -536,9 +537,9 @@ bool vg_iterator_next_key(vector_iterator_t* iter, vector_key_t* key) {
 void vg_iterator_destroy(vector_iterator_t* iter) {
     if (!iter) return;
     
-    free(iter->key_sequence);
-    free(iter->vector_buffer);
-    free(iter);
+    zfree(iter->key_sequence);
+    zfree(iter->vector_buffer);
+    zfree(iter);
 }
 
 /* Get stats */
@@ -573,18 +574,18 @@ void vg_find_ground_truth(
     }
     
     /* For arbitrary test queries, do brute force on reserved range */
-    float* candidate_vec = malloc(gen->dimensions * sizeof(float));
+    float* candidate_vec = zmalloc(gen->dimensions * sizeof(float));
     typedef struct {
         vector_key_t key;
         float distance;
     } candidate_t;
     
     /* Only search within reserved range for consistency */
-    uint32_t max_search = 10000;  /* Limit for performance */
-    candidate_t* candidates = malloc(max_search * sizeof(candidate_t));
+    uint32_t max_search = RESERVED_KEY_RANGE;  /* Limit for performance */
+    candidate_t* candidates = zmalloc(max_search * sizeof(candidate_t));
     
     for (uint32_t i = 0; i < max_search; i++) {
-        vector_key_t key = i + 1;
+        vector_key_t key = i;
         vg_generate_vector_from_key(gen, key, candidate_vec);
         candidates[i].key = key;
         candidates[i].distance = vg_compute_l2_distance(query->data, candidate_vec, gen->dimensions);
@@ -607,6 +608,6 @@ void vg_find_ground_truth(
         ground_truth[i].distance = candidates[i].distance;
     }
     
-    free(candidate_vec);
-    free(candidates);
+    zfree(candidate_vec);
+    zfree(candidates);
 }

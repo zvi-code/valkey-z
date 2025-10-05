@@ -1219,7 +1219,7 @@ clusterSnapshot* createClusterSnapshot(const char *command,
         }
         
         if (lines) {
-            char *lines_copy = strdup(lines);
+            char *lines_copy = sdsdup(lines);
             char *saveptr;
             char *line = strtok_r(lines_copy, "\n", &saveptr);
             
@@ -1259,7 +1259,7 @@ clusterSnapshot* createClusterSnapshot(const char *command,
                 line = strtok_r(NULL, "\n", &saveptr);
             }
             
-            free(lines_copy);
+            zfree(lines_copy);
             sdsfree(lines);
         }
         
