@@ -1406,32 +1406,27 @@ static void replacePlaceholderDataset(
     if (key_count > 0 && vec_count > 0) {
         for (size_t i = 0; i < key_count; i++) {
             uint64_t vector_id;
-            /* Self-check: ensure placeholder is exactly 12 bytes */
             char *key_write_pos = cmd + key_indices[i];
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
+
             /* Atomic fetch - no thread conflicts */
             uint64_t dataset_idx = atomic_fetch_add(
                 &config.dataset_prefill_counter, 1
             );
             dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
                             &vector_id, vec_write_pos);
-            char key_buf[32];
-            int key_len = snprintf(key_buf, sizeof(key_buf), "%lu", vector_id);
 
-            /* Clear and write key string to 16-byte placeholder space */
-            memcpy(key_write_pos, key_buf, key_len < 8 ? key_len : 8);
-
-            /* Write actual key length to 4-byte length field */
-            uint32_t actual_key_len = (uint32_t)key_len;
-            memcpy(key_write_pos + 8, &actual_key_len, 4);
+            /* Replace entire 12-byte placeholder with zero-padded ID */
+            char key_id_str[13]; /* 12 bytes + null terminator */
+            snprintf(key_id_str, sizeof(key_id_str), "%012lu", vector_id);
+            memcpy(key_write_pos, key_id_str, 12);  /* Copy exactly 12 bytes */
 
             static int debug_count = 0;
             if (debug_count < 5) {
-                printf("DEBUG INSERT: dataset_idx=%lu, vector_id=%lu, key_len=%d, key_buf='%s'\n",
-                    dataset_idx, vector_id, key_len, key_buf);
+                printf("DEBUG INSERT: dataset_idx=%lu, vector_id=%lu, key_str='%.12s'\n",
+                    dataset_idx, vector_id, key_id_str);
                 debug_count++;
             }
-            
         }
     }
 
@@ -1450,18 +1445,16 @@ static void replacePlaceholderDataset(
     /* DELETE: only key replacement */
     if (key_count > 0 && vec_count == 0) {
         for (size_t i = 0; i < key_count; i++) {
-            /* Self-check: ensure placeholder is exactly 12 bytes */
             char *key_write_pos = cmd + key_indices[i];
 
             uint64_t dataset_idx = atomic_fetch_add(
-            &config.dataset_num_vectors, 1);
-            char key_buf[32];
-            int key_len = snprintf(key_buf, sizeof(key_buf), "%lu", dataset_idx);
-            memcpy(key_write_pos, key_buf, key_len < 8 ? key_len : 8);
+                &config.dataset_prefill_counter, 1
+            );
 
-            /* Write actual key length to 4-byte length field */
-            uint32_t actual_key_len = (uint32_t)key_len;
-            memcpy(key_write_pos + 8, &actual_key_len, 4);
+            /* Replace entire 12-byte placeholder with zero-padded ID */
+            char key_id_str[13]; /* 12 bytes + null terminator */
+            snprintf(key_id_str, sizeof(key_id_str), "%012lu", dataset_idx);
+            memcpy(key_write_pos, key_id_str, 12);  /* Copy exactly 12 bytes */
         }
     }        
 }
