@@ -8,6 +8,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
+#include <pthread.h>
+
 // use zmalloc for Valkey memory tracking
 #include "../../src/zmalloc.h"
 #ifdef __ARM_NEON
@@ -200,9 +202,9 @@ static void compute_query_ground_truth(
     
     query_ground_truth_t* gt = &gen->query_ground_truth[query_idx];
     
-    pthread_mutex_lock(&gt->compute_mutex);
+    // pthread_mutex_lock(&gt->compute_mutex);
     if (gt->computed) {
-        pthread_mutex_unlock(&gt->compute_mutex);
+        // pthread_mutex_unlock(&gt->compute_mutex);
         return;
     }
     
@@ -265,11 +267,15 @@ static void compute_query_ground_truth(
     
     /* Search all reserved keys including key 0 and the query itself */
     for (uint32_t i = 0; i < search_size; i++) {
+        if (i == query_idx) {
+            candidates[i].key = i;
+            candidates[i].distance = 0.0f;
+            continue;
+        }
         vector_key_t key = i;  /* Start from 0 to include all keys */
-        
         vg_generate_vector_from_key(gen, key, candidate_vec);
         candidates[i].key = key;
-        candidates[i].distance = vg_compute_l2_distance(query_vec, candidate_vec, gen->dimensions);
+        candidates[i].distance = vg_compute_l2_distance(gt->query_vector, candidate_vec, gen->dimensions);
     }
     
     /* Sort and take top 10 */
@@ -292,9 +298,8 @@ static void compute_query_ground_truth(
     }
     
     gt->computed = true;
-    pthread_mutex_unlock(&gt->compute_mutex);
+    // pthread_mutex_unlock(&gt->compute_mutex);
     
-    zfree(query_vec);
     zfree(candidate_vec);
     zfree(candidates);
 }
@@ -325,7 +330,7 @@ static void compute_query_ground_truth2(
     for (int i = 0; i < NEIGHBORS_PER_QUERY; i++) {
         vg_generate_vector_from_key(gen, gt->neighbor_keys[i], neighbor_vec);
         gt->neighbor_distances[i] = vg_compute_l2_distance(
-            query_vec, neighbor_vec, gen->dimensions);
+            gt->query_vector, neighbor_vec, gen->dimensions);
     }
     
     gt->computed = true;
@@ -363,9 +368,9 @@ vector_generator_t* vg_init(const generator_config_t* config) {
     /* Pre-assign query and neighbor keys using prime number spacing for better distribution */
     for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
         /* Use prime spacing (997) to distribute query keys across reserved range */
-        gen->query_ground_truth[i].query_key = (i * 997 + 1) % RESERVED_KEY_RANGE;
-
-        
+        gen->query_ground_truth[i].query_key = i;
+        gen->query_ground_truth[i].query_vector = zmalloc(gen->dimensions * sizeof(float));
+        vg_generate_vector_from_key(gen, gen->query_ground_truth[i].query_key, gen->query_ground_truth[i].query_vector);
         for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
             gen->query_ground_truth[i].neighbor_keys[j] = 
                 gen->query_ground_truth[i].query_key + j + 1;
@@ -430,6 +435,31 @@ void vg_set_ground_truth_dataset_size(vector_generator_t* gen, uint64_t dataset_
         }
     }
 }
+static atomic_int completed_ground_truth_vectors = 0;
+// #ifdef USE_PTHREADS_FOR_GT_COMPUTE
+#include <pthread.h>
+#define NUM_THREADS 10
+typedef struct {
+    vector_generator_t* gen;
+    uint32_t start_idx;
+    uint32_t end_idx;
+    atomic_int *completed;
+} thread_arg_t;
+
+
+void* thread_func(void* arg) {
+    thread_arg_t* t_arg = (thread_arg_t*)arg;
+    for (uint32_t i = t_arg->start_idx; i < t_arg->end_idx; i++) {
+        compute_query_ground_truth(t_arg->gen, i);
+        atomic_fetch_add(t_arg->completed, 1);
+        if (*t_arg->completed % 100 == 0) {
+            fprintf(stderr, "[VG] Progress: %d/%d queries (%.1f%%)\n",
+                    *t_arg->completed, t_arg->gen->num_query_vectors,
+                    100.0 * *t_arg->completed / t_arg->gen->num_query_vectors);
+        }
+    }
+    return NULL;
+}
 
 /* Precompute all ground truths for query vectors */
 void vg_precompute_all_ground_truths(vector_generator_t* gen) {
@@ -447,24 +477,32 @@ void vg_precompute_all_ground_truths(vector_generator_t* gen) {
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     
-    /* Compute ground truth for all queries sequentially.
-     * Note: Could be parallelized with OpenMP if needed, but need to ensure
-     * thread safety since compute_query_ground_truth() uses mutexes. */
-    for (uint32_t i = 0; i < gen->num_query_vectors; i++) {
-        /* Skip if already computed */
-        if (gen->query_ground_truth[i].computed) {
-            continue;
+    // create threads each thread will compute a portion of the queries
+    // and give each thread its own copy of gen to avoid contention
+    // use pthreads for portability
+    // #define USE_PTHREADS_FOR_GT_COMPUTE
+    // use atomic to track progress and print every 100 queries
+
+    pthread_t threads[NUM_THREADS];
+    thread_arg_t thread_args[NUM_THREADS];
+    uint32_t queries_per_thread = gen->num_query_vectors / NUM_THREADS;
+    for (int t = 0; t < NUM_THREADS; t++) {
+        fprintf(stderr, "[VG] Starting thread %d for queries %d to %d\n", 
+            t, t * queries_per_thread, (t + 1) * queries_per_thread - 1);
+        thread_args[t].gen = gen;
+        thread_args[t].start_idx = t * queries_per_thread;
+        thread_args[t].completed = &completed_ground_truth_vectors;
+        if (t == NUM_THREADS - 1) {
+            thread_args[t].end_idx = gen->num_query_vectors - (t * queries_per_thread);
+        } else {
+            thread_args[t].end_idx = (t + 1) * queries_per_thread;
         }
-        
-        compute_query_ground_truth(gen, i);
-        
-        /* Progress update every 100 queries */
-        if ((i + 1) % 100 == 0) {
-            fprintf(stderr, "[VG] Progress: %u/%u queries (%.1f%%)\n", 
-                    i + 1, gen->num_query_vectors, 
-                    100.0 * (i + 1) / gen->num_query_vectors);
-        }
+        pthread_create(&threads[t], NULL, thread_func, &thread_args[t]);
     }
+    for (int t = 0; t < NUM_THREADS; t++) {
+        pthread_join(threads[t], NULL);
+    }
+
     
     clock_gettime(CLOCK_MONOTONIC, &end);
     double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
@@ -526,12 +564,11 @@ bool vg_iterator_next(vector_iterator_t* iter, vector_t* vec) {
     
     vector_key_t key = iter->key_sequence[iter->current];
     vec->key = key;
-    vec->data = zmalloc(iter->generator->dimensions * sizeof(float));
-    assert(vec->data != NULL && "Failed to allocate memory for vector data");
-    
-    vg_generate_vector_from_key(iter->generator, key, vec->data);
-    
+    if (vec->data) {                
+        vg_generate_vector_from_key(iter->generator, key, vec->data);
+    }
     iter->current++;
+    
     return true;
 }
 
@@ -580,12 +617,10 @@ bool vg_iterator_next_query(vector_iterator_t* iter, query_vector_t* query) {
     /* Return query from RESERVED range */
     query->vector.key = gt->query_key;
     assert(query->vector.key < RESERVED_KEY_RANGE && "Query key must be in reserved range");
-    
-    query->vector.data = zmalloc(iter->generator->dimensions * sizeof(float));
+
+    query->vector.data = gt->query_vector;
     assert(query->vector.data != NULL && "Failed to allocate memory for query vector");
-    
-    vg_generate_vector_from_key(iter->generator, query->vector.key, query->vector.data);
-    
+        
     /* Ground truth neighbors are also from RESERVED range */
     for (int i = 0; i < NEIGHBORS_PER_QUERY; i++) {
         query->ground_truth[i].key = gt->neighbor_keys[i];

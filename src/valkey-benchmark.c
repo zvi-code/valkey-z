@@ -30,6 +30,7 @@
 
 #include "valkey-benchmark-utils.h"
 #include "valkey-benchmark-vgen.h"
+#include "dataset_api.h"
 #include "fmacros.h"
 
 #include <stdio.h>
@@ -97,6 +98,11 @@ static long long nstime(void) {
 #define VGEN_VECTOR_PLACEHOLDER "__v_gen_vec_ph__"  // Exactly 16 characters for 2 floats
 #define VGEN_VECTOR_PLACEHOLDER_INDEX 13
 
+#define DATASET_KEY_PLACEHOLDER "__d_key_ph____"      // 16 bytes to fit 16-digit ID
+#define DATASET_VECTOR_PLACEHOLDER "__d_vec_ph__"   // 12 bytes
+#define DATASET_KEY_PLACEHOLDER_INDEX 14
+#define DATASET_VECTOR_PLACEHOLDER_INDEX 15
+
 #define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
 #define VECTOR_PLACEHOLDER_LEN 8 // length of VECTOR_PLACEHOLDER strings
 #define VECTOR_NUM_RAND_DIM (VECTOR_PLACEHOLDER_LEN/sizeof(float)) // Number of random dimensions for vector generation
@@ -106,8 +112,9 @@ static long long nstime(void) {
 #define CLUSTER_PLACEHOLDER_INDEX 10
 
 
-#define PLACEHOLDER_NUM_OF 14
+#define PLACEHOLDER_NUM_OF 16
 #define PLACEHOLDER_NORMAL_NUM_OF 10  // Number of normal placeholders excluding vector and cluster placeholders
+#define DATASET_KEY_ID_WIDTH 16  /* 16 decimal digits for vector ID */
 
 
 // TODO: Use existing vectors\fields in the index as base for vector\tag\numeric generation
@@ -121,6 +128,8 @@ static const struct {
     {VECTOR_PLACEHOLDER, 8},  // Vector placeholder
     {VGEN_KEY_PLACEHOLDER, 16},
     {VGEN_VECTOR_PLACEHOLDER, 16},
+    {DATASET_KEY_PLACEHOLDER, 16},
+    {DATASET_VECTOR_PLACEHOLDER, 12},
 };
 
 struct benchmarkThread;
@@ -396,8 +405,124 @@ static struct config {
     float vgen_sparsity;            /* Sparsity level (0.0-1.0) */
     uint64_t vgen_seed;             /* Random seed for reproducibility */
     int vgen_precompute;            /* Precompute ground truths (warm-up phase) */
+
+    /* Dataset configuration */
+    int use_dataset;              /* Enable dataset mode */
+    sds dataset_name;             /* Dataset identifier or path */
+    void *dataset_ctx;            /* Opaque dataset context */
+    uint64_t dataset_num_vectors; /* Total vectors */
+    uint64_t dataset_num_queries; /* Total queries */
+    uint32_t dataset_num_neighbors; /* Ground truth k */
+    _Atomic uint64_t dataset_prefill_counter;  /* Insert counter */
+    _Atomic uint64_t dataset_query_counter;    /* Query counter */
 } config;
 
+/* Recall statistics for dataset mode */
+typedef struct {
+    uint64_t total_queries;
+    uint64_t total_matches;
+    double sum_recall;
+    double min_recall;
+    double max_recall;
+    uint64_t perfect_recalls;
+    uint64_t zero_recalls;
+    pthread_mutex_t mutex;
+} recallStats;
+
+static recallStats dataset_recall_stats;
+
+__attribute__((unused))
+static void initRecallStats(void) {
+    memset(&dataset_recall_stats, 0, sizeof(recallStats));
+    dataset_recall_stats.min_recall = 1.0;
+    pthread_mutex_init(&dataset_recall_stats.mutex, NULL);
+}
+
+static void updateRecallStats(float recall) {
+    pthread_mutex_lock(&dataset_recall_stats.mutex);
+
+    dataset_recall_stats.total_queries++;
+    dataset_recall_stats.sum_recall += recall;
+
+    if (recall < dataset_recall_stats.min_recall) {
+        dataset_recall_stats.min_recall = recall;
+    }
+    if (recall > dataset_recall_stats.max_recall) {
+        dataset_recall_stats.max_recall = recall;
+    }
+    if (recall >= 0.9999) {
+        dataset_recall_stats.perfect_recalls++;
+    }
+    if (recall < 0.0001) {
+        dataset_recall_stats.zero_recalls++;
+    }
+
+    dataset_recall_stats.total_matches += (uint64_t)(recall * config.search.k);
+
+    pthread_mutex_unlock(&dataset_recall_stats.mutex);
+}
+
+/* Extract vector ID from fully formatted key */
+static uint64_t extract_vector_id_from_key(const char *key, size_t keylen) {
+    const char *id_start = key;
+
+    /* Skip prefix (vec:) */
+    const char *colon = strchr(key, ':');
+    if (colon) {
+        id_start = colon + 1;
+        /* Skip cluster tag {tag}: if present */
+        if (*id_start == '{') {
+            colon = strchr(id_start, ':');
+            if (colon) id_start = colon + 1;
+        }
+    }
+
+    return strtoull(id_start, NULL, 10);
+}
+
+static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
+    if (!reply || reply->type != VALKEY_REPLY_ARRAY || reply->elements < 2) {
+        return;
+    }
+
+    /* Get ground truth from dataset */
+    uint64_t *gt_neighbors = zmalloc(
+        config.dataset_num_neighbors * sizeof(uint64_t)
+    );
+    float dummy_query[1];
+    dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx, dummy_query, gt_neighbors);
+
+    /* Extract returned vector IDs from search results */
+    int k = config.search.k;
+    uint64_t *returned_ids = zmalloc(k * sizeof(uint64_t));
+    int returned_count = 0;
+
+    /* Parse FT.SEARCH results: [count, key1, fields1, key2, fields2, ...] */
+    for (size_t i = 1; i < reply->elements && returned_count < k; i += 2) {
+        valkeyReply *key_reply = reply->element[i];
+        if (key_reply->type == VALKEY_REPLY_STRING) {
+            returned_ids[returned_count++] =
+                extract_vector_id_from_key(key_reply->str, key_reply->len);
+        }
+    }
+
+    /* Calculate recall@k */
+    int matches = 0;
+    for (int i = 0; i < returned_count; i++) {
+        for (uint32_t j = 0; j < config.dataset_num_neighbors && j < (uint32_t)k; j++) {
+            if (returned_ids[i] == gt_neighbors[j]) {
+                matches++;
+                break;
+            }
+        }
+    }
+
+    float recall = returned_count > 0 ? (float)matches / k : 0.0f;
+    updateRecallStats(recall);
+
+    zfree(gt_neighbors);
+    zfree(returned_ids);
+}
 
 /* Prototypes */
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -425,20 +550,36 @@ static int dictSdsKeyCompare(const void *key1, const void *key2);
 
 /* Fast unique vector generation using key-based deterministic randomization */
 static sds createVectorTemplate(uint64_t key_idx) {
+    /* Dataset mode - placeholder for entire vector */
+    if (config.use_dataset) {
+        float *vector = zmalloc(config.search.vector_dim * sizeof(float));
+
+        /* Mark first 12 bytes with placeholder for identification */
+        memcpy(vector, DATASET_VECTOR_PLACEHOLDER, 12);
+        /* Fill rest with recognizable pattern */
+        memset((uint8_t*)vector + 12, 0xDD,
+               config.search.vector_dim * sizeof(float) - 12);
+
+        sds vector_data = sdsnewlen(vector,
+                                    config.search.vector_dim * sizeof(float));
+        zfree(vector);
+        return vector_data;
+    }
+
     // If vector generator is enabled, use VGEN_VECTOR_PLACEHOLDER
     if (config.is_vector_generator) {
         /* Allocate vector with placeholder for vgen replacement */
         float *vector = zmalloc(config.search.vector_dim * sizeof(float));
-        
+
         /* Insert VGEN_VECTOR_PLACEHOLDER at the beginning (16 bytes = 4 floats) */
         memcpy(vector, VGEN_VECTOR_PLACEHOLDER, 16);
-        
+
         /* Fill rest with non-zero pattern so strstr works (avoid NULL bytes) */
         memset(vector + 4, 0xFF, (config.search.vector_dim - 4) * sizeof(float));
-        
+
         sds vector_data = sdsnewlen(vector, config.search.vector_dim * sizeof(float));
         zfree(vector);
-        
+
         assert(sdslen(vector_data) == config.search.vector_dim * sizeof(float));
         return vector_data;
     }
@@ -722,6 +863,19 @@ static void initBaseVector(int dim) {
 
 static sds getVectorKey(void) {
     sds key;
+
+    /* Dataset mode - use placeholder */
+    if (config.use_dataset) {
+        if (config.cluster_mode) {
+            key = sdscatprintf(sdsempty(), "%s{tag}:", config.search.prefix);
+        } else {
+            key = sdscatprintf(sdsempty(), "%s", config.search.prefix);
+        }
+        /* Append placeholder (will be replaced with vector ID) */
+        key = sdscatlen(key, DATASET_KEY_PLACEHOLDER, 16);
+        return key;
+    }
+
     // If vector generator is enabled, use VGEN_KEY_PLACEHOLDER
     if (config.is_vector_generator) {
         /* Create key with VGEN_KEY_PLACEHOLDER (16 bytes) + 4 bytes for length */
@@ -733,13 +887,13 @@ static sds getVectorKey(void) {
             key = sdscatprintf(sdsempty(), "%s", config.search.prefix);
         }
         key = sdscatlen(key, VGEN_KEY_PLACEHOLDER, 16);
-        
+
         /* Append 4 bytes for length - use non-zero pattern to avoid breaking strstr */
         uint32_t placeholder_len = 0xFFFFFFFF;  /* Will be overwritten by vgen */
-        key = sdscatlen(key, &placeholder_len, 4);            
+        key = sdscatlen(key, &placeholder_len, 4);
         return key;
     }
-    
+
     // Original implementation for non-vgen mode
     if (config.cluster_mode) {
         key = sdscatprintf(sdsempty(), "%s{tag}:__rand_int__", config.search.prefix);
@@ -1229,6 +1383,119 @@ static void replacePlaceholderVector(const size_t *indices, const size_t count,
     }
 }
 
+
+/* Main dataset replacement function */
+static uint64_t replacePlaceholderDataset(
+    int thread_id,
+    const size_t key_count, const size_t *key_indices,
+    _Atomic uint64_t *key_counter,
+    const size_t vec_count, const size_t *vec_indices,
+    _Atomic uint64_t *vector_counter,
+    char *cmd)
+{
+    if (!config.use_dataset) return UINT64_MAX;
+
+    /* Validate placeholder consistency */
+    assert((key_count == vec_count) || (vec_count == 0) || (key_count == 0));
+
+    /* INSERT/PREFILL: both key and vector replacement */
+    if (key_count > 0 && vec_count > 0) {
+        /* Atomic fetch - no thread conflicts */
+        uint64_t dataset_idx = atomic_fetch_add(
+            &config.dataset_prefill_counter, 1
+        );
+
+        /* Check bounds - no wrapping for insert */
+        if (dataset_idx >= config.dataset_num_vectors) {
+            return UINT64_MAX;  /* Exhausted dataset */
+        }
+
+        uint64_t vector_id;
+        float *vector = zmalloc(config.search.vector_dim * sizeof(float));
+
+        /* O(1) mmap read - thread-safe */
+        if (dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
+                           &vector_id, vector) != 0) {
+            zfree(vector);
+            return UINT64_MAX;
+        }
+
+        /* Replace key placeholder: vec:0000001234567890 */
+        for (size_t i = 0; i < key_count; i++) {
+            char *key_ph = cmd + key_indices[i];
+            /* Use memcpy to avoid null terminator issues in binary data */
+            char temp_id[17];
+            snprintf(temp_id, sizeof(temp_id), "%016lu", vector_id);
+            memcpy(key_ph, temp_id, 16);  /* Copy exactly 16 bytes, no null terminator */
+        }
+
+        /* Replace vector data (memcpy from mmap) */
+        for (size_t i = 0; i < vec_count; i++) {
+            char *vec_ph = cmd + vec_indices[i];
+            memcpy(vec_ph, vector, config.search.vector_dim * sizeof(float));
+        }
+
+        zfree(vector);
+        return UINT64_MAX;
+    }
+
+    /* QUERY: only vector, return query_idx for recall */
+    if (vec_count > 0 && key_count == 0) {
+        uint64_t query_idx = atomic_fetch_add(
+            &config.dataset_query_counter, 1
+        );
+        query_idx %= config.dataset_num_queries;  /* Wrap for repeated queries */
+
+        float *query_vector = zmalloc(config.search.vector_dim * sizeof(float));
+        uint64_t *neighbors = zmalloc(
+            config.dataset_num_neighbors * sizeof(uint64_t)
+        );
+
+        if (dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx,
+                         query_vector, neighbors) != 0) {
+            zfree(query_vector);
+            zfree(neighbors);
+            return UINT64_MAX;
+        }
+
+        /* Replace vector placeholder */
+        for (size_t i = 0; i < vec_count; i++) {
+            char *vec_ph = cmd + vec_indices[i];
+            memcpy(vec_ph, query_vector,
+                   config.search.vector_dim * sizeof(float));
+        }
+
+        zfree(query_vector);
+        zfree(neighbors);
+        return query_idx;  /* For recall tracking */
+    }
+
+    /* DELETE: only key replacement */
+    if (key_count > 0 && vec_count == 0) {
+        uint64_t dataset_idx = atomic_fetch_add(
+            &config.dataset_prefill_counter, 1
+        );
+
+        if (dataset_idx >= config.dataset_num_vectors) {
+            return UINT64_MAX;
+        }
+
+        uint64_t vector_id;
+        float dummy;
+        dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx, &vector_id, &dummy);
+
+        for (size_t i = 0; i < key_count; i++) {
+            char *key_ph = cmd + key_indices[i];
+            /* Use memcpy to avoid null terminator issues in binary data */
+            char temp_id[17];
+            snprintf(temp_id, sizeof(temp_id), "%016lu", vector_id);
+            memcpy(key_ph, temp_id, 16);  /* Copy exactly 16 bytes, no null terminator */
+        }
+    }
+
+    return UINT64_MAX;
+}
+
 static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
     static _Atomic uint64_t seq_key[PLACEHOLDER_NUM_OF] = {0};
 
@@ -1270,6 +1537,26 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
         /* Enqueue query index for recall tracking (handles pipelining) */
         if (query_idx != UINT64_MAX) {
             c->vgen_query_indices[(c->vgen_query_tail++) % c->vgen_query_capacity] = query_idx;
+        }
+
+        /* Handle dataset placeholders (AFTER vgen check) */
+        if (config.use_dataset) {
+            uint64_t dataset_query_idx = replacePlaceholderDataset(
+                c->thread_id,
+                placeholders.count[DATASET_KEY_PLACEHOLDER_INDEX],
+                placeholders.indices[DATASET_KEY_PLACEHOLDER_INDEX],
+                &seq_key[DATASET_KEY_PLACEHOLDER_INDEX],
+                placeholders.count[DATASET_VECTOR_PLACEHOLDER_INDEX],
+                placeholders.indices[DATASET_VECTOR_PLACEHOLDER_INDEX],
+                &seq_key[DATASET_VECTOR_PLACEHOLDER_INDEX],
+                cmd
+            );
+
+            /* Enqueue query index for recall tracking */
+            if (dataset_query_idx != UINT64_MAX) {
+                c->vgen_query_indices[(c->vgen_query_tail++) %
+                                      c->vgen_query_capacity] = dataset_query_idx;
+            }
         }
     }
 }
@@ -1486,6 +1773,14 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                     /* Dequeue the query index for this response */
                     uint64_t query_idx = c->vgen_query_indices[(c->vgen_query_head++) % c->vgen_query_capacity];
                     vgen_compute_recall(query_idx, reply);
+                }
+
+                /* Compute recall if using dataset */
+                if (config.use_dataset && c->vgen_query_head < c->vgen_query_tail) {
+                    uint64_t query_idx = c->vgen_query_indices[
+                        (c->vgen_query_head++) % c->vgen_query_capacity
+                    ];
+                    dataset_compute_recall(reply, query_idx);
                 }
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
@@ -2984,6 +3279,15 @@ int parseOptions(int argc, char **argv) {
             config.vgen_seed = strtoull(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--vgen-precompute")) {
             config.vgen_precompute = 1;
+        } else if (!strcmp(argv[i], "--dataset")) {
+            if (lastarg) goto invalid;
+            config.dataset_name = sdsnew(argv[++i]);
+            config.use_dataset = 1;
+        } else if (!strcmp(argv[i], "--dataset-path")) {
+            if (lastarg) goto invalid;
+            sdsfree(config.dataset_name);
+            config.dataset_name = sdsnew(argv[++i]);
+            config.use_dataset = 1;
         } else if (!strcmp(argv[i], "--search-print-results")) {
             config.print_search_results = 1;
         } else if (!strcmp(argv[i], "--search-prefix")) {
@@ -3141,7 +3445,7 @@ usage:
 
 
     printf(
-        "%s%s%s%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
+        "%s%s%s%s%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
         "Usage: valkey-benchmark [OPTIONS] [--] [COMMAND ARGS...]\n\n"
         "Simulates sending commands using multiple clients. The utility provides a\n"
         "default set of tests. You can run a subset of the tests using the -t option or\n"
@@ -3275,6 +3579,8 @@ usage:
         " --vgen-sparsity <value>\n"
         "                    Sparsity ratio for vectors, 0.0-1.0 (default 0.0).\n"
         " --vgen-seed <num>  Seed for deterministic vector generation (default: random).\n"
+        " --dataset <name>   Use dataset for vector workloads.\n"
+        " --dataset-path <path> Explicit path to dataset binary file.\n",
         " --vgen-precompute  Precompute ground truths before queries (warm-up phase).\n",
         tls_usage,
         rdma_usage,        
@@ -3742,7 +4048,14 @@ int main(int argc, char **argv) {
                                         &search_ingest_field_vector, &search_background_indexing_status);
         last_ftinfo = getFtInfoStatistics(config.search.name, config.cluster_node_count, config.cluster_nodes, config.ct);
         last_info_all = getInfoCluster(config.cluster_node_count, config.cluster_nodes, config.ct);
-
+    }
+    if (config.is_vector_generator) {
+        printf("Using vector generator for the benchmark.\n");
+        /* Validate mutual exclusion */
+        if (config.use_dataset) {
+            fprintf(stderr, "ERROR: --dataset and --use_vgen cannot be used together\n");
+            exit(1);
+        }
         /* Initialize vector generator if enabled */
         printf("Initializing vector generator for search workload...\n");
         if (vgen_init_from_config(config.search.vector_dim,
@@ -3757,6 +4070,41 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to initialize vector generator\n");
             assert(0);
         }
+    }
+    /* Initialize dataset if enabled */
+    if (config.use_dataset) {
+        /* Validate mutual exclusion */
+        if (config.is_vector_generator) {
+            fprintf(stderr, "ERROR: --dataset and --use_vgen cannot be used together\n");
+            exit(1);
+        }
+
+        dataset_info_t info;
+        config.dataset_ctx = dataset_init(config.dataset_name, &info);
+
+        if (!config.dataset_ctx) {
+            fprintf(stderr, "Failed to initialize dataset: %s\n", config.dataset_name);
+            exit(1);
+        }
+
+        /* Store metadata */
+        config.dataset_num_vectors = info.num_vectors;
+        config.dataset_num_queries = info.num_queries;
+        config.dataset_num_neighbors = info.num_neighbors;
+
+        /* Override vector dimension from dataset */
+        if (config.search.vector_dim != (int)info.dim) {
+            fprintf(stderr, "WARNING: Overriding --vector-dim %d with dataset dim %d\n",
+                    config.search.vector_dim, info.dim);
+            config.search.vector_dim = info.dim;
+        }
+
+        /* Initialize counters */
+        atomic_store(&config.dataset_prefill_counter, 0);
+        atomic_store(&config.dataset_query_counter, 0);
+
+        printf("✓ Dataset loaded: %lu vectors, %lu queries, %u dims, %u neighbors\n",
+               info.num_vectors, info.num_queries, info.dim, info.num_neighbors);
     }
     /* Run default benchmark suite. */
     data = zcalloc(config.datasize + 1);
@@ -3853,16 +4201,16 @@ int main(int argc, char **argv) {
                         : config.vgen_initial_capacity;
                     vgen_set_ground_truth_size(dataset_size);
                     
-                    /* Precompute ground truths if requested (warm-up phase) */
-                    if (config.vgen_precompute) {
-                        printf("\n");
-                        printf("====== Warm-up Phase: Precomputing Ground Truths ======\n");
-                        printf("This eliminates lazy computation overhead for consistent query performance.\n");
-                        printf("Progress will be displayed below...\n\n");
-                        vgen_precompute_ground_truths();
-                        printf("\n");
-                        printf("====== Warm-up Complete - Starting Query Benchmark ======\n\n");
-                    }
+                    // /* Precompute ground truths if requested (warm-up phase) */
+                    // if (config.vgen_precompute) {
+                    //     printf("\n");
+                    //     printf("====== Warm-up Phase: Precomputing Ground Truths ======\n");
+                    //     printf("This eliminates lazy computation overhead for consistent query performance.\n");
+                    //     printf("Progress will be displayed below...\n\n");
+                    //     vgen_precompute_ground_truths();
+                    //     printf("\n");
+                    //     printf("====== Warm-up Complete - Starting Query Benchmark ======\n\n");
+                    // }
                 }
                 /* Use custom vector benchmark function */
                 len = createSearchCmdTemplate(&cmd);

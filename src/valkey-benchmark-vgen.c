@@ -614,17 +614,14 @@ uint64_t vgen_replace_vector_placeholder_query(int thread_id, const size_t *indi
                 printf("...\n");
             }
             
-        /* Copy ground truth neighbors from query */
-        entry->neighbor_count = NEIGHBORS_PER_QUERY;
-        for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
-            entry->neighbors[j] = query.ground_truth[j];
+            /* Copy ground truth neighbors from query */
+            entry->neighbor_count = NEIGHBORS_PER_QUERY;
+            for (int j = 0; j < NEIGHBORS_PER_QUERY; j++) {
+                entry->neighbors[j] = query.ground_truth[j];
+            }
         }
     }
-    
-    /* Free the allocated vector data (allocated by vg_iterator_next_query) */
-    zfree(query.vector.data);
-    query.vector.data = NULL;
-}    /* Release iterator back to pool (lock-free using atomics) */
+    /* Release iterator back to pool (lock-free using atomics) */
     vgen_release_thread_iterator(thread_id, ITER_QUERY);
     
     (void)vector_counter; /* Unused for vgen */
@@ -659,14 +656,14 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
         assert(0);
     }
     
-    /* Get dimensions (read-only after init, no lock needed) */
-    uint32_t dims = vg_get_dimensions(vgen_instance);
-    size_t vector_bytes = dims * sizeof(float);
-    
+   
     /* Get vectors from ingestion iterator and replace both keys and vectors */
     for (size_t i = 0; i < key_count; i++) {
         vector_t vec;
-        
+        /* Replace vector placeholder */
+        if (i < vec_count) {
+            vec.data = (float *)(cmd + vec_indices[i]);
+        }
         /* Access thread-local iterator (no lock needed) */
         if (!vg_iterator_next(iter, &vec)) {
             /* Iterator exhausted, reset it */
@@ -702,14 +699,6 @@ void vgen_replace_vector_and_key_placeholder(int thread_id, const size_t *key_in
             /* Write actual key length in 4-byte length field */
             uint32_t actual_key_len = (uint32_t)key_len;
             memcpy(key_placeholder + 16, &actual_key_len, 4);
-        }
-        
-        /* Replace vector placeholder */
-        if (i < vec_count) {
-            char *vec_placeholder = cmd + vec_indices[i];
-            
-            /* Replace entire vector data */
-            memcpy(vec_placeholder, vec.data, vector_bytes);
         }
     }
     

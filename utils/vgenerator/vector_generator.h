@@ -13,7 +13,7 @@
 
 /* Constants */
 #define MAX_NUM_THREADS 64
-#define MAX_QUERY_VECTORS 100000
+#define MAX_QUERY_VECTORS 20000
 #define RESERVED_KEY_RANGE 1000000
 #define NEIGHBORS_PER_QUERY 10
 
@@ -72,6 +72,7 @@ typedef struct {
 /* Pre-computed query ground truth entry */
 typedef struct {
     vector_key_t query_key;
+    float* query_vector;
     vector_key_t neighbor_keys[NEIGHBORS_PER_QUERY];
     float neighbor_distances[NEIGHBORS_PER_QUERY];
     bool computed;
