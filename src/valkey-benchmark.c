@@ -107,8 +107,7 @@ static long long nstime(void) {
 #define DATASET_VECTOR_PLACEHOLDER_INDEX 15
 
 #define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
-#define VECTOR_PLACEHOLDER_LEN 8 // length of VECTOR_PLACEHOLDER strings
-#define VECTOR_NUM_RAND_DIM (VECTOR_PLACEHOLDER_LEN/sizeof(float)) // Number of random dimensions for vector generation
+#define VECTOR_NUM_RAND_DIM (8/sizeof(float)) // Number of random dimensions for vector generation
 #define VECTOR_PLACEHOLDER_INDEX 11
 
 #define CLUSTER_PLACEHOLDER "{tag}"
@@ -117,7 +116,6 @@ static long long nstime(void) {
 
 #define PLACEHOLDER_NUM_OF 16
 #define PLACEHOLDER_NORMAL_NUM_OF 10  // Number of normal placeholders excluding vector and cluster placeholders
-#define DATASET_KEY_ID_WIDTH 16  /* 16 decimal digits for vector ID */
 
 
 // TODO: Use existing vectors\fields in the index as base for vector\tag\numeric generation
@@ -515,28 +513,43 @@ static int dictSdsKeyCompare(const void *key1, const void *key2);
  * The final key format depends on prefix_len, cluster_tag_len, and vector_id_len
  */
 static int encode_vector_key_fixed(char *key_out, size_t key_out_size,
-                                  const char *prefix, size_t prefix_len,
-                                  const char *cluster_tag, size_t cluster_tag_len,
-                                  uint64_t vector_id, size_t vector_id_len) {
+                                  const char *prefix,
+                                  const char *cluster_tag,
+                                  uint64_t vector_id) {
     if (!key_out || key_out_size == 0) {
         return -1;
     }
+    size_t prefix_len = strlen(config.search.prefix);
+    size_t cluster_tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
+    size_t vector_id_len = PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len; // Fixed width for vector ID
     int ret;
     if (prefix) {
         memcpy(key_out, prefix, prefix_len);
     }
     key_out+=prefix_len;
+    key_out_size-=prefix_len;
     if (config.cluster_mode) {
         if (cluster_tag) {
             memcpy(key_out, cluster_tag, cluster_tag_len);
         }
         key_out+=cluster_tag_len;
+        key_out_size-=cluster_tag_len;
     }  
-    //assert(*key_out == ':'); // Separator
-    *key_out = ':';
+    assert(*key_out == ':'); // Separator
     key_out++; // Skip ':'
-    ret = snprintf(key_out, key_out_size - prefix_len - cluster_tag_len - 1, "%0*lu",
-                        (int)vector_id_len, (unsigned long)vector_id);
+    key_out_size--;
+    char format[32];
+    // debug print parameters
+    // printf("DEBUG: prefix_len=%zu, cluster_tag_len=%zu, vector_id_len=%zu, vector_id=%lu\n",
+    //        prefix_len, cluster_tag_len, vector_id_len, vector_id);
+    // Create format string for fixed width vector ID
+    snprintf(format, sizeof(format), "%%0%zulu", vector_id_len);
+    ret = snprintf(key_out, key_out_size+1, format,
+                        (unsigned long)vector_id);
+    // printf("DEBUG: format='%s', encoded result='%.*s', ret=%d\n",
+    //        format, (int)vector_id_len, p, ret);
+    assert(ret == key_out_size); // Should fit exactly
+    assert(key_out[key_out_size] == '\0');
     return (ret >= 0 && ret < (int)key_out_size) ? 0 : -1;
 }
 
@@ -550,14 +563,14 @@ static int encode_vector_key_fixed(char *key_out, size_t key_out_size,
  * Output parameters can be NULL to skip extracting that field.
  */
 static int decode_vector_key_fixed(const char *key,
-                                  size_t prefix_len, size_t cluster_tag_len,
                                   char *prefix_out, size_t prefix_size,
                                   char *cluster_tag_out, size_t cluster_tag_size,
                                   uint64_t *vector_id_out) {
     if (!key) {
         return -1;
     }
-
+    size_t prefix_len = strlen(config.search.prefix);
+    size_t cluster_tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
     size_t key_len = strlen(key);
     const char *read_pos = key;
 
@@ -676,10 +689,13 @@ static void validateMissingGroundTruthNeighbors(uint64_t *gt_neighbors, uint64_t
 
             /* Reconstruct key using the centralized encoding function */
             char key_buffer[256];
+            key_buffer[strlen(config.search.prefix) + PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1 + PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len] = '\0';
+            key_buffer[strlen(config.search.prefix) + PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len] = ':';
+
             if (encode_vector_key_fixed(key_buffer, sizeof(key_buffer),
-                                       NULL, strlen(config.search.prefix),
-                                       cluster_tag, PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
-                                       gt_vector_id, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len) != 0) {
+                                       NULL,
+                                       cluster_tag,
+                                       gt_vector_id) != 0) {
                 printf("[VALIDATION] Failed to encode key for vector %lu\n", gt_vector_id);
                 checks_performed++;
                 continue;
@@ -707,8 +723,6 @@ static int vectorKeyProcessor(const char *key, void *user_data, int thread_id) {
     char prefix[256];
 
     if (decode_vector_key_fixed(key,
-                               strlen(config.search.prefix),
-                               PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
                                prefix, sizeof(prefix),
                                cluster_tag, sizeof(cluster_tag),
                                &vector_id) != 0) {
@@ -768,8 +782,6 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
             uint64_t vector_id;
 
             if (decode_vector_key_fixed(key_str,
-                                       strlen(config.search.prefix),
-                                       PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
                                        NULL, 0,
                                        cluster_tag, sizeof(cluster_tag),
                                        &vector_id) != 0) {
@@ -1144,9 +1156,11 @@ static void initBaseVector(int dim) {
 }
 
 static sds getVectorKey(void) {
-    sds key;
-    int ph_index = -1;
-    /* Dataset mode - placeholder for entire vector */
+    int ph_index = 0;
+    size_t key_len = strlen(config.search.prefix) + 1; // +1 for ':'
+    if (config.cluster_mode) {
+        key_len += PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
+    }
     if (config.use_dataset) {
         ph_index = DATASET_KEY_PLACEHOLDER_INDEX;
     } else if (config.is_vector_generator) {
@@ -1154,12 +1168,16 @@ static sds getVectorKey(void) {
     } else {
         ph_index = 0; // Original implementation for non-vgen mode
     }
+    key_len += PLACEHOLDERS[ph_index].len;
+    sds key = sdsnewlen("", key_len);
+    int ret = 0;
+    /* Dataset mode - placeholder for entire vector */
     if (config.cluster_mode) {
-        key = sdscatprintf(sdsempty(), "%s{tag}:", config.search.prefix);
+        ret = snprintf(key, key_len+1, "%s{tag}:%s", config.search.prefix, PLACEHOLDERS[ph_index].name);
     } else {
-        key = sdscatprintf(sdsempty(), "%s", config.search.prefix);
-    }
-    key = sdscatlen(key, PLACEHOLDERS[ph_index].name, PLACEHOLDERS[ph_index].len);
+        ret = snprintf(key, key_len+1, "%s:%s", config.search.prefix, PLACEHOLDERS[ph_index].name);
+    }    
+    assert(ret == (int)(key_len)); // -1 for null terminator    
     return key;
 }
 
@@ -1600,7 +1618,7 @@ static void replacePlaceholderVector(const size_t *indices, const size_t count,
     if (!config.use_search || count == 0) return;
     
     /* Self-check: ensure placeholder is exactly 8 bytes */
-    assert(VECTOR_PLACEHOLDER_LEN == 8);
+    assert(PLACEHOLDERS[VECTOR_PLACEHOLDER_INDEX].len == 8);
     
     /* Get key for randomization */
     uint64_t key = 0;
@@ -1639,7 +1657,7 @@ static void replacePlaceholderVector(const size_t *indices, const size_t count,
     /* Replace all occurrences in-place (exactly 8 bytes) */
     for (size_t j = 0; j < count; j++) {
         char *placeholder = cmd + indices[j];        
-        memcpy(placeholder, vector, VECTOR_PLACEHOLDER_LEN);  // Exactly 8 bytes replacement
+        memcpy(placeholder, vector, PLACEHOLDERS[VECTOR_PLACEHOLDER_INDEX].len);  // Exactly 8 bytes replacement
     }
 }
 
@@ -1673,7 +1691,8 @@ static void replacePlaceholderDataset(
         for (size_t i = 0; i < key_count; i++) {
             uint64_t vector_id;
             char *key_write_pos = cmd + key_indices[i];
-            int key_len = strlen(config.search.prefix)+PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len+PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len;
+            char *key = key_write_pos - strlen(config.search.prefix) - PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len - 1;
+            int key_len = strlen(config.search.prefix)+PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len+PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len+1;
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
 
             /* Atomic fetch - no thread conflicts */
@@ -1682,10 +1701,14 @@ static void replacePlaceholderDataset(
             );
             dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
                             &vector_id, vec_write_pos);
-            encode_vector_key_fixed((char*)key_write_pos - strlen(config.search.prefix) - PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len - 1, key_len,
-                                   NULL, strlen(config.search.prefix),
-                                   NULL, PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
-                                   dataset_idx, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
+            // if (i < 5) {
+            //     fprintf(stderr, "DEBUG: Before encode - dataset_idx=%lu, vector_id=%lu, key_placeholder_len=%d\n",
+            //             dataset_idx, vector_id, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
+            // }
+            encode_vector_key_fixed(key, key_len,
+                                   NULL,
+                                   NULL,
+                                   vector_id);
             /* Update cluster tag mapping for new insertions (complements initial cluster scan) */
             if (cluster_tag_count > 0 && cluster_tag_indices && i < cluster_tag_count) {
                 char *cluster_tag_pos = cmd + cluster_tag_indices[i];
@@ -1700,8 +1723,8 @@ static void replacePlaceholderDataset(
 
             static int debug_count = 0;
             if (debug_count < 5) {
-                printf("DEBUG INSERT: dataset_idx=%lu, vector_id=%lu, key_str='%.12s', vec_size=%u bytes\n",
-                    dataset_idx, vector_id, key_write_pos, config.search.vector_dim * 4);
+                printf("DEBUG INSERT: dataset_idx=%lu, vector_id=%lu, key_str='%s', vec_size=%u bytes\n",
+                    dataset_idx, vector_id, key_write_pos-(strlen(config.search.prefix) - PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len - 1), config.search.vector_dim * 4);
                 debug_count++;
             }
         }
@@ -1736,9 +1759,9 @@ static void replacePlaceholderDataset(
             );
 
             encode_vector_key_fixed(key_write_pos - strlen(config.search.prefix) - PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len - 1, key_len,
-                                   NULL, strlen(config.search.prefix),
-                                   NULL, PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
-                                   vector_id, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
+                                   NULL,
+                                   NULL,
+                                   vector_id);
         }
     }        
 }
@@ -2378,7 +2401,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
                 }
                 c->stagptr[c->staglen++] = p;
                 c->stagfree--;
-                p += 5; /* 5 is strlen("{tag}"). */
+                p += PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len; /* 5 is strlen("{tag}"). */
             }
         }
     }
@@ -4101,7 +4124,7 @@ int main(int argc, char **argv) {
 
     if (config.cluster_mode) {
         // We only include the slot placeholder {tag} if cluster mode is enabled
-        tag = ":{tag}";
+        tag = "{tag}";
 
         /* Fetch cluster configuration. */
         if (!fetchClusterConfiguration() || !config.cluster_nodes) {
