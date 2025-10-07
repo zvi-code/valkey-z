@@ -20,6 +20,8 @@ typedef struct {
 
 /* Thread-safe cluster tag mapping table */
 typedef struct {
+    char* prefix;  // Padding for cache alignment
+    int prefix_len; // Length of the prefix
     vectorClusterMapping *mappings;
     uint64_t capacity;
     uint64_t count;
@@ -60,7 +62,8 @@ const char* getClusterTagForVector(clusterTagMap *tag_map, uint64_t vector_id);
 int buildVectorIdMappings(const char *prefix,
                          struct clusterNode **nodes,
                          int node_count,
-                         clusterTagMap *tag_map);
+                         clusterTagMap *tag_map,
+                        keyProcessorCallback key_processor);
 
 /**
  * Progress callback for vector mapping scan

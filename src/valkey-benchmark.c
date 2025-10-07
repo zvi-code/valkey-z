@@ -144,6 +144,8 @@ static const struct {
     [DATASET_VECTOR_PLACEHOLDER_INDEX] = {DATASET_VECTOR_PLACEHOLDER, 16},
 };
 
+
+
 struct benchmarkThread;
 struct clusterNode;
 struct serverConfig;
@@ -479,6 +481,117 @@ static void updateRecallStats(float recall) {
     pthread_mutex_unlock(&dataset_recall_stats.mutex);
 }
 
+
+/* Prototypes */
+static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
+static void createMissingClients(client c);
+static benchmarkThread *createBenchmarkThread(int index);
+static void freeBenchmarkThread(benchmarkThread *thread);
+static void freeBenchmarkThreads(void);
+static void *execBenchmarkThread(void *ptr);
+static void benchmark(const char *title, char *cmd, int len);
+static clusterNode *createClusterNode(char *ip, int port);
+// static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port);
+static sds selectTagByDistribution(void);
+static void parseTagDistributions(const char *distributions_str);
+valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
+static void freeServerConfig(serverConfig *cfg);
+static int fetchClusterSlotsConfiguration(client c);
+static void updateClusterSlotsConfiguration(void);
+static long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData);
+
+/* Dict callbacks */
+static uint64_t dictSdsHash(const void *key);
+static int dictSdsKeyCompare(const void *key1, const void *key2);
+
+#define UNUSED(V) ((void)V)
+
+
+/* Vector key encoding/decoding functions */
+
+/**
+ * Encode a vector key from fixed-size components
+ * Format: prefix + cluster_tag + ':' + vector_id
+ * The final key format depends on prefix_len, cluster_tag_len, and vector_id_len
+ */
+static int encode_vector_key_fixed(char *key_out, size_t key_out_size,
+                                  const char *prefix, size_t prefix_len,
+                                  const char *cluster_tag, size_t cluster_tag_len,
+                                  uint64_t vector_id, size_t vector_id_len) {
+    if (!key_out || key_out_size == 0) {
+        return -1;
+    }
+    int ret;
+    if (prefix) {
+        memcpy(key_out, prefix, prefix_len);
+    }
+    key_out+=prefix_len;
+    if (config.cluster_mode) {
+        if (cluster_tag) {
+            memcpy(key_out, cluster_tag, cluster_tag_len);
+        }
+        key_out+=cluster_tag_len;
+    }  
+    //assert(*key_out == ':'); // Separator
+    *key_out = ':';
+    key_out++; // Skip ':'
+    ret = snprintf(key_out, key_out_size - prefix_len - cluster_tag_len - 1, "%0*lu",
+                        (int)vector_id_len, (unsigned long)vector_id);
+    return (ret >= 0 && ret < (int)key_out_size) ? 0 : -1;
+}
+
+/**
+ * Decode a vector key into components using fixed field sizes
+ * Format: prefix + cluster_tag + ':' + vector_id (fixed width fields)
+ * Returns: 0 on success, -1 on error
+ *
+ * @param prefix_len: Expected prefix length
+ * @param cluster_tag_len: Expected cluster tag length
+ * Output parameters can be NULL to skip extracting that field.
+ */
+static int decode_vector_key_fixed(const char *key,
+                                  size_t prefix_len, size_t cluster_tag_len,
+                                  char *prefix_out, size_t prefix_size,
+                                  char *cluster_tag_out, size_t cluster_tag_size,
+                                  uint64_t *vector_id_out) {
+    if (!key) {
+        return -1;
+    }
+
+    size_t key_len = strlen(key);
+    const char *read_pos = key;
+
+    /* Extract prefix if requested */
+    if (prefix_out && prefix_size > 0 && prefix_len > 0) {
+        assert(!(prefix_len >= prefix_size || key_len < prefix_len));
+        memcpy(prefix_out, read_pos, prefix_len);
+        prefix_out[prefix_len] = '\0';
+    }    
+    read_pos += prefix_len;
+    if (config.cluster_mode) {
+        /* Extract cluster tag if requested */
+        if (cluster_tag_out && cluster_tag_size > 0 && cluster_tag_len > 0) {
+            assert(!(cluster_tag_len >= cluster_tag_size || (read_pos - key) + cluster_tag_len > key_len));
+            memcpy(cluster_tag_out, read_pos, cluster_tag_len);
+            cluster_tag_out[cluster_tag_len] = '\0';
+        }
+        read_pos += cluster_tag_len;
+    }
+   
+    assert(!((read_pos - key) >= key_len));
+    /* Skip the ':' separator */
+    read_pos++;
+
+    /* Extract vector ID if requested */
+    if (vector_id_out) {
+        *vector_id_out = (uint64_t)atoll(read_pos);
+    }
+
+    return 0;
+}
+
+
+
 static void printDatasetRecallStats(void) {
     if (!config.use_dataset || dataset_recall_stats.total_queries == 0) {
         return;
@@ -523,16 +636,17 @@ static void validateMissingGroundTruthNeighbors(uint64_t *gt_neighbors, uint64_t
     if (!config.cluster_mode || !config.use_dataset) return;
 
     /* Extract cluster tags from returned results to understand the pattern */
-    char *sample_cluster_tag = NULL;
+    char sample_cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1];
+    sample_cluster_tag[0] = '\0';
     if (reply && reply->type == VALKEY_REPLY_ARRAY && reply->elements >= 3) {
         /* Get a sample key from the results to extract cluster tag pattern */
         valkeyReply *sample_key = reply->element[1];  /* First result key */
-        if (sample_key && sample_key->type == VALKEY_REPLY_STRING) {
-            sample_cluster_tag = extractClusterTagFromKey(sample_key->str);
+        if (sample_key && (sample_key->type == VALKEY_REPLY_STRING || sample_key->type == VALKEY_REPLY_STATUS)) {
+            memcpy(sample_cluster_tag, sample_key->str + strlen(config.search.prefix), PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len);
+            sample_cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len] = '\0'; /* Null-terminate */
         }
-    }
-
-    if (!sample_cluster_tag) {
+    } 
+    if (sample_cluster_tag[0] == '\0') {
         printf("[VALIDATION] Cannot extract cluster tag pattern from results\n");
         return;
     }
@@ -542,12 +656,12 @@ static void validateMissingGroundTruthNeighbors(uint64_t *gt_neighbors, uint64_t
     int max_checks = 3;  /* Limit validation to avoid performance impact */
 
     for (uint32_t i = 0; i < config.dataset_num_neighbors && i < (uint32_t)k && checks_performed < max_checks; i++) {
-        uint64_t gt_id = gt_neighbors[i];
+        uint64_t gt_vector_id = gt_neighbors[i];
 
         /* Check if this ground truth neighbor is missing from results */
         int found = 0;
         for (int j = 0; j < returned_count; j++) {
-            if (returned_ids[j] == gt_id) {
+            if (returned_ids[j] == gt_vector_id) {
                 found = 1;
                 break;
             }
@@ -555,19 +669,24 @@ static void validateMissingGroundTruthNeighbors(uint64_t *gt_neighbors, uint64_t
 
         if (!found) {
             /* Missing neighbor - try to get cluster tag from mapping */
-            const char *cluster_tag = getClusterTagForVector(&cluster_tag_map, gt_id);
-            if (!cluster_tag) {
-                cluster_tag = sample_cluster_tag;  /* Fallback to sample tag */
+            const char *cluster_tag = getClusterTagForVector(&cluster_tag_map, gt_vector_id);
+            assert(cluster_tag != NULL);
+
+            /* Debug: cluster_tag for vector gt_id: cluster_tag (len=strlen(cluster_tag)) */
+
+            /* Reconstruct key using the centralized encoding function */
+            char key_buffer[256];
+            if (encode_vector_key_fixed(key_buffer, sizeof(key_buffer),
+                                       NULL, strlen(config.search.prefix),
+                                       cluster_tag, PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
+                                       gt_vector_id, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len) != 0) {
+                printf("[VALIDATION] Failed to encode key for vector %lu\n", gt_vector_id);
+                checks_performed++;
+                continue;
             }
 
-            /* Reconstruct key using cluster tag */
-            char key_buffer[256];
-            snprintf(key_buffer, sizeof(key_buffer), "%s{%s}:%016lu",
-                    config.search.prefix, cluster_tag, gt_id);
-
-            printf("[VALIDATION] Missing GT neighbor %lu, checking key: %s\n", gt_id, key_buffer);
-            /* Note: In production, would perform EXISTS check here */
-            /* For now, we just log the reconstructed key for debugging */
+            printf("[VALIDATION] Missing GT neighbor %lu, expected key: %s\n", gt_vector_id, key_buffer);
+            /* Note: Cannot check key existence here to avoid deadlock in connection handler */
             checks_performed++;
         }
     }
@@ -576,10 +695,38 @@ static void validateMissingGroundTruthNeighbors(uint64_t *gt_neighbors, uint64_t
         printf("[VALIDATION] Checked %d missing neighbors for recall %.2f%% using tag '%s'\n",
                checks_performed, recall * 100.0f, sample_cluster_tag);
     }
+}
+/**
+ * Key processor callback for vector ID mapping
+ * This function is called for each key discovered during cluster scan
+ */
+static int vectorKeyProcessor(const char *key, void *user_data, int thread_id) {
+    char cluster_tag[6];
+    uint64_t vector_id;
+    int prefix_len = strlen(config.search.prefix);
+    char prefix[256];
 
-    if (sample_cluster_tag) {
-        zfree(sample_cluster_tag);
+    if (decode_vector_key_fixed(key,
+                               strlen(config.search.prefix),
+                               PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
+                               prefix, sizeof(prefix),
+                               cluster_tag, sizeof(cluster_tag),
+                               &vector_id) != 0) {
+        fprintf(stderr, "Failed to decode key: %s\n", key);
+        exit(1);
     }
+    if (strncmp(prefix, config.search.prefix, prefix_len) != 0) {
+        fprintf(stderr, "Key %s prefix mismatch: expected '%s', got '%s'\n", key, config.search.prefix, prefix);
+        /* Key prefix doesn't match index prefix */
+        exit(1);
+    }
+    // if vector id is larger than dataset_num_vectors, skip it
+    if (config.use_dataset && vector_id >= config.dataset_num_vectors) {
+        return 0; /* Continue processing other keys */
+    }
+    addClusterTagMapping(&cluster_tag_map, vector_id, cluster_tag);
+    /* Key format doesn't match expected vector key pattern */
+    return 0;  /* Continue processing other keys */
 }
 
 static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
@@ -602,17 +749,59 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
     int returned_count = 0;
 
     /* Parse FT.SEARCH results: [count, key1, fields1, key2, fields2, ...] */
+    static _Atomic int total_keys_parsed = 0;
+    static _Atomic int duplicate_keys_skipped = 0;
+    static _Atomic int unique_vectors_extracted = 0;
+
+    /* Use a simple array to track seen vector IDs for this query (max k unique IDs) */
+    uint64_t seen_ids[k];
+    int seen_count = 0;
+
     for (size_t i = 1; i < reply->elements && returned_count < k; i += 2) {
         valkeyReply *key_reply = reply->element[i];
         if (key_reply->type == VALKEY_REPLY_STRING) {
-            /* Extract vector ID from key format: "prefix:{tag}:000000000000" */
+            atomic_fetch_add(&total_keys_parsed, 1);
+
+            /* Extract vector ID using centralized decoding function */
             const char *key_str = key_reply->str;
-            const char *last_colon = strrchr(key_str, ':');
-            if (last_colon != NULL) {
-                uint64_t vector_id = (uint64_t)atoll(last_colon + 1);
+            char cluster_tag[16];
+            uint64_t vector_id;
+
+            if (decode_vector_key_fixed(key_str,
+                                       strlen(config.search.prefix),
+                                       PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
+                                       NULL, 0,
+                                       cluster_tag, sizeof(cluster_tag),
+                                       &vector_id) != 0) {
+                continue; /* Skip malformed keys */
+            }
+
+            /* Quick check if we've seen this vector ID already in this query */
+            int is_duplicate = 0;
+            for (int j = 0; j < seen_count && j < k; j++) {
+                if (seen_ids[j] == vector_id) {
+                    is_duplicate = 1;
+                    break;
+                }
+            }
+
+            if (!is_duplicate && returned_count < k) {
                 returned_ids[returned_count++] = vector_id;
+                seen_ids[seen_count++] = vector_id;
+                atomic_fetch_add(&unique_vectors_extracted, 1);
+            } else if (is_duplicate) {
+                atomic_fetch_add(&duplicate_keys_skipped, 1);
             }
         }
+    }
+
+    /* Print summary every 100 queries */
+    static _Atomic int query_count = 0;
+    int current_query = atomic_fetch_add(&query_count, 1);
+    if (current_query % 100 == 0) {
+        printf("[PARSE-STATS] Query %d: total_keys=%d, duplicates_skipped=%d, unique_vectors=%d\n",
+               current_query, atomic_load(&total_keys_parsed),
+               atomic_load(&duplicate_keys_skipped), atomic_load(&unique_vectors_extracted));
     }
 
     /* Calculate recall@k */
@@ -656,29 +845,6 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
     zfree(returned_ids);
 }
 
-/* Prototypes */
-static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
-static void createMissingClients(client c);
-static benchmarkThread *createBenchmarkThread(int index);
-static void freeBenchmarkThread(benchmarkThread *thread);
-static void freeBenchmarkThreads(void);
-static void *execBenchmarkThread(void *ptr);
-static void benchmark(const char *title, char *cmd, int len);
-static clusterNode *createClusterNode(char *ip, int port);
-// static serverConfig *getServerConfig(enum valkeyConnectionType ct, const char *ip_or_path, int port);
-static sds selectTagByDistribution(void);
-static void parseTagDistributions(const char *distributions_str);
-valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
-static void freeServerConfig(serverConfig *cfg);
-static int fetchClusterSlotsConfiguration(client c);
-static void updateClusterSlotsConfiguration(void);
-static long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData);
-
-/* Dict callbacks */
-static uint64_t dictSdsHash(const void *key);
-static int dictSdsKeyCompare(const void *key1, const void *key2);
-
-#define UNUSED(V) ((void)V)
 
 /* Fast unique vector generation using key-based deterministic randomization */
 static sds createVectorTemplate(uint64_t key_idx) {
@@ -1507,6 +1673,7 @@ static void replacePlaceholderDataset(
         for (size_t i = 0; i < key_count; i++) {
             uint64_t vector_id;
             char *key_write_pos = cmd + key_indices[i];
+            int key_len = strlen(config.search.prefix)+PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len+PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len;
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
 
             /* Atomic fetch - no thread conflicts */
@@ -1515,39 +1682,39 @@ static void replacePlaceholderDataset(
             );
             dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
                             &vector_id, vec_write_pos);
-
-            /* Replace entire 12-byte placeholder with zero-padded ID */
-            char key_id_str[13]; /* 12 bytes + null terminator */
-            snprintf(key_id_str, sizeof(key_id_str), "%012lu", vector_id);
-            memcpy(key_write_pos, key_id_str, 12);  /* Copy exactly 12 bytes */
-
+            encode_vector_key_fixed((char*)key_write_pos - strlen(config.search.prefix) - PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len - 1, key_len,
+                                   NULL, strlen(config.search.prefix),
+                                   NULL, PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
+                                   dataset_idx, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
             /* Update cluster tag mapping for new insertions (complements initial cluster scan) */
             if (cluster_tag_count > 0 && cluster_tag_indices && i < cluster_tag_count) {
                 char *cluster_tag_pos = cmd + cluster_tag_indices[i];
-                char cluster_tag[6] = {0};
+                char cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1];
 
                 /* Extract cluster tag using reusable function */
                 int tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
-                if (extractClusterTag(cluster_tag_pos, tag_len, cluster_tag, sizeof(cluster_tag)) == 0) {
-                    /* Add/update mapping for this vector ID */
-                    addClusterTagMapping(&cluster_tag_map, vector_id, cluster_tag);
-                }
+                memcpy(cluster_tag, cluster_tag_pos, tag_len);
+                cluster_tag[tag_len] = '\0'; /* Null-terminate */
+                addClusterTagMapping(&cluster_tag_map, vector_id, cluster_tag);
             }
 
             static int debug_count = 0;
             if (debug_count < 5) {
                 printf("DEBUG INSERT: dataset_idx=%lu, vector_id=%lu, key_str='%.12s', vec_size=%u bytes\n",
-                    dataset_idx, vector_id, key_id_str, config.search.vector_dim * 4);
+                    dataset_idx, vector_id, key_write_pos, config.search.vector_dim * 4);
                 debug_count++;
             }
         }
     }
-
+    static __thread uint64_t next_query_idx = 0;
+    if (next_query_idx == 0) {
+        next_query_idx = thread_id;
+    }
     /* SEARCH: only vector replacement */
     if (vec_count > 0 && key_count == 0) {
         for (size_t i = 0; i < vec_count; i++) {
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
-            uint64_t query_idx = atomic_fetch_add(&config.dataset_query_counter, 1);
+            uint64_t query_idx = next_query_idx % c->dataset_query_capacity;
 
             /* Enqueue query index for recall tracking */
             if (c && c->dataset_query_indices) {
@@ -1555,6 +1722,7 @@ static void replacePlaceholderDataset(
             }
 
             dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx, vec_write_pos);
+            next_query_idx ++;
         }
     }
 
@@ -1562,15 +1730,15 @@ static void replacePlaceholderDataset(
     if (key_count > 0 && vec_count == 0) {
         for (size_t i = 0; i < key_count; i++) {
             char *key_write_pos = cmd + key_indices[i];
-
-            uint64_t dataset_idx = atomic_fetch_add(
+            int key_len = strlen(config.search.prefix)+PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len+PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len;
+            uint64_t vector_id = atomic_fetch_add(
                 &config.dataset_prefill_counter, 1
             );
 
-            /* Replace entire 12-byte placeholder with zero-padded ID */
-            char key_id_str[13]; /* 12 bytes + null terminator */
-            snprintf(key_id_str, sizeof(key_id_str), "%012lu", dataset_idx);
-            memcpy(key_write_pos, key_id_str, 12);  /* Copy exactly 12 bytes */
+            encode_vector_key_fixed(key_write_pos - strlen(config.search.prefix) - PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len - 1, key_len,
+                                   NULL, strlen(config.search.prefix),
+                                   NULL, PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len,
+                                   vector_id, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
         }
     }        
 }
@@ -1850,22 +2018,24 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                         assert(0);
                     }
                 }
-                if (config.print_search_results) {
-                    printSearchResults(reply);
-                }
-                /* Compute recall if using vector generator */
-                if (config.is_vector_generator && c->vgen_query_head < c->vgen_query_tail) {
-                    /* Dequeue the query index for this response */
-                    uint64_t query_idx = c->vgen_query_indices[(c->vgen_query_head++) % c->vgen_query_capacity];
-                    vgen_compute_recall(query_idx, reply);
-                }
+                if (c->prefix_pending == 0) {
+                    if (config.print_search_results) {
+                        printSearchResults(reply);
+                    }
+                    /* Compute recall if using vector generator */
+                    if (config.is_vector_generator && c->vgen_query_head < c->vgen_query_tail) {
+                        /* Dequeue the query index for this response */
+                        uint64_t query_idx = c->vgen_query_indices[(c->vgen_query_head++) % c->vgen_query_capacity];
+                        vgen_compute_recall(query_idx, reply);
+                    }
 
-                /* Compute recall if using dataset */
-                if (config.use_dataset && c->dataset_query_head < c->dataset_query_tail) {
-                    uint64_t query_idx = c->dataset_query_indices[
-                        (c->dataset_query_head++) % c->dataset_query_capacity
-                    ];
-                    dataset_compute_recall(reply, query_idx);
+                    /* Compute recall if using dataset */
+                    if (config.use_dataset && c->dataset_query_head < c->dataset_query_tail) {
+                        uint64_t query_idx = c->dataset_query_indices[
+                            (c->dataset_query_head++) % c->dataset_query_capacity
+                        ];
+                        dataset_compute_recall(reply, query_idx);
+                    }
                 }
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
@@ -4196,7 +4366,7 @@ int main(int argc, char **argv) {
             int scan_result = buildVectorIdMappings(config.search.prefix,
                                                    config.cluster_nodes,
                                                    config.cluster_node_count,
-                                                   &cluster_tag_map);
+                                                   &cluster_tag_map, vectorKeyProcessor);
             if (scan_result != 0) {
                 fprintf(stderr, "WARNING: Failed to build vector ID mappings, validation may be limited\n");
             } else {

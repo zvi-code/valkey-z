@@ -15,54 +15,6 @@
 #include <string.h>
 #include <pthread.h>
 
-/**
- * Extract vector ID and cluster tag from a vector key
- * Expected format: prefix{cluster_tag}:vector_id
- * Example: "zvec_large_{06S}:000001234567890123"
- */
-static int parseVectorKey(const char *key, uint64_t *vector_id, char *cluster_tag, size_t tag_size) {
-    if (!key || !vector_id || !cluster_tag) {
-        return -1;
-    }
-
-    /* Extract cluster tag using shared utility function */
-    if (extractClusterTag(key, 0, cluster_tag, tag_size) != 0) {
-        return -1;
-    }
-
-    /* Find vector ID after the last colon */
-    const char *id_start = strrchr(key, ':');
-    if (!id_start) return -1;
-
-    id_start++; /* Skip the colon */
-
-    /* Parse vector ID */
-    char *endptr;
-    *vector_id = strtoull(id_start, &endptr, 10);
-    if (*endptr != '\0') return -1;  /* Invalid number */
-
-    return 0;
-}
-
-/**
- * Key processor callback for vector ID mapping
- * This function is called for each key discovered during cluster scan
- */
-static int vectorKeyProcessor(const char *key, void *user_data, int thread_id) {
-    clusterTagMap *tag_map = (clusterTagMap*)user_data;
-    uint64_t vector_id;
-    char cluster_tag[6];
-
-    /* Parse the vector key to extract ID and cluster tag */
-    if (parseVectorKey(key, &vector_id, cluster_tag, sizeof(cluster_tag)) == 0) {
-        /* Add mapping to the table */
-        addClusterTagMapping(tag_map, vector_id, cluster_tag);
-        return 0;
-    }
-
-    /* Key format doesn't match expected vector key pattern */
-    return 0;  /* Continue processing other keys */
-}
 
 void initClusterTagMap(clusterTagMap *tag_map, uint64_t initial_capacity) {
     memset(tag_map, 0, sizeof(clusterTagMap));
@@ -77,18 +29,17 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
     pthread_mutex_lock(&tag_map->mutex);
 
     /* Expand capacity if needed */
-    if (tag_map->count >= tag_map->capacity) {
+    if (vector_id >= tag_map->capacity) {
         tag_map->capacity *= 2;
         tag_map->mappings = zrealloc(tag_map->mappings,
                                    tag_map->capacity * sizeof(vectorClusterMapping));
     }
 
     /* Add new mapping */
-    tag_map->mappings[tag_map->count].vector_id = vector_id;
-    strncpy(tag_map->mappings[tag_map->count].cluster_tag, cluster_tag,
-            sizeof(tag_map->mappings[tag_map->count].cluster_tag) - 1);
-    tag_map->mappings[tag_map->count].cluster_tag[
-        sizeof(tag_map->mappings[tag_map->count].cluster_tag) - 1] = '\0';
+    memcpy(tag_map->mappings[vector_id].cluster_tag, cluster_tag,
+           sizeof(tag_map->mappings[vector_id].cluster_tag) - 1);
+    tag_map->mappings[vector_id].cluster_tag[
+        sizeof(tag_map->mappings[vector_id].cluster_tag) - 1] = '\0';
     tag_map->count++;
 
     pthread_mutex_unlock(&tag_map->mutex);
@@ -96,19 +47,7 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
 
 const char* getClusterTagForVector(clusterTagMap *tag_map, uint64_t vector_id) {
     if (!tag_map) return NULL;
-
-    pthread_mutex_lock(&tag_map->mutex);
-
-    /* Linear search for vector ID */
-    for (uint64_t i = 0; i < tag_map->count; i++) {
-        if (tag_map->mappings[i].vector_id == vector_id) {
-            pthread_mutex_unlock(&tag_map->mutex);
-            return tag_map->mappings[i].cluster_tag;
-        }
-    }
-
-    pthread_mutex_unlock(&tag_map->mutex);
-    return NULL;
+    return tag_map->mappings[vector_id].cluster_tag;
 }
 
 void vectorMappingProgressCallback(uint64_t keys_processed, int active_threads, void *user_data) {
@@ -119,7 +58,8 @@ void vectorMappingProgressCallback(uint64_t keys_processed, int active_threads, 
 int buildVectorIdMappings(const char *prefix,
                          struct clusterNode **nodes,
                          int node_count,
-                         clusterTagMap *tag_map) {
+                         clusterTagMap *tag_map,
+                        keyProcessorCallback key_processor) {
     if (!prefix || !nodes || !tag_map) {
         return -1;
     }
@@ -127,11 +67,12 @@ int buildVectorIdMappings(const char *prefix,
     /* Create scan pattern: prefix* */
     char pattern[256];
     snprintf(pattern, sizeof(pattern), "%s*", prefix);
-
+    tag_map->prefix = zstrdup(prefix);
+    tag_map->prefix_len = strlen(prefix);
     /* Configure cluster scan */
     clusterScanConfig scan_config;
     initClusterScanConfig(&scan_config, pattern, nodes, node_count,
-                         vectorKeyProcessor, tag_map);
+                         key_processor, tag_map);
 
     /* Set performance parameters for vector scanning */
     setClusterScanPerformance(&scan_config, 1000, node_count, 50000);
