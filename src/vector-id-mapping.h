@@ -65,6 +65,7 @@ int buildVectorIdMappings(const char *prefix,
                          clusterTagMap *tag_map,
                         keyProcessorCallback key_processor);
 
+size_t getClusterTagMapCount(clusterTagMap *tag_map);
 /**
  * Progress callback for vector mapping scan
  * @param keys_processed Number of keys processed so far

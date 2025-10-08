@@ -7,6 +7,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <assert.h>
+
+#define MAX_QUERY_VEC_PER_NEIGHBORS 1
+// packed struct of uint64_t array of size MAX_QUERY_VEC_PER_NEIGHBORS
+typedef struct __attribute__((packed)) {
+    uint64_t neighbors[MAX_QUERY_VEC_PER_NEIGHBORS+1];
+} query_vec_neighbors_t;
 
 /* Internal context */
 struct dataset_ctx {
@@ -17,6 +24,18 @@ struct dataset_ctx {
     float *vectors;
     float *queries;
     int64_t *ground_truth;
+    query_vec_neighbors_t *query_neighbors; // a reverse map from neighbor index to query index
+};
+
+static const char *distance_metric_names[] = {
+    [DISTANCE_L2] = "L2",
+    [DISTANCE_COSINE] = "COSINE",
+    [DISTANCE_IP] = "IP"
+};
+
+static const char *dtype_names[] = {
+    [DTYPE_FLOAT32] = "FLOAT32",
+    [DTYPE_FLOAT16] = "FLOAT16"
 };
 
 /* Path resolution: try multiple locations */
@@ -95,30 +114,61 @@ dataset_ctx_t* dataset_init(const char *dataset_name, dataset_info_t *info) {
     ctx->vectors = (float*)((uint8_t*)base + header->vectors_offset);
     ctx->queries = (float*)((uint8_t*)base + header->queries_offset);
     ctx->ground_truth = (int64_t*)((uint8_t*)base + header->ground_truth_offset);
-
+    // a reverse map from neighbor index to query index
+    //
+    ctx->query_neighbors = malloc(sizeof(query_vec_neighbors_t) * header->num_queries*header->num_neighbors);
+    memset(ctx->query_neighbors, 0, sizeof(query_vec_neighbors_t) * header->num_queries*header->num_neighbors);
     /* Return metadata */
     if (info) {
-        info->distance_metric = header->distance_metric;
-        info->dtype = header->dtype;
+        snprintf(info->distance_metric, sizeof(info->distance_metric), "%s", distance_metric_names[ctx->header->distance_metric]);
+        snprintf(info->dtype, sizeof(info->dtype), "%s", dtype_names[ctx->header->dtype]);
         info->dim = header->dim;
         info->num_vectors = header->num_vectors;
         info->num_queries = header->num_queries;
         info->num_neighbors = header->num_neighbors;
     }
-
-    fprintf(stderr, "Dataset loaded: %s (%.2f GB, %lu vecs, %u dims)\n",
-            header->dataset_name,
+    int max_queries_per_neighbor = 0;
+    for (uint64_t q = 0; q < header->num_queries; q++) {
+        for (uint32_t n = 0; n < header->num_neighbors; n++) {
+            int64_t neighbor_idx = ctx->ground_truth[q * header->num_neighbors + n];
+            if (neighbor_idx >= 0 && neighbor_idx < header->num_vectors) {
+                query_vec_neighbors_t *qvn = &ctx->query_neighbors[neighbor_idx];
+                for (int i = 0; i < MAX_QUERY_VEC_PER_NEIGHBORS; i++) {
+                    if (qvn->neighbors[i] == 0) {
+                        qvn->neighbors[i] = q + 1; // store query index + 1 to distinguish from empty
+                        break;
+                    }
+                }
+                qvn->neighbors[1]++; // count of queries that have this neighbor
+                if (qvn->neighbors[1] > max_queries_per_neighbor) {
+                    max_queries_per_neighbor = qvn->neighbors[1];
+                }
+            }
+        }
+    }
+    printf("Dataset loaded: %s (%.2f GB, %lu vecs, %u dims, dtype %s, distance %s, max queries per neighbor %d)\n",
+            header->dataset_name, 
             (double)st.st_size / (1024*1024*1024),
-            header->num_vectors, header->dim);
+            header->num_vectors, header->dim, 
+            dtype_names[header->dtype], distance_metric_names[header->distance_metric], 
+            max_queries_per_neighbor);
 
     return ctx;
 }
 
-int dataset_prefill(dataset_ctx_t *ctx, uint64_t index,
-                    uint64_t *id_out, float *vec_out) {
-    if (!ctx || index >= ctx->header->num_vectors) {
-        return -1;
+uint64_t datasetGetQueryIxByNeighbor(dataset_ctx_t *ctx, uint64_t neighbor_index, uint32_t ix) {
+    if (!ctx || neighbor_index >= ctx->header->num_vectors || ix >= MAX_QUERY_VEC_PER_NEIGHBORS) {
+        return (uint64_t)-1;
     }
+    uint64_t qix = ctx->query_neighbors[neighbor_index].neighbors[ix];
+    if (qix == 0) return (uint64_t)-1;
+    return qix - 1; // stored as index + 1
+}
+
+int datasetGetVector(dataset_ctx_t *ctx, uint64_t index,
+                    uint64_t *id_out, float *vec_out) {
+    assert(ctx);
+    assert(index < ctx->header->num_vectors);
 
     /* ID is the index itself (can extend later) */
     *id_out = index;
@@ -133,7 +183,7 @@ int dataset_prefill(dataset_ctx_t *ctx, uint64_t index,
     return 0;
 }
 
-int dataset_query(dataset_ctx_t *ctx, uint64_t query_index,
+int datasetSetQueryVec(dataset_ctx_t *ctx, uint64_t query_index,
                   float *query_vec_out) {
     if (!ctx || query_index >= ctx->header->num_queries) {
         return -1;
@@ -158,8 +208,8 @@ int dataset_query(dataset_ctx_t *ctx, uint64_t query_index,
 int dataset_get_info(dataset_ctx_t *ctx, dataset_info_t *info) {
     if (!ctx || !info) return -1;
 
-    info->distance_metric = ctx->header->distance_metric;
-    info->dtype = ctx->header->dtype;
+    snprintf(info->distance_metric, sizeof(info->distance_metric), "%s", distance_metric_names[ctx->header->distance_metric]);
+    snprintf(info->dtype, sizeof(info->dtype), "%s", dtype_names[ctx->header->dtype]);
     info->dim = ctx->header->dim;
     info->num_vectors = ctx->header->num_vectors;
     info->num_queries = ctx->header->num_queries;
@@ -168,14 +218,13 @@ int dataset_get_info(dataset_ctx_t *ctx, dataset_info_t *info) {
     return 0;
 }
 
-int dataset_get_neighbors(dataset_ctx_t *ctx, uint64_t query_index, uint64_t *neighbors_out) {
+int datasetGetNeighbors(dataset_ctx_t *ctx, uint64_t query_index, uint64_t *neighbors_out) {
     if (!ctx || !neighbors_out) return -1;
     if (query_index >= ctx->header->num_queries) return -1;
 
     /* Copy ground truth neighbors for this query */
-    int64_t *gt_start = ctx->ground_truth + query_index * ctx->header->num_neighbors;
     for (uint32_t i = 0; i < ctx->header->num_neighbors; i++) {
-        neighbors_out[i] = (uint64_t)gt_start[i];
+        neighbors_out[i] = (uint64_t)ctx->ground_truth[query_index * ctx->header->num_neighbors + i];
     }
 
     return 0;

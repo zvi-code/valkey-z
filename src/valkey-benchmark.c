@@ -479,6 +479,9 @@ static void updateRecallStats(float recall) {
     pthread_mutex_unlock(&dataset_recall_stats.mutex);
 }
 
+// create printf wrapper function that prints inder mutex lock
+// static pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 /* Prototypes */
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
@@ -521,36 +524,39 @@ static int encode_vector_key_fixed(char *key_out, size_t key_out_size,
     }
     size_t prefix_len = strlen(config.search.prefix);
     size_t cluster_tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
-    size_t vector_id_len = PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len; // Fixed width for vector ID
+    size_t key_write_len = prefix_len + cluster_tag_len + 1 + PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len; // +1 for ':' +12 for vector_id
+    // size_t vector_id_len = PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len; // Fixed width for vector ID
     int ret;
     if (prefix) {
         memcpy(key_out, prefix, prefix_len);
     }
     key_out+=prefix_len;
-    key_out_size-=prefix_len;
+    key_write_len-=prefix_len;
     if (config.cluster_mode) {
         if (cluster_tag) {
             memcpy(key_out, cluster_tag, cluster_tag_len);
         }
         key_out+=cluster_tag_len;
-        key_out_size-=cluster_tag_len;
+        key_write_len-=cluster_tag_len;
     }  
     assert(*key_out == ':'); // Separator
     key_out++; // Skip ':'
-    key_out_size--;
-    char format[32];
+    key_write_len--;
+    // char format[32];
     // debug print parameters
     // printf("DEBUG: prefix_len=%zu, cluster_tag_len=%zu, vector_id_len=%zu, vector_id=%lu\n",
     //        prefix_len, cluster_tag_len, vector_id_len, vector_id);
     // Create format string for fixed width vector ID
-    snprintf(format, sizeof(format), "%%0%zulu", vector_id_len);
-    ret = snprintf(key_out, key_out_size+1, format,
+    // snprintf(format, sizeof(format), "%%0%zulu", vector_id_len);
+    assert(12 == PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
+    // Encode vector ID with fixed width
+    ret = snprintf(key_out, key_out_size+1, "%012lu",
                         (unsigned long)vector_id);
     // printf("DEBUG: format='%s', encoded result='%.*s', ret=%d\n",
     //        format, (int)vector_id_len, p, ret);
-    assert(ret == key_out_size); // Should fit exactly
-    assert(key_out[key_out_size] == '\0');
-    return (ret >= 0 && ret < (int)key_out_size) ? 0 : -1;
+    assert(ret == key_write_len); // Should fit exactly
+    assert(key_out[key_write_len] == '\0');
+    return (ret >= 0 && ret <= (int)key_write_len) ? 0 : -1;
 }
 
 /**
@@ -641,77 +647,6 @@ static void printDatasetRecallStats(void) {
 }
 
 
-
-/* Validate missing ground truth neighbors by checking if they exist in the engine */
-static void validateMissingGroundTruthNeighbors(uint64_t *gt_neighbors, uint64_t *returned_ids,
-                                               int returned_count, int k, float recall,
-                                               valkeyReply *reply) {
-    if (!config.cluster_mode || !config.use_dataset) return;
-
-    /* Extract cluster tags from returned results to understand the pattern */
-    char sample_cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1];
-    sample_cluster_tag[0] = '\0';
-    if (reply && reply->type == VALKEY_REPLY_ARRAY && reply->elements >= 3) {
-        /* Get a sample key from the results to extract cluster tag pattern */
-        valkeyReply *sample_key = reply->element[1];  /* First result key */
-        if (sample_key && (sample_key->type == VALKEY_REPLY_STRING || sample_key->type == VALKEY_REPLY_STATUS)) {
-            memcpy(sample_cluster_tag, sample_key->str + strlen(config.search.prefix), PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len);
-            sample_cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len] = '\0'; /* Null-terminate */
-        }
-    } 
-    if (sample_cluster_tag[0] == '\0') {
-        printf("[VALIDATION] Cannot extract cluster tag pattern from results\n");
-        return;
-    }
-
-    /* Check a few missing neighbors (not all for performance) */
-    int checks_performed = 0;
-    int max_checks = 3;  /* Limit validation to avoid performance impact */
-
-    for (uint32_t i = 0; i < config.dataset_num_neighbors && i < (uint32_t)k && checks_performed < max_checks; i++) {
-        uint64_t gt_vector_id = gt_neighbors[i];
-
-        /* Check if this ground truth neighbor is missing from results */
-        int found = 0;
-        for (int j = 0; j < returned_count; j++) {
-            if (returned_ids[j] == gt_vector_id) {
-                found = 1;
-                break;
-            }
-        }
-
-        if (!found) {
-            /* Missing neighbor - try to get cluster tag from mapping */
-            const char *cluster_tag = getClusterTagForVector(&cluster_tag_map, gt_vector_id);
-            assert(cluster_tag != NULL);
-
-            /* Debug: cluster_tag for vector gt_id: cluster_tag (len=strlen(cluster_tag)) */
-
-            /* Reconstruct key using the centralized encoding function */
-            char key_buffer[256];
-            key_buffer[strlen(config.search.prefix) + PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1 + PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len] = '\0';
-            key_buffer[strlen(config.search.prefix) + PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len] = ':';
-
-            if (encode_vector_key_fixed(key_buffer, sizeof(key_buffer),
-                                       NULL,
-                                       cluster_tag,
-                                       gt_vector_id) != 0) {
-                printf("[VALIDATION] Failed to encode key for vector %lu\n", gt_vector_id);
-                checks_performed++;
-                continue;
-            }
-
-            printf("[VALIDATION] Missing GT neighbor %lu, expected key: %s\n", gt_vector_id, key_buffer);
-            /* Note: Cannot check key existence here to avoid deadlock in connection handler */
-            checks_performed++;
-        }
-    }
-
-    if (checks_performed > 0) {
-        printf("[VALIDATION] Checked %d missing neighbors for recall %.2f%% using tag '%s'\n",
-               checks_performed, recall * 100.0f, sample_cluster_tag);
-    }
-}
 /**
  * Key processor callback for vector ID mapping
  * This function is called for each key discovered during cluster scan
@@ -742,121 +677,6 @@ static int vectorKeyProcessor(const char *key, void *user_data, int thread_id) {
     /* Key format doesn't match expected vector key pattern */
     return 0;  /* Continue processing other keys */
 }
-
-static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
-    if (!reply || reply->type != VALKEY_REPLY_ARRAY || reply->elements < 2) {
-        return;
-    }
-
-    /* Get ground truth from dataset */
-    uint64_t *gt_neighbors = zmalloc(
-        config.dataset_num_neighbors * sizeof(uint64_t)
-    );
-    if (dataset_get_neighbors((dataset_ctx_t*)config.dataset_ctx, query_idx, gt_neighbors) != 0) {
-        zfree(gt_neighbors);
-        return;
-    }
-
-    /* Extract returned vector IDs from search results */
-    int k = config.search.k;
-    uint64_t *returned_ids = zmalloc(k * sizeof(uint64_t));
-    int returned_count = 0;
-
-    /* Parse FT.SEARCH results: [count, key1, fields1, key2, fields2, ...] */
-    static _Atomic int total_keys_parsed = 0;
-    static _Atomic int duplicate_keys_skipped = 0;
-    static _Atomic int unique_vectors_extracted = 0;
-
-    /* Use a simple array to track seen vector IDs for this query (max k unique IDs) */
-    uint64_t seen_ids[k];
-    int seen_count = 0;
-
-    for (size_t i = 1; i < reply->elements && returned_count < k; i += 2) {
-        valkeyReply *key_reply = reply->element[i];
-        if (key_reply->type == VALKEY_REPLY_STRING) {
-            atomic_fetch_add(&total_keys_parsed, 1);
-
-            /* Extract vector ID using centralized decoding function */
-            const char *key_str = key_reply->str;
-            char cluster_tag[16];
-            uint64_t vector_id;
-
-            if (decode_vector_key_fixed(key_str,
-                                       NULL, 0,
-                                       cluster_tag, sizeof(cluster_tag),
-                                       &vector_id) != 0) {
-                continue; /* Skip malformed keys */
-            }
-
-            /* Quick check if we've seen this vector ID already in this query */
-            int is_duplicate = 0;
-            for (int j = 0; j < seen_count && j < k; j++) {
-                if (seen_ids[j] == vector_id) {
-                    is_duplicate = 1;
-                    break;
-                }
-            }
-
-            if (!is_duplicate && returned_count < k) {
-                returned_ids[returned_count++] = vector_id;
-                seen_ids[seen_count++] = vector_id;
-                atomic_fetch_add(&unique_vectors_extracted, 1);
-            } else if (is_duplicate) {
-                atomic_fetch_add(&duplicate_keys_skipped, 1);
-            }
-        }
-    }
-
-    /* Print summary every 100 queries */
-    static _Atomic int query_count = 0;
-    int current_query = atomic_fetch_add(&query_count, 1);
-    if (current_query % 100 == 0) {
-        printf("[PARSE-STATS] Query %d: total_keys=%d, duplicates_skipped=%d, unique_vectors=%d\n",
-               current_query, atomic_load(&total_keys_parsed),
-               atomic_load(&duplicate_keys_skipped), atomic_load(&unique_vectors_extracted));
-    }
-
-    /* Calculate recall@k */
-    int matches = 0;
-    for (int i = 0; i < returned_count; i++) {
-        for (uint32_t j = 0; j < config.dataset_num_neighbors && j < (uint32_t)k; j++) {
-            if (returned_ids[i] == gt_neighbors[j]) {
-                matches++;
-                break;
-            }
-        }
-    }
-
-    float recall = returned_count > 0 ? (float)matches / k : 0.0f;
-    updateRecallStats(recall);
-
-    /* Validate missing ground truth neighbors if recall is low */
-    if (recall < 0.80f) {
-        validateMissingGroundTruthNeighbors(gt_neighbors, returned_ids, returned_count, k, recall, reply);
-    }
-
-    /* Debug output for first few queries */
-    static _Atomic int debug_count = 0;
-    int current_debug = atomic_fetch_add(&debug_count, 1);
-    if (current_debug < 3) {
-        printf("\n[DATASET RECALL #%d] Query idx=%lu\n", current_debug, query_idx);
-        printf("  Reply elements: %zu, returned_count: %d, k: %d\n",
-               reply->elements, returned_count, k);
-        printf("  Returned IDs: ");
-        for (int i = 0; i < returned_count; i++) {
-            printf("%lu ", returned_ids[i]);
-        }
-        printf("\n  Ground truth: ");
-        for (uint32_t j = 0; j < config.dataset_num_neighbors && j < 10; j++) {
-            printf("%lu ", gt_neighbors[j]);
-        }
-        printf("\n  Matches: %d, Recall: %.2f%%\n", matches, recall * 100.0f);
-    }
-
-    zfree(gt_neighbors);
-    zfree(returned_ids);
-}
-
 
 /* Fast unique vector generation using key-based deterministic randomization */
 static sds createVectorTemplate(uint64_t key_idx) {
@@ -924,26 +744,33 @@ static sds createVectorTemplate(uint64_t key_idx) {
 }
 
 /* Print FT.SEARCH results in a user-friendly format */
-static void printSearchResults(valkeyReply *reply) {
+static void printSearchResults(valkeyReply *reply, uint64_t query_idx) {
     if (!reply || reply->type != VALKEY_REPLY_ARRAY) {
-        printf("Invalid search result format\n");
+        // printf("Invalid search result format\n");
         return;
     }
     
     if (reply->elements < 1) {
         printf("No search results\n");
-        return;
+        assert(0);
     }
-    
+    // lock mutex to prevent interleaved prints
+    pthread_mutex_lock(&dataset_recall_stats.mutex);
+    int num_elements = 0;
+
     /* First element is the total number of results */
     if (reply->element[0]->type == VALKEY_REPLY_INTEGER) {
-        printf("\n=== Search Results (Total: %lld) ===\n", reply->element[0]->integer);
+        printf("\n===Query %ld Search Results (Total: %lld) ===\n", query_idx, reply->element[0]->integer);
+        num_elements = reply->element[0]->integer;
     }
-    
+    if (num_elements == 0) {
+        printf("No search results\n");
+        assert(0);
+    }
     /* Print ground truth if using vector generator */
     if (config.is_vector_generator) {     
-        uint64_t neighbors[10]; /* NEIGHBORS_PER_QUERY = 10 */
-        uint64_t query_idx = vgen_get_current_query_index();
+        uint64_t neighbors[100]; /* NEIGHBORS_PER_QUERY = 10 */
+        query_idx = vgen_get_current_query_index();
         int neighbor_count = vgen_get_ground_truth(query_idx, neighbors);
         
         if (neighbor_count > 0) {
@@ -956,81 +783,117 @@ static void printSearchResults(valkeyReply *reply) {
             printf("\n");
         }
     }
-    
+    /* Get ground truth from dataset */
+    uint64_t *gt_neighbors = zmalloc(
+        config.dataset_num_neighbors * sizeof(uint64_t)
+    );
+    if (datasetGetNeighbors((dataset_ctx_t*)config.dataset_ctx, query_idx, gt_neighbors) != 0) {
+        zfree(gt_neighbors);
+        pthread_mutex_unlock(&dataset_recall_stats.mutex);
+        printf("Failed to get ground truth for query index %lu\n", query_idx);
+        assert(0);
+    }
     /* Calculate number of results to display (limit to 20) */
     size_t total_results = (reply->elements - 1) / 2;
-    size_t max_display = total_results > 20 ? 20 : total_results;
-    
-    if (total_results > 20) {
-        printf("  (Showing first 20 of %zu results)\n", total_results);
+    size_t num_vecs_ids = 0;    
+    if (config.search.nocontent) {
+        total_results = reply->elements - 1; // Each element is a key
     }
-    size_t end_index = total_results * 2;
-    /* Results come in pairs: key, fields 
-     * The score field (__<vector_field>_score) is included in the fields */
-    for (size_t i = end_index; i > 2 && max_display > 0; i -= 2, max_display--) {
-        valkeyReply *keyReply = reply->element[i - 1];
-        valkeyReply *fieldsReply = reply->element[i];
-
-        /* Extract score from fields if available */
-        double score = -1.0;
-        if (fieldsReply && fieldsReply->type == VALKEY_REPLY_ARRAY) {
-            for (size_t j = 0; j < fieldsReply->elements; j += 2) {
-                if (j + 1 >= fieldsReply->elements) break;
-                valkeyReply *fieldName = fieldsReply->element[j];
-                valkeyReply *fieldValue = fieldsReply->element[j + 1];
-                if ((fieldName->type == VALKEY_REPLY_STRING || fieldName->type == VALKEY_REPLY_STATUS) &&
-                    strstr(fieldName->str, "_score") != NULL) {
-                    if (fieldValue->type == VALKEY_REPLY_STRING || fieldValue->type == VALKEY_REPLY_STATUS) {
-                        score = atof(fieldValue->str);
-                    }
+    uint64_t *result_vec_ids = zmalloc(total_results * sizeof(uint64_t));
+    // size_t max_display = total_results > 100 ? 100 : total_results;
+    float score = -1.0;
+    // if (total_results > 100) {
+    printf("  (Showing first 100 of %zu results)\n", total_results);
+    // }
+    // size_t end_index = total_results * 2;
+    for (size_t i = 0; i < reply->elements; i++) {
+        valkeyReply *resNeighborKey = reply->element[i + 1];
+        if (!resNeighborKey) {
+            printf("Invalid key format, resNeighborKey is NULL at index %zu\n", i);
+            continue;
+            // assert(0);
+        }
+        char* vector_key = resNeighborKey->str;        
+        if (config.search.nocontent) {
+            // No content mode: only show keys
+            if (resNeighborKey && (resNeighborKey->type == VALKEY_REPLY_STRING || resNeighborKey->type == VALKEY_REPLY_STATUS)) {
+                printf("\nResult %zu: %s\n", i, resNeighborKey->str);
+            } else {
+                printf("Invalid key format in NOCONTENT mode, type: %d\n", resNeighborKey? resNeighborKey->type : -1);
+                assert(0);
+            }
+        } else {
+            i++;
+            valkeyReply *resNeighborFields = reply->element[i + 1];
+            if (!resNeighborKey || (resNeighborKey->type != VALKEY_REPLY_STRING && resNeighborKey->type != VALKEY_REPLY_STATUS)) {
+                printf("Invalid key format in CONTENT mode, resNeighborKey type: %d\n", resNeighborKey? resNeighborKey->type : -1);
+                assert(0);
+            }
+            if (!resNeighborFields || resNeighborFields->type != VALKEY_REPLY_ARRAY) {
+                if (!resNeighborFields) {
+                    printf("Invalid key format in CONTENT mode, resNeighborFields is NULL\n");
+                } else if (resNeighborFields->type == VALKEY_REPLY_STRING || resNeighborFields->type == VALKEY_REPLY_STATUS) {
+                    printf("Invalid key format in CONTENT mode, resNeighborFields %s type: %d\n", resNeighborFields->str, resNeighborFields->type);
+                } else {
+                    printf("Invalid key format in CONTENT mode, resNeighborFields type: %d\n", resNeighborFields->type);
+                }
+                assert(0);
+            }
+            /* Extract score from fields if available */
+            score = -1.0;
+            char* field_name = resNeighborFields->element[0]->str;
+            if (strstr(field_name, "_score") != NULL) {
+                valkeyReply *field_value = resNeighborFields->element[1];
+                if (field_value->type == VALKEY_REPLY_STRING || field_value->type == VALKEY_REPLY_STATUS) {
+                    score = atof(field_value->str);
+                }
+                printf("\n  Result %zu: %s [distance: %.6f]\n", (i/2)+1, resNeighborKey->str, score);
+            } else {
+                printf("\n  Result %zu: %s\n", (i/2)+1, resNeighborKey->str);
+            }
+        }
+        /* Extract vector ID using centralized decoding function */
+        char cluster_tag[16];
+        uint64_t vector_id;
+        if (decode_vector_key_fixed(vector_key,
+                                       NULL, 0,
+                                       cluster_tag, sizeof(cluster_tag),
+                                       &vector_id) != 0) {
+            fprintf(stderr, "Failed to decode key: %s\n", vector_key);
+            fflush(stderr);
+            assert(0);
+        }
+        result_vec_ids[num_vecs_ids++] = vector_id;
+    }
+    /* Compare with ground truth if available */
+    if (config.use_dataset && num_vecs_ids > 0) {
+        printf("\n=== Ground Truth Comparison ===\n");
+        int matches = 0;
+        for (size_t i = 0; i < num_vecs_ids; i++) {
+            int found = -1;
+            for (uint32_t j = 0; j < config.dataset_num_neighbors; j++) {
+                if (result_vec_ids[i] == gt_neighbors[j]) {
+                    matches++;
+                    found = j;
                     break;
                 }
             }
+            int64_t query_index = datasetGetQueryIxByNeighbor((dataset_ctx_t*)config.dataset_ctx, result_vec_ids[i], 0);
+            int has_more_query_sources = datasetGetQueryIxByNeighbor((dataset_ctx_t*)config.dataset_ctx, result_vec_ids[i], 1);            
+            printf("  [SR vs GT] %lu vs %lu, %s(found in GT at index %d), is neighbor of query_index %ld, %s %d\n",
+                   gt_neighbors[i], result_vec_ids[i], (found >= 0) ? "[MATCH]" : "[MISS]", found, query_index, has_more_query_sources > 0 ? "(multiple query sources)" : "", has_more_query_sources + 1);
         }
-        
-        /* Print the key with score */
-        if ((keyReply->type == VALKEY_REPLY_STRING || keyReply->type == VALKEY_REPLY_STATUS)) {
-            size_t result_num = ((i - 1) / 2) + 1;
-            if (score >= 0) {
-                printf("\n  Result %zu: %s [distance: %.6f]\n", result_num, keyReply->str, score);
-            } else {
-                printf("\n  Result %zu: %s\n", result_num, keyReply->str);
-            }
-        }
-        
-        /* Print the fields */
-        if (fieldsReply && fieldsReply->type == VALKEY_REPLY_ARRAY) {
-            for (size_t j = 0; j < fieldsReply->elements; j += 2) {
-                if (j + 1 >= fieldsReply->elements) break;
-                
-                valkeyReply *fieldName = fieldsReply->element[j];
-                valkeyReply *fieldValue = fieldsReply->element[j + 1];
-                
-                if ((fieldName->type == VALKEY_REPLY_STRING || fieldName->type == VALKEY_REPLY_STATUS) && (fieldValue->type == VALKEY_REPLY_STRING || fieldValue->type == VALKEY_REPLY_STATUS)) {
-                    /* Check if it's a score field - already printed above */
-                    if (strstr(fieldName->str, "_score") != NULL) {
-                        continue; /* Skip - already shown in header */
-                    }
-                    /* Check if it's a vector field (binary data) */
-                    else if (strstr(fieldName->str, "vector") != NULL || strstr(fieldName->str, "embedding") != NULL) {                        
-                        printf("    %s: [binary vector data, %zu bytes]\n", fieldName->str, fieldValue->len);
-                        // data is float32, print first 24 floats if available
-                        if (fieldValue->len >= 96) { // 24 floats * 4 bytes each
-                            printf("    First 24 floats: ");
-                            for (size_t k = 0; k < 96; k += 4) {
-                                float value;
-                                memcpy(&value, fieldValue->str + k, sizeof(float));
-                                printf("%f ", value);
-                            }
-                            printf("\n");
-                        }
-                    } else {
-                        printf("    %s: %s\n", fieldName->str, fieldValue->str);
-                    }
-                }
-            }
-        }
+        float recall = (float)matches / num_vecs_ids;
+
+        printf("  Total matches: %d out of %zu, Recall: %.2f%%\n", matches, num_vecs_ids, recall * 100.0f);
+        pthread_mutex_unlock(&dataset_recall_stats.mutex);
+
+        updateRecallStats(recall);
+    } else {
+        pthread_mutex_unlock(&dataset_recall_stats.mutex);
     }
+    zfree(gt_neighbors);
+    zfree(result_vec_ids);   
     printf("\n");
 }
 
@@ -1222,8 +1085,8 @@ static int createVectorInsertCmdTemplate(char **cmd) {
 static int createSearchCmdTemplate(char **cmd) {
     int len;
     /* Validation checks */
-    printf("Creating FT.SEARCH command template for index '%s' dimension %d/%ld k %d ef_search %d vector_field %s tag_field %s tag_filter %s nocontent %d\n", 
-        config.search.name, config.search.vector_dim, VECTOR_NUM_RAND_DIM, 
+    printf("Creating FT.SEARCH command template for index '%s' algorithm %s dimension %d rand-dim %ld k %d ef_search %d vector_field %s tag_field %s tag_filter %s nocontent %d\n", 
+        config.search.name, config.search.algorithm, config.search.vector_dim, VECTOR_NUM_RAND_DIM, 
         config.search.k, config.search.ef_search, config.search.vector_field, 
         config.search.tag_field, config.search.curr_conf.tag_filter, config.search.nocontent);
     assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim > VECTOR_NUM_RAND_DIM);    
@@ -1274,18 +1137,17 @@ static int createSearchCmdTemplate(char **cmd) {
     if (config.search.nocontent) {
         /* With NOCONTENT, we need RETURN to get the score field */
         len = valkeyFormatCommand(cmd, 
-            "FT.SEARCH %b %b NOCONTENT %s PARAMS 2 query_vector %b DIALECT 2", 
+            "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b", 
             config.search.name, sdslen(config.search.name), 
             query, sdslen(query),
-            score_field,
             vector_binary, sdslen(vector_binary));
     } else {
         /* Without NOCONTENT, all fields including score are returned by default */
         len = valkeyFormatCommand(cmd,
-            "FT.SEARCH %b %b RETURN 1 __%s_score PARAMS 2 query_vector %b DIALECT 2",
+            "FT.SEARCH %b %b RETURN 1 %s PARAMS 2 query_vector %b",
             config.search.name, sdslen(config.search.name),
             query, sdslen(query),
-            config.search.vector_field,
+            score_field,
             vector_binary, sdslen(vector_binary));
     }
     
@@ -1685,7 +1547,8 @@ static void replacePlaceholderDataset(
 
     /* Validate placeholder consistency */
     assert((key_count == vec_count) || (vec_count == 0) || (key_count == 0));
-
+    // dataset is prefilled
+    int dataset_prefilled = getClusterTagMapCount(&cluster_tag_map) >= config.dataset_num_vectors;
     /* INSERT/PREFILL: both key and vector replacement */
     if (key_count > 0 && vec_count > 0) {
         for (size_t i = 0; i < key_count; i++) {
@@ -1694,25 +1557,58 @@ static void replacePlaceholderDataset(
             char *key = key_write_pos - strlen(config.search.prefix) - PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len - 1;
             int key_len = strlen(config.search.prefix)+PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len+PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len+1;
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
+            const char* cluster_tag = NULL;
+            uint64_t dataset_idx = 0;
+            /* Determine dataset index to use */
+            if (!dataset_prefilled) {
+                /* Atomic fetch - no thread conflicts */
+                dataset_idx = atomic_fetch_add(
+                    &config.dataset_prefill_counter, 1
+                );
+                while (getClusterTagForVector(&cluster_tag_map, dataset_idx)) {
+                    dataset_idx = atomic_fetch_add(
+                        &config.dataset_prefill_counter, 1);
+                    if (dataset_idx >= config.dataset_num_vectors) {
+                        printf("Dataset exhausted while trying to avoid duplicate cluster tags. Re-setting prefill.\n");
+                        atomic_store(&config.dataset_prefill_counter, 0);
+                        dataset_idx = atomic_fetch_add(&config.dataset_prefill_counter, 1);
+                    }
+                    dataset_prefilled = (getClusterTagMapCount(&cluster_tag_map) >= config.dataset_num_vectors);
+                    if (dataset_prefilled) {
+                        // override random-vector, reuse existing tags
+                        printf("All dataset entries have cluster tags. Continuing with possible duplicate tags.\n");
+                        break;
+                    }
+                } 
+            } 
+            if (dataset_prefilled) {
+                /* Random access after prefill */
+                if (config.sequential_replacement) {
+                    dataset_idx = atomic_fetch_add_explicit(vector_counter, 1, memory_order_relaxed);
+                    dataset_idx %= config.dataset_num_vectors;
+                } else {
+                    dataset_idx = random();
+                    dataset_idx %= config.dataset_num_vectors;
+                }
+                cluster_tag = getClusterTagForVector(&cluster_tag_map, dataset_idx);
+                if (!cluster_tag) {
+                    printf("No cluster tag found for vector ID %lu\n", dataset_idx);
+                    assert(0);
+                }
+            }
 
-            /* Atomic fetch - no thread conflicts */
-            uint64_t dataset_idx = atomic_fetch_add(
-                &config.dataset_prefill_counter, 1
-            );
-            dataset_prefill((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
+            datasetGetVector((dataset_ctx_t*)config.dataset_ctx, dataset_idx,
                             &vector_id, vec_write_pos);
-            // if (i < 5) {
-            //     fprintf(stderr, "DEBUG: Before encode - dataset_idx=%lu, vector_id=%lu, key_placeholder_len=%d\n",
-            //             dataset_idx, vector_id, PLACEHOLDERS[DATASET_KEY_PLACEHOLDER_INDEX].len);
-            // }
+      
             encode_vector_key_fixed(key, key_len,
                                    NULL,
-                                   NULL,
+                                   cluster_tag, // cluster tag may be NULL if dataset is prefilled and no tags, but if tags exist, it must be provided and override existing tag. 
+                                   // TODO need to handle case of cluster node mismatch
                                    vector_id);
             /* Update cluster tag mapping for new insertions (complements initial cluster scan) */
-            if (cluster_tag_count > 0 && cluster_tag_indices && i < cluster_tag_count) {
+            if (!dataset_prefilled && cluster_tag_count > 0 && cluster_tag_indices && i < cluster_tag_count) {
                 char *cluster_tag_pos = cmd + cluster_tag_indices[i];
-                char cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1];
+                char cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1];  
 
                 /* Extract cluster tag using reusable function */
                 int tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
@@ -1744,7 +1640,7 @@ static void replacePlaceholderDataset(
                 c->dataset_query_indices[(c->dataset_query_tail++) % c->dataset_query_capacity] = query_idx;
             }
 
-            dataset_query((dataset_ctx_t*)config.dataset_ctx, query_idx, vec_write_pos);
+            datasetSetQueryVec((dataset_ctx_t*)config.dataset_ctx, query_idx, vec_write_pos);
             next_query_idx ++;
         }
     }
@@ -2041,9 +1937,12 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                         assert(0);
                     }
                 }
-                if (c->prefix_pending == 0) {
+                if (c->prefix_pending <= 0) {
                     if (config.print_search_results) {
-                        printSearchResults(reply);
+                        uint64_t query_idx = c->dataset_query_indices[
+                            (c->dataset_query_head++) % c->dataset_query_capacity
+                        ];
+                        printSearchResults(reply, query_idx);
                     }
                     /* Compute recall if using vector generator */
                     if (config.is_vector_generator && c->vgen_query_head < c->vgen_query_tail) {
@@ -2052,13 +1951,6 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                         vgen_compute_recall(query_idx, reply);
                     }
 
-                    /* Compute recall if using dataset */
-                    if (config.use_dataset && c->dataset_query_head < c->dataset_query_tail) {
-                        uint64_t query_idx = c->dataset_query_indices[
-                            (c->dataset_query_head++) % c->dataset_query_capacity
-                        ];
-                        dataset_compute_recall(reply, query_idx);
-                    }
                 }
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
@@ -2299,7 +2191,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
     c->vgen_query_tail = 0;
 
     /* Initialize query index queue for dataset recall tracking */
-    c->dataset_query_capacity = config.pipeline * 2;  /* 2x pipeline for safety */
+    c->dataset_query_capacity = config.dataset_num_queries;  /* 2x pipeline for safety */
     c->dataset_query_indices = zcalloc(sizeof(uint64_t) * c->dataset_query_capacity);
     c->dataset_query_head = 0;
     c->dataset_query_tail = 0;
@@ -3544,6 +3436,8 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--search")) {
             // TODO: Is search is enabled and -t is not, do not run default tests
             config.use_search = 1;
+        } else if (!strcmp(argv[i], "--nocontent")) {
+            config.search.nocontent = 1;
         } else if (!strcmp(argv[i], "--use_vgen")) {
             config.is_vector_generator = 1;
         } else if (!strcmp(argv[i], "--vgen-capacity")) {
@@ -4375,7 +4269,22 @@ int main(int argc, char **argv) {
         config.dataset_num_vectors = info.num_vectors;
         config.dataset_num_queries = info.num_queries;
         config.dataset_num_neighbors = info.num_neighbors;
-
+        config.search.vector_dim = info.dim;
+        config.search.k = info.num_neighbors < config.search.k ? info.num_neighbors : config.search.k;
+        // verify datatype is FLOAT32
+        if (strcmp(info.dtype, "FLOAT32") != 0) {
+            fprintf(stderr, "ERROR: Unsupported dataset datatype: %s (only FLOAT32 supported)\n", info.dtype);
+            exit(1);
+        }
+        // verify distance metric is supported
+        if (strcmp(info.distance_metric, "L2") != 0 &&
+            strcmp(info.distance_metric, "IP") != 0 &&
+            strcmp(info.distance_metric, "COSINE") != 0) {
+            fprintf(stderr, "ERROR: Unsupported dataset distance metric: %s (supported: L2, IP, COSINE)\n", info.distance_metric);
+            exit(1);
+        }
+        /* Store distance metric */
+        config.search.metric = sdsnewlen(info.distance_metric, strlen(info.distance_metric));
         /* Initialize recall tracking */
         initRecallStats();
 

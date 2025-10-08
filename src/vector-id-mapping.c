@@ -14,39 +14,46 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-
+#include <assert.h>
 
 void initClusterTagMap(clusterTagMap *tag_map, uint64_t initial_capacity) {
     memset(tag_map, 0, sizeof(clusterTagMap));
     tag_map->capacity = initial_capacity;
-    tag_map->mappings = zmalloc(tag_map->capacity * sizeof(vectorClusterMapping));
+    tag_map->mappings = zcalloc(tag_map->capacity * sizeof(vectorClusterMapping));
     pthread_mutex_init(&tag_map->mutex, NULL);
 }
 
 void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char *cluster_tag) {
     if (!tag_map || !cluster_tag) return;
-
+    assert(vector_id < 1000000000);  // Prevent overflow on doubling capacity
     pthread_mutex_lock(&tag_map->mutex);
 
     /* Expand capacity if needed */
     if (vector_id >= tag_map->capacity) {
-        tag_map->capacity *= 2;
         tag_map->mappings = zrealloc(tag_map->mappings,
-                                   tag_map->capacity * sizeof(vectorClusterMapping));
+                                   2 * vector_id * sizeof(vectorClusterMapping));
+        memset(&tag_map->mappings[tag_map->capacity], 0,
+               (2 * vector_id - tag_map->capacity) * sizeof(vectorClusterMapping));
+        tag_map->capacity = 2 * vector_id;
     }
-
-    /* Add new mapping */
-    memcpy(tag_map->mappings[vector_id].cluster_tag, cluster_tag,
-           sizeof(tag_map->mappings[vector_id].cluster_tag) - 1);
-    tag_map->mappings[vector_id].cluster_tag[
-        sizeof(tag_map->mappings[vector_id].cluster_tag) - 1] = '\0';
-    tag_map->count++;
-
+    if (tag_map->mappings[vector_id].cluster_tag[0] == '\0') {
+        /* New entry */
+        assert(tag_map->count < tag_map->capacity);
+        tag_map->count++;
+    }
     pthread_mutex_unlock(&tag_map->mutex);
+    
+    /* Add new mapping */
+    memcpy(tag_map->mappings[vector_id].cluster_tag, cluster_tag, 5);
+    tag_map->mappings[vector_id].cluster_tag[5] = '\0';
+
 }
 
 const char* getClusterTagForVector(clusterTagMap *tag_map, uint64_t vector_id) {
     if (!tag_map) return NULL;
+    if (vector_id >= tag_map->capacity) return NULL;
+    if (tag_map->mappings[vector_id].cluster_tag[0] == '\0') return NULL;
+    assert(tag_map->mappings[vector_id].cluster_tag[0] == '{');
     return tag_map->mappings[vector_id].cluster_tag;
 }
 
@@ -106,4 +113,9 @@ void cleanupClusterTagMap(clusterTagMap *tag_map) {
     }
     pthread_mutex_destroy(&tag_map->mutex);
     memset(tag_map, 0, sizeof(clusterTagMap));
+}
+
+size_t getClusterTagMapCount(clusterTagMap *tag_map) {
+    if (!tag_map) return 0;
+    return tag_map->count;
 }

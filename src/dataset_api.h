@@ -22,8 +22,8 @@ typedef enum {
 
 /* Dataset metadata */
 typedef struct {
-    distance_metric_t distance_metric;
-    dtype_t dtype;
+    char distance_metric[32];
+    char dtype[32];
     uint32_t dim;
     uint64_t num_vectors;
     uint64_t num_queries;
@@ -54,10 +54,10 @@ typedef struct dataset_ctx dataset_ctx_t;
 
 /* API Functions */
 dataset_ctx_t* dataset_init(const char *dataset_name, dataset_info_t *info);
-int dataset_prefill(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out);
-int dataset_query(dataset_ctx_t *ctx, uint64_t query_index, float *query_vec_out);
-int dataset_get_neighbors(dataset_ctx_t *ctx, uint64_t query_index, uint64_t *neighbors_out);
+int datasetGetVector(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out);
+int datasetSetQueryVec(dataset_ctx_t *ctx, uint64_t query_index, float *query_vec_out);
+int datasetGetNeighbors(dataset_ctx_t *ctx, uint64_t query_index, uint64_t *neighbors_out);
 int dataset_get_info(dataset_ctx_t *ctx, dataset_info_t *info);
 void dataset_destroy(dataset_ctx_t *ctx);
-
+uint64_t datasetGetQueryIxByNeighbor(dataset_ctx_t *ctx, uint64_t neighbor_index, uint32_t ix);
 #endif /* DATASET_API_H */

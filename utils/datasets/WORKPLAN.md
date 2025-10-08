@@ -87,8 +87,8 @@ typedef struct dataset_ctx dataset_ctx_t;
 
 /* API Functions */
 dataset_ctx_t* dataset_init(const char *dataset_name, dataset_info_t *info);
-int dataset_prefill(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out);
-int dataset_query(dataset_ctx_t *ctx, uint64_t query_index, float *query_vec_out, uint64_t *neighbors_out);
+int datasetGetVector(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out);
+int datasetSetQueryVec(dataset_ctx_t *ctx, uint64_t query_index, float *query_vec_out, uint64_t *neighbors_out);
 int dataset_get_info(dataset_ctx_t *ctx, dataset_info_t *info);
 void dataset_destroy(dataset_ctx_t *ctx);
 
@@ -221,7 +221,7 @@ dataset_ctx_t* dataset_init(const char *dataset_name, dataset_info_t *info) {
     return ctx;
 }
 
-int dataset_prefill(dataset_ctx_t *ctx, uint64_t index, 
+int datasetGetVector(dataset_ctx_t *ctx, uint64_t index, 
                     uint64_t *id_out, float *vec_out) {
     if (!ctx || index >= ctx->header->num_vectors) {
         return -1;
@@ -238,7 +238,7 @@ int dataset_prefill(dataset_ctx_t *ctx, uint64_t index,
     return 0;
 }
 
-int dataset_query(dataset_ctx_t *ctx, uint64_t query_index,
+int datasetSetQueryVec(dataset_ctx_t *ctx, uint64_t query_index,
                   float *query_vec_out, uint64_t *neighbors_out) {
     if (!ctx || query_index >= ctx->header->num_queries) {
         return -1;
@@ -297,12 +297,12 @@ int main(void) {
     /* Test prefill */
     uint64_t id;
     float *vec = malloc(info.dim * sizeof(float));
-    assert(dataset_prefill(ctx, 0, &id, vec) == 0);
+    assert(datasetGetVector(ctx, 0, &id, vec) == 0);
     assert(id == 0);
     
     /* Test query */
     uint64_t *neighbors = malloc(info.num_neighbors * sizeof(uint64_t));
-    assert(dataset_query(ctx, 0, vec, neighbors) == 0);
+    assert(datasetSetQueryVec(ctx, 0, vec, neighbors) == 0);
     
     free(vec);
     free(neighbors);
@@ -748,7 +748,7 @@ static uint64_t replacePlaceholderDataset(
         float *vector = zmalloc(config.search.vector_dim * sizeof(float));
         
         /* O(1) mmap read - thread-safe */
-        if (dataset_prefill(config.dataset_ctx, dataset_idx, 
+        if (datasetGetVector(config.dataset_ctx, dataset_idx, 
                            &vector_id, vector) != 0) {
             zfree(vector);
             return UINT64_MAX;
@@ -782,7 +782,7 @@ static uint64_t replacePlaceholderDataset(
             config.dataset_num_neighbors * sizeof(uint64_t)
         );
         
-        if (dataset_query(config.dataset_ctx, query_idx, 
+        if (datasetSetQueryVec(config.dataset_ctx, query_idx, 
                          query_vector, neighbors) != 0) {
             zfree(query_vector);
             zfree(neighbors);
@@ -813,7 +813,7 @@ static uint64_t replacePlaceholderDataset(
         
         uint64_t vector_id;
         float dummy;
-        dataset_prefill(config.dataset_ctx, dataset_idx, &vector_id, &dummy);
+        datasetGetVector(config.dataset_ctx, dataset_idx, &vector_id, &dummy);
         
         for (size_t i = 0; i < key_count; i++) {
             char *key_ph = cmd + key_indices[i];
@@ -945,7 +945,7 @@ static void dataset_compute_recall(valkeyReply *reply, uint64_t query_idx) {
         config.dataset_num_neighbors * sizeof(uint64_t)
     );
     float dummy_query[1];
-    dataset_query(config.dataset_ctx, query_idx, dummy_query, gt_neighbors);
+    datasetSetQueryVec(config.dataset_ctx, query_idx, dummy_query, gt_neighbors);
     
     /* Extract returned vector IDs from search results */
     int k = config.search.k;
@@ -1328,8 +1328,8 @@ This phased approach enables incremental testing at each step while building tow
 │  ┌──────────────────────────────────────────────────────┐  │
 │  │ dataset_init()      - Initialize dataset             │  │
 │  │ dataset_get_info()  - Get metadata                   │  │
-│  │ dataset_prefill()   - Get vector by index (O(1))     │  │
-│  │ dataset_query()     - Get query + ground truth (O(1))│  │
+│  │ datasetGetVector()   - Get vector by index (O(1))     │  │
+│  │ datasetSetQueryVec()     - Get query + ground truth (O(1))│  │
 │  │ dataset_destroy()   - Cleanup                        │  │
 │  └──────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────┐  │

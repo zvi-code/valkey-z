@@ -276,7 +276,7 @@ int vgen_init_from_config(uint32_t dimensions, uint64_t initial_capacity,
     /* Store configuration values for later use */
     vgen_cluster_mode = cluster_mode;
     if (prefix) {
-        snprintf(vgen_prefix, sizeof(vgen_prefix), "%s", prefix);
+        snprintf(vgen_prefix, sizeof(vgen_prefix)+1, "%s", prefix);
     }
     
     /* Create generator configuration from parameters */
