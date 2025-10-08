@@ -636,6 +636,7 @@ float calculateDistance(const float *vec1, const float *vec2, int dim, const cha
 }
 
 typedef struct {
+    int is_gt; // 1 if ground truth, 0 if returned neighbor
     uint64_t id;
     float distance;
 } Neighbor;
@@ -663,48 +664,96 @@ static void checkNeighbors(uint64_t query_ix,
     datasetSetQueryVec((dataset_ctx_t *)config.dataset_ctx, query_ix, query_vector); // set the query vector in dataset context
     dataset_ctx_t *dctx = (dataset_ctx_t *)config.dataset_ctx;
     float* vector = zmalloc(config.search.vector_dim * sizeof(float));
-    Neighbor returned_neighbors_dist[num_ground_truth_neighbors];
-    Neighbor ground_truth_neighbors_dist[num_ground_truth_neighbors];
+    Neighbor neighbors_dists[num_neighbors+num_ground_truth_neighbors];
+    memset(neighbors_dists, 0, sizeof(neighbors_dists));
     for (uint32_t i = 0; i < num_ground_truth_neighbors; i++) {
         //(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out)
-        datasetGetVector(dctx, ground_truth_neighbors[i], &ground_truth_neighbors_dist[i].id, vector); // get the ground truth vector
-        ground_truth_neighbors_dist[i].distance = calculateDistance(query_vector, vector, config.search.vector_dim, config.search.metric);
+        datasetGetVector(dctx, ground_truth_neighbors[i], &neighbors_dists[i].id, vector); // get the ground truth vector
+        neighbors_dists[i].distance = calculateDistance(query_vector, vector, config.search.vector_dim, config.search.metric);
+        neighbors_dists[i].is_gt = 1; // Mark as ground truth
         // if (i < num_neighbors) // store only up to num_neighbors
         //     printf("Ground truth neighbor %d: ID=%lu, Distance=%.6f\n", i, 
         //             ground_truth_neighbors_dist[i].id, ground_truth_neighbors_dist[i].distance);
     }
-    // Sort ground truth neighbors by distance
-    qsort(ground_truth_neighbors_dist, num_ground_truth_neighbors, sizeof(Neighbor), compareNeighbors);
-          
+              
     
     // Now check returned neighbors
     int match_count = 0;
-    for (int i = 0; i < num_neighbors; i++) {
-        uint64_t ret_id = returned_neighbors[i];
-        datasetGetVector(dctx, ret_id, &returned_neighbors_dist[i].id, vector); // get the returned vector
-        returned_neighbors_dist[i].distance = calculateDistance(query_vector, vector, config.search.vector_dim, config.search.metric);
+    for (int j = 0; j < num_neighbors; j++) {
+        int i = j + num_ground_truth_neighbors;
+        datasetGetVector(dctx, returned_neighbors[j], &neighbors_dists[i].id, vector); // get the returned vector
+        neighbors_dists[i].distance = calculateDistance(query_vector, vector, config.search.vector_dim, config.search.metric);
+        neighbors_dists[i].is_gt = 0; // Mark as returned neighbor
         // printf("Returned neighbor %d: ID=%lu, Distance=%.6f\n", i, ret_id, returned_neighbors_dist[i].distance);
         // Compare ret_distance with ground truth distances
-        for (uint32_t j = 0; j < num_ground_truth_neighbors; j++) {
-            if (fabs(returned_neighbors_dist[i].distance - ground_truth_neighbors_dist[j].distance) < 1e-5) {
-                match_count++;
-                break;
-            }
-        }
+        // for (uint32_t j = 0; j < num_ground_truth_neighbors; j++) {
+        //     if (fabs(returned_neighbors_dist[i].distance - ground_truth_neighbors_dist[j].distance) < 1e-5) {
+        //         match_count++;
+        //         break;
+        //     }
+        // }
         
     }
-    qsort(returned_neighbors_dist, num_neighbors, sizeof(Neighbor), compareNeighbors);
-    pthread_mutex_lock(&dataset_recall_stats.mutex);
-    printf("Query %ld: Sorted returned neighbors:\n", query_ix);
-    for (uint32_t i = 0; i < num_neighbors; i++) {
-        printf("[%d]:ID=%lu, Distance=%.6f ", i,
-                returned_neighbors_dist[i].id, returned_neighbors_dist[i].distance);
+    // Sort by distance
+    qsort(neighbors_dists, num_ground_truth_neighbors + num_neighbors, sizeof(Neighbor), compareNeighbors);
+    int num_returned = 0;
+    int num_gt = 0;
+    for (int i = 0; i < 2*num_neighbors; i++) {
+        num_returned += !neighbors_dists[i].is_gt;
+        num_gt += neighbors_dists[i].is_gt;
+        printf("Rank %d: ID=%lu, Distance=%.6f, %s\n", i, neighbors_dists[i].id, neighbors_dists[i].distance,
+               neighbors_dists[i].is_gt ? "GT" : "RET");
+        if (num_returned >= num_neighbors) break;
+        if (num_gt >= num_neighbors) {
+            if (!neighbors_dists[i+1].is_gt && 
+               (neighbors_dists[i+1].distance == neighbors_dists[i].distance) &&
+                neighbors_dists[i].is_gt) {
+                // include the tie
+                num_returned++;
+                printf("Including tie at rank %d for ID %lu with distance %.6f\n", 
+                       i+1, neighbors_dists[i+1].id, neighbors_dists[i+1].distance);
+                i++;
+            }
+            break;
+        }
     }
-    printf("\n");
-    printf("Query %ld: Sorted ground truth neighbors:\n", query_ix);
-    for (uint32_t i = 0; i < num_neighbors*2 && i < num_ground_truth_neighbors; i++) {
-        printf("[%d]:ID=%lu, Distance=%.6f ", i,
-                ground_truth_neighbors_dist[i].id, ground_truth_neighbors_dist[i].distance);
+    printf("Total returned neighbors considered for recall: %d/%d\n", num_returned, num_gt);
+    match_count = num_returned;
+    pthread_mutex_lock(&dataset_recall_stats.mutex);
+    printf("Query %ld: Neighbor Comparison (%ld)\n", query_ix, num_neighbors);
+    printf("%-6s %-20s %-20s\n", "Rank", "Returned (ID:Dist)", "Ground Truth (ID:Dist)");
+    printf("%-6s %-20s %-20s\n", "----", "-------------------", "---------------------");
+    Neighbor returned_neighbors_dist[num_neighbors];
+    Neighbor ground_truth_neighbors_dist[num_ground_truth_neighbors];
+    int ret_idx = 0, gt_idx = 0;
+    for (int i = 0; i < num_neighbors + num_ground_truth_neighbors; i++) {
+        if (!neighbors_dists[i].is_gt && ret_idx < num_neighbors) {
+            returned_neighbors_dist[ret_idx++] = neighbors_dists[i];
+        } else if (neighbors_dists[i].is_gt && gt_idx < num_ground_truth_neighbors) {
+            ground_truth_neighbors_dist[gt_idx++] = neighbors_dists[i];
+        }
+    }
+    // Print side by side
+    uint32_t max_rows = (num_neighbors > num_ground_truth_neighbors) ? num_neighbors : num_ground_truth_neighbors;
+    for (uint32_t i = 0; i < max_rows; i++) {
+        char returned_str[32] = "";
+        char gt_str[32] = "";
+
+        if (i < num_neighbors) {
+            snprintf(returned_str, sizeof(returned_str), "%lu:%.4f",
+                    returned_neighbors_dist[i].id, returned_neighbors_dist[i].distance);
+        } else {
+            valkey_strlcpy(returned_str, "-", sizeof(returned_str));
+        }
+
+        if (i < num_ground_truth_neighbors) {
+            snprintf(gt_str, sizeof(gt_str), "%lu:%.4f",
+                    ground_truth_neighbors_dist[i].id, ground_truth_neighbors_dist[i].distance);
+        } else {
+            valkey_strlcpy(gt_str, "-", sizeof(gt_str));
+        }
+
+        printf("%-6d %-20s %-20s\n", i, returned_str, gt_str);
     }
     
     printf("\n");
@@ -1006,13 +1055,15 @@ static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
         if (config.print_search_results) {
             pthread_mutex_unlock(&dataset_recall_stats.mutex);
         }
-        if (recall < 1.0) {
+        if (recall < 8.0f) {
             // check distances for debugging
             checkNeighbors(query_idx, result_vec_ids, num_vecs_ids, gt_neighbors, config.dataset_num_neighbors);
+        } else {
+            updateRecallStats(recall);
         }
 
 
-        updateRecallStats(recall);
+        
     } else if (config.print_search_results) {
         pthread_mutex_unlock(&dataset_recall_stats.mutex);
     }
