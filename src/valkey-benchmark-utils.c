@@ -9,6 +9,25 @@
 #include "util.h"
 #include <time.h>
 #include <assert.h>
+#include <unistd.h>
+// #include <stdio.h>
+// #include <string.h>
+// #include <stdlib.h>
+// #include <unistd.h>
+// // #include <errno.h>
+// // #include <time.h>
+// #include <sys/time.h>
+// #include <signal.h>
+// #include <assert.h>
+// #include <math.h>
+// #include <pthread.h>
+// #include <stdatomic.h>
+
+// #include "sds.h"
+// #include "ae.h"
+// #include "util.h"
+// #include <valkey/valkey.h>
+// #include <valkey/alloc.h>
 
 /* Forward declaration - getValkeyContext is defined in valkey-benchmark.c */
 valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
@@ -1015,6 +1034,88 @@ static sds convertFtInfoToLines(valkeyReply *reply, const char *prefix) {
     return lines;
 }
 
+void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_nodes,
+                                        enum valkeyConnectionType ct, const char *index_name) {
+    if (!index_name) return;
+    
+    size_t total_docs = 0;
+    int backfill_in_progress_nodes = 0;
+    double global_backfill_complete_percent = 0.0;
+    while (1) {
+        // go over all nodes and check FT.INFO
+        // check these metrics:
+        // 25) backfill_in_progress
+        // 26) "0"
+        // 27) backfill_complete_percent
+        // 28) "1.000000"
+        // if backfill_in_progress is 0 on all nodes, we are done
+        // if not, continue to next nodes to collect global progress, print global progress and number of nodes still backfilling and number of docs
+        for (int i = 0; i < cluster_node_count; i++) {
+            clusterNode *node = cluster_nodes[i];
+            valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(ct, node->ip, node->port);
+            if (!node || !ctx) continue;
+            // send command to node
+            valkeyReply *reply = valkeyCommand(ctx, "FT.INFO %b", index_name, strlen(index_name));
+            if (!reply) {
+                printf("Error: No response from node %s while checking index status.\n", node->name);
+                continue;
+            }
+            sds info_lines = convertFtInfoToLines(reply, NULL);
+            freeReplyObject(reply);
+            if (!info_lines) {
+                printf("Error: Unable to parse FT.INFO response from node %s.\n", node->name);
+                continue;
+            }
+            /* Check for backfill_in_progress line */
+            char *line = strstr(info_lines, "backfill_in_progress:");
+            int backfill_in_progress = 0;
+            if (line) {
+                sscanf(line, "backfill_in_progress:%d", &backfill_in_progress);
+            }
+            // get backfill_complete_percent line
+            line = strstr(info_lines, "backfill_complete_percent:");
+            double backfill_complete_percent = 0.0;
+            if (line) {
+                sscanf(line, "backfill_complete_percent:%lf", &backfill_complete_percent);
+            }
+            // get num_docs line
+            line = strstr(info_lines, "num_docs:");
+            long long num_docs = 0;
+            if (line) {
+                sscanf(line, "num_docs:%lld", &num_docs);
+            }
+            total_docs += num_docs;
+            if (backfill_in_progress) {
+                backfill_in_progress_nodes++;
+            }
+            global_backfill_complete_percent += backfill_complete_percent;
+            // print status
+            sdsfree(info_lines);
+            if (backfill_in_progress) {
+                printf("Node %s: Index '%s' backfill is still in progress.\n", node->name, index_name);
+            } else {
+                printf("Node %s: Index '%s' backfill is complete.\n", node->name, index_name);
+            }
+        }
+        if (backfill_in_progress_nodes > 0) {
+            global_backfill_complete_percent /= (double)cluster_node_count;
+            printf("Global: Index '%s' backfill is %.2f%% complete across %d nodes. Total docs indexed: %ld\n", 
+                   index_name, global_backfill_complete_percent, 
+                   backfill_in_progress_nodes, total_docs);
+        } else {
+            printf("Global: Index '%s' backfill is complete across all nodes. Total docs indexed: %ld\n", 
+                   index_name, total_docs);
+            break;
+        }
+        total_docs = 0;
+        backfill_in_progress_nodes = 0;
+        global_backfill_complete_percent = 0.0;
+        // wait for 5 seconds before next check
+        printf("Waiting for index '%s' backfill to complete...\n", index_name);
+        sleep(5);
+    }
+    printf("Index '%s' backfill process has completed on all nodes.\n", index_name);
+}
 
 /* Create snapshot from current cluster state 
 # Modules

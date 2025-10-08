@@ -29,7 +29,7 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
     pthread_mutex_lock(&tag_map->mutex);
 
     /* Expand capacity if needed */
-    if (vector_id >= tag_map->capacity) {
+    if (2 * vector_id >= tag_map->capacity) {
         tag_map->mappings = zrealloc(tag_map->mappings,
                                    2 * vector_id * sizeof(vectorClusterMapping));
         memset(&tag_map->mappings[tag_map->capacity], 0,
@@ -37,9 +37,20 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
         tag_map->capacity = 2 * vector_id;
     }
     if (tag_map->mappings[vector_id].cluster_tag[0] == '\0') {
+        if (tag_map->count > tag_map->capacity) {
+            fprintf(stderr, "Error: tag_map count %lu exceeds capacity %lu for vector_id %lu cluster_tag %s\n",
+                    tag_map->count, tag_map->capacity, vector_id, cluster_tag);
+            fflush(stderr);
+            assert(0);
+        }
+        assert(cluster_tag[0] == '{');
         /* New entry */
-        assert(tag_map->count < tag_map->capacity);
+        assert(tag_map->count <= tag_map->capacity);
         tag_map->count++;
+        if (tag_map->count % 10000 == 0) {
+            printf("[VECTOR-MAPPING] Added %lu mappings, current capacity %lu\n",
+                   tag_map->count, tag_map->capacity);
+        }
     }
     pthread_mutex_unlock(&tag_map->mutex);
     

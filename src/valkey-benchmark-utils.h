@@ -125,5 +125,6 @@ void* compareInfoSnapshots(int cluster_node_count, clusterNode **cluster_nodes,
                                       clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch);
 void freeClusterSnapshot(clusterSnapshot *snapshot);
 valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
-
+void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_nodes,
+                                        enum valkeyConnectionType ct, const char *index_name);
 #endif /* __VALKEY_BENCHMARK_UTILS_H */

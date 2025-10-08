@@ -116,8 +116,8 @@ dataset_ctx_t* dataset_init(const char *dataset_name, dataset_info_t *info) {
     ctx->ground_truth = (int64_t*)((uint8_t*)base + header->ground_truth_offset);
     // a reverse map from neighbor index to query index
     //
-    ctx->query_neighbors = malloc(sizeof(query_vec_neighbors_t) * header->num_queries*header->num_neighbors);
-    memset(ctx->query_neighbors, 0, sizeof(query_vec_neighbors_t) * header->num_queries*header->num_neighbors);
+    ctx->query_neighbors = malloc(sizeof(query_vec_neighbors_t) * header->num_vectors*header->num_neighbors);
+    memset(ctx->query_neighbors, 0, sizeof(query_vec_neighbors_t) * header->num_vectors*header->num_neighbors);
     /* Return metadata */
     if (info) {
         snprintf(info->distance_metric, sizeof(info->distance_metric), "%s", distance_metric_names[ctx->header->distance_metric]);
