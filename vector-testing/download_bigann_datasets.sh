@@ -420,12 +420,18 @@ convert_to_binary() {
 # Function to process a dataset
 process_dataset() {
     local name=$1
-    local config="${DATASETS[$name]}"
 
-    if [ -z "$config" ]; then
+    # Check if dataset exists
+    if [[ ! -v "DATASETS[$name]" ]]; then
         print_error "Unknown dataset: $name"
+        echo "Available datasets:"
+        for dataset_name in "${!DATASETS[@]}"; do
+            echo "  - $dataset_name"
+        done | sort
         return 1
     fi
+
+    local config="${DATASETS[$name]}"
 
     IFS=',' read -r url dims vectors metric description <<< "$config"
 
