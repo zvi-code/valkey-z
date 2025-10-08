@@ -83,35 +83,68 @@ cd /home/ubuntu/valkey/vector-testing
 
 ### Standard ANN-Benchmarks (Small to Medium Scale)
 
-| Dataset | Dimensions | Vectors | Metric | Size | Description |
-|---------|------------|---------|--------|------|-------------|
-| glove-25 | 25 | 1.18M | Cosine | 120MB | Word embeddings |
-| glove-50 | 50 | 1.18M | Cosine | 240MB | Word embeddings |
-| glove-100 | 100 | 1.18M | Cosine | 480MB | Word embeddings |
-| glove-200 | 200 | 1.18M | Cosine | 960MB | Word embeddings |
-| sift-128 | 128 | 1M | L2 | 500MB | SIFT descriptors |
-| gist-960 | 960 | 1M | L2 | 3.6GB | GIST descriptors |
-| deep-96 | 96 | 10M | Cosine | 3.6GB | Deep embeddings |
-| fashion-mnist | 784 | 60K | L2 | 200MB | Fashion images |
-| mnist | 784 | 60K | L2 | 200MB | Handwritten digits |
-| lastfm-64 | 64 | 292K | IP | 75MB | Music embeddings |
-| nytimes-256 | 256 | 290K | Cosine | 300MB | Article embeddings |
-| nytimes-16 | 16 | 290K | Cosine | 20MB | Article embeddings |
+**All datasets include embeddings, queries, and precomputed ground truth for accurate recall evaluation.**
+
+| Dataset | Dimensions | Embeddings | Queries | Metric | Size | Description |
+|---------|------------|------------|---------|--------|------|-------------|
+| glove-25 | 25 | 1.18M | 10K | Cosine | 120MB | Word embeddings + ground truth |
+| glove-50 | 50 | 1.18M | 10K | Cosine | 240MB | Word embeddings + ground truth |
+| glove-100 | 100 | 1.18M | 10K | Cosine | 480MB | Word embeddings + ground truth |
+| glove-200 | 200 | 1.18M | 10K | Cosine | 960MB | Word embeddings + ground truth |
+| sift-128 | 128 | 1M | 10K | L2 | 500MB | SIFT descriptors + ground truth |
+| gist-960 | 960 | 1M | 1K | L2 | 3.6GB | GIST descriptors + ground truth |
+| deep-96 | 96 | 10M | 10K | Cosine | 3.6GB | Deep embeddings + ground truth |
+| fashion-mnist | 784 | 60K | 10K | L2 | 200MB | Fashion images + ground truth |
+| mnist | 784 | 60K | 10K | L2 | 200MB | Handwritten digits + ground truth |
+| lastfm-64 | 64 | 292K | 50K | IP | 75MB | Music embeddings + ground truth |
+| nytimes-256 | 256 | 290K | 10K | Cosine | 300MB | Article embeddings + ground truth |
+| nytimes-16 | 16 | 290K | 10K | Cosine | 20MB | Article embeddings + ground truth |
 
 ### Big-ANN Benchmarks (Large Scale)
 
-| Dataset | Dimensions | Vectors | Metric | Size | Description |
-|---------|------------|---------|--------|------|-------------|
-| bigann-1M | 128 | 1M | L2 | 500MB | SIFT subset |
-| bigann-10M | 128 | 10M | L2 | 5GB | SIFT subset |
-| bigann-100M | 128 | 100M | L2 | 50GB | SIFT subset |
-| deep-1M | 96 | 1M | Cosine | 400MB | Deep images |
-| deep-10M | 96 | 10M | Cosine | 4GB | Deep images |
-| text2image-1M | 200 | 1M | IP | 800MB | Cross-modal |
-| text2image-10M | 200 | 10M | IP | 8GB | Cross-modal |
-| msturing-1M | 100 | 1M | L2 | 400MB | Web search |
-| msturing-10M | 100 | 10M | L2 | 4GB | Web search |
-| msspacev-1M | 100 | 1M | L2 | 400MB | SpaceV |
+**All datasets include embeddings, queries, and precomputed ground truth for accurate recall evaluation.**
+
+| Dataset | Dimensions | Embeddings | Queries | Metric | Size | Description |
+|---------|------------|------------|---------|--------|------|-------------|
+| bigann-1M | 128 | 1M | 10K | L2 | 500MB | SIFT subset + ground truth |
+| bigann-10M | 128 | 10M | 10K | L2 | 5GB | SIFT subset + ground truth |
+| bigann-100M | 128 | 100M | 10K | L2 | 50GB | SIFT subset + ground truth |
+| deep-1M | 96 | 1M | 10K | Cosine | 400MB | Deep images + ground truth |
+| deep-10M | 96 | 10M | 10K | Cosine | 4GB | Deep images + ground truth |
+| text2image-1M | 200 | 1M | 100K | IP | 800MB | Cross-modal + ground truth |
+| text2image-10M | 200 | 10M | 100K | IP | 8GB | Cross-modal + ground truth |
+| msturing-1M | 100 | 1M | 100K | L2 | 400MB | Web search + ground truth |
+| msturing-10M | 100 | 10M | 100K | L2 | 4GB | Web search + ground truth |
+| msspacev-1M | 100 | 1M | 100K | L2 | 400MB | SpaceV + ground truth |
+
+## Dataset Components
+
+### What's Included in Each Dataset
+
+Every dataset provides three essential components for comprehensive vector search evaluation:
+
+1. **Base Embeddings**: The main vector database for indexing and searching
+   - Pre-computed vector representations (float32 format)
+   - Range from 60K (fashion-mnist) to 100M+ (bigann-100M) vectors
+
+2. **Query Vectors**: Test queries for performance evaluation
+   - Separate set of vectors not in the base embeddings
+   - Used to test search accuracy and performance
+   - Range from 1K to 100K queries depending on dataset
+
+3. **Ground Truth**: Precomputed exact k-nearest neighbors
+   - For each query, the true k-nearest neighbors in the base set
+   - Used to calculate recall metrics (what percentage of true neighbors were found)
+   - Computed using exact brute-force search for 100% accuracy
+   - Typically k=100 neighbors per query
+
+### Ground Truth Quality
+
+- **ANN-Benchmarks**: Precomputed exact k-NN using brute-force search
+- **Big-ANN**: Ground truth computed from full billion-scale datasets
+- **All formats**: Verified for correctness and consistency
+
+This ensures that recall measurements are accurate and comparable across different vector search algorithms and configurations.
 
 ## Binary Format Specification
 

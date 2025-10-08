@@ -58,33 +58,33 @@ print_error() {
 declare -A DATASETS
 
 # === Standard ANN-Benchmarks (already supported) ===
-DATASETS["sift-128"]="http://ann-benchmarks.com/sift-128-euclidean.hdf5,128,1000000,L2,SIFT image descriptors"
-DATASETS["gist-960"]="http://ann-benchmarks.com/gist-960-euclidean.hdf5,960,1000000,L2,GIST image descriptors"
-DATASETS["glove-25"]="http://ann-benchmarks.com/glove-25-angular.hdf5,25,1183514,COSINE,GloVe word embeddings 25d"
-DATASETS["glove-50"]="http://ann-benchmarks.com/glove-50-angular.hdf5,50,1183514,COSINE,GloVe word embeddings 50d"
-DATASETS["glove-100"]="http://ann-benchmarks.com/glove-100-angular.hdf5,100,1183514,COSINE,GloVe word embeddings 100d"
-DATASETS["glove-200"]="http://ann-benchmarks.com/glove-200-angular.hdf5,200,1183514,COSINE,GloVe word embeddings 200d"
-DATASETS["fashion-mnist"]="http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5,784,60000,L2,Fashion MNIST images"
-DATASETS["mnist"]="http://ann-benchmarks.com/mnist-784-euclidean.hdf5,784,60000,L2,MNIST handwritten digits"
-DATASETS["deep-96"]="http://ann-benchmarks.com/deep-image-96-angular.hdf5,96,10000000,COSINE,Deep image embeddings (10M)"
+DATASETS["sift-128"]="http://ann-benchmarks.com/sift-128-euclidean.hdf5,128,1000000,L2,SIFT image descriptors (1M embeddings + 10K queries + ground truth)"
+DATASETS["gist-960"]="http://ann-benchmarks.com/gist-960-euclidean.hdf5,960,1000000,L2,GIST image descriptors (1M embeddings + 1K queries + ground truth)"
+DATASETS["glove-25"]="http://ann-benchmarks.com/glove-25-angular.hdf5,25,1183514,COSINE,GloVe word embeddings 25d (1.18M embeddings + 10K queries + ground truth)"
+DATASETS["glove-50"]="http://ann-benchmarks.com/glove-50-angular.hdf5,50,1183514,COSINE,GloVe word embeddings 50d (1.18M embeddings + 10K queries + ground truth)"
+DATASETS["glove-100"]="http://ann-benchmarks.com/glove-100-angular.hdf5,100,1183514,COSINE,GloVe word embeddings 100d (1.18M embeddings + 10K queries + ground truth)"
+DATASETS["glove-200"]="http://ann-benchmarks.com/glove-200-angular.hdf5,200,1183514,COSINE,GloVe word embeddings 200d (1.18M embeddings + 10K queries + ground truth)"
+DATASETS["fashion-mnist"]="http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5,784,60000,L2,Fashion MNIST images (60K embeddings + 10K queries + ground truth)"
+DATASETS["mnist"]="http://ann-benchmarks.com/mnist-784-euclidean.hdf5,784,60000,L2,MNIST handwritten digits (60K embeddings + 10K queries + ground truth)"
+DATASETS["deep-96"]="http://ann-benchmarks.com/deep-image-96-angular.hdf5,96,10000000,COSINE,Deep image embeddings (10M embeddings + 10K queries + ground truth)"
 
 # === Big-ANN Billion-scale datasets ===
 # These require special handling due to binary format
-DATASETS["bigann-1M"]="bigann:1M,128,1000000,L2,BIGANN 1M subset of SIFT descriptors"
-DATASETS["bigann-10M"]="bigann:10M,128,10000000,L2,BIGANN 10M subset of SIFT descriptors"
-DATASETS["bigann-100M"]="bigann:100M,128,100000000,L2,BIGANN 100M subset of SIFT descriptors"
-DATASETS["deep-1M"]="deep1b:1M,96,1000000,COSINE,Deep1B 1M subset"
-DATASETS["deep-10M"]="deep1b:10M,96,10000000,COSINE,Deep1B 10M subset"
-DATASETS["text2image-1M"]="text2image:1M,200,1000000,IP,Text2Image 1M subset"
-DATASETS["text2image-10M"]="text2image:10M,200,10000000,IP,Text2Image 10M subset"
-DATASETS["msturing-1M"]="msturing:1M,100,1000000,L2,MS-Turing 1M subset"
-DATASETS["msturing-10M"]="msturing:10M,100,10000000,L2,MS-Turing 10M subset (full)"
-DATASETS["msspacev-1M"]="msspacev:1M,100,1000000,L2,MS-SpaceV 1M subset"
+DATASETS["bigann-1M"]="bigann:1M,128,1000000,L2,BIGANN 1M subset of SIFT descriptors (1M embeddings + 10K queries + ground truth)"
+DATASETS["bigann-10M"]="bigann:10M,128,10000000,L2,BIGANN 10M subset of SIFT descriptors (10M embeddings + 10K queries + ground truth)"
+DATASETS["bigann-100M"]="bigann:100M,128,100000000,L2,BIGANN 100M subset of SIFT descriptors (100M embeddings + 10K queries + ground truth)"
+DATASETS["deep-1M"]="deep1b:1M,96,1000000,COSINE,Deep1B 1M subset (1M embeddings + 10K queries + ground truth)"
+DATASETS["deep-10M"]="deep1b:10M,96,10000000,COSINE,Deep1B 10M subset (10M embeddings + 10K queries + ground truth)"
+DATASETS["text2image-1M"]="text2image:1M,200,1000000,IP,Text2Image 1M subset (1M embeddings + 100K queries + ground truth)"
+DATASETS["text2image-10M"]="text2image:10M,200,10000000,IP,Text2Image 10M subset (10M embeddings + 100K queries + ground truth)"
+DATASETS["msturing-1M"]="msturing:1M,100,1000000,L2,MS-Turing 1M subset (1M embeddings + 100K queries + ground truth)"
+DATASETS["msturing-10M"]="msturing:10M,100,10000000,L2,MS-Turing 10M subset (10M embeddings + 100K queries + ground truth)"
+DATASETS["msspacev-1M"]="msspacev:1M,100,1000000,L2,MS-SpaceV 1M subset (1M embeddings + 100K queries + ground truth)"
 
 # === Additional standard benchmarks ===
-DATASETS["lastfm-64"]="http://ann-benchmarks.com/lastfm-64-dot.hdf5,64,292385,IP,Last.fm music embeddings"
-DATASETS["nytimes-256"]="http://ann-benchmarks.com/nytimes-256-angular.hdf5,256,290000,COSINE,NYTimes article embeddings"
-DATASETS["nytimes-16"]="http://ann-benchmarks.com/nytimes-16-angular.hdf5,16,290000,COSINE,NYTimes article embeddings (reduced)"
+DATASETS["lastfm-64"]="http://ann-benchmarks.com/lastfm-64-dot.hdf5,64,292385,IP,Last.fm music embeddings (292K embeddings + 50K queries + ground truth)"
+DATASETS["nytimes-256"]="http://ann-benchmarks.com/nytimes-256-angular.hdf5,256,290000,COSINE,NYTimes article embeddings (290K embeddings + 10K queries + ground truth)"
+DATASETS["nytimes-16"]="http://ann-benchmarks.com/nytimes-16-angular.hdf5,16,290000,COSINE,NYTimes article embeddings reduced (290K embeddings + 10K queries + ground truth)"
 
 # Function to download and convert Big-ANN datasets
 download_bigann_dataset() {
