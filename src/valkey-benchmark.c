@@ -32,7 +32,6 @@
 #include "valkey-benchmark-vgen.h"
 #include "dataset_api.h"
 #include "vector-id-mapping.h"
-#include "cluster-utils.h"
 #include "fmacros.h"
 
 #include <stdio.h>
@@ -507,6 +506,9 @@ static int dictSdsKeyCompare(const void *key1, const void *key2);
 
 #define UNUSED(V) ((void)V)
 
+static void checkNeighbors(uint64_t query_ix, 
+    uint64_t *returned_neighbors, size_t num_neighbors, 
+    uint64_t *ground_truth_neighbors, size_t num_ground_truth_neighbors);
 
 /* Vector key encoding/decoding functions */
 
@@ -609,7 +611,114 @@ static int decode_vector_key_fixed(const char *key,
     return 0;
 }
 
+/** Calculate distance between query vector and its neighbors */
+float calculateDistance(const float *vec1, const float *vec2, int dim, const char *metric) {
+    if (strcmp(metric, "L2") == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < dim; i++) {
+            float diff = vec1[i] - vec2[i];
+            sum += diff * diff;
+        }
+        return sqrtf(sum);
+    } else if (strcmp(metric, "COSINE") == 0) {
+        float dot = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
+        for (int i = 0; i < dim; i++) {
+            dot += vec1[i] * vec2[i];
+            norm1 += vec1[i] * vec1[i];
+            norm2 += vec2[i] * vec2[i];
+        }
+        if (norm1 == 0 || norm2 == 0) return 1.0f; // Avoid division by zero
+        return 1.0f - (dot / (sqrtf(norm1) * sqrtf(norm2))); // Cosine distance
+    } else {
+        fprintf(stderr, "Unknown metric: %s\n", metric);
+        return -1.0f;
+    }
+}
 
+typedef struct {
+    uint64_t id;
+    float distance;
+} Neighbor;
+
+static int compareNeighbors(const void *a, const void *b) {
+    const Neighbor *na = (const Neighbor *)a;
+    const Neighbor *nb = (const Neighbor *)b;
+    if (na->distance < nb->distance) return -1;
+    if (na->distance > nb->distance) return 1;
+    return 0;
+}
+
+
+/** evaluate returned number distance  from Query vector comparing to ground truth distances from Query vector */
+static void checkNeighbors(uint64_t query_ix, 
+    uint64_t *returned_neighbors, size_t num_neighbors, 
+    uint64_t *ground_truth_neighbors, size_t num_ground_truth_neighbors) {
+    // Check neighbors and compare the distance with ground truth vector distances
+    // for every ground truth neighbor and for every returned vector, fetch the vector from datasetGetVector
+    // distance calculation is L2 or COSINE based on config.search.metric
+    if (!config.use_dataset || !config.dataset_ctx) {
+        return;
+    }
+    float* query_vector = zmalloc(config.search.vector_dim * sizeof(float));
+    datasetSetQueryVec((dataset_ctx_t *)config.dataset_ctx, query_ix, query_vector); // set the query vector in dataset context
+    dataset_ctx_t *dctx = (dataset_ctx_t *)config.dataset_ctx;
+    float* vector = zmalloc(config.search.vector_dim * sizeof(float));
+    Neighbor returned_neighbors_dist[num_ground_truth_neighbors];
+    Neighbor ground_truth_neighbors_dist[num_ground_truth_neighbors];
+    for (uint32_t i = 0; i < num_ground_truth_neighbors; i++) {
+        //(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out)
+        datasetGetVector(dctx, ground_truth_neighbors[i], &ground_truth_neighbors_dist[i].id, vector); // get the ground truth vector
+        ground_truth_neighbors_dist[i].distance = calculateDistance(query_vector, vector, config.search.vector_dim, config.search.metric);
+        // if (i < num_neighbors) // store only up to num_neighbors
+        //     printf("Ground truth neighbor %d: ID=%lu, Distance=%.6f\n", i, 
+        //             ground_truth_neighbors_dist[i].id, ground_truth_neighbors_dist[i].distance);
+    }
+    // Sort ground truth neighbors by distance
+    qsort(ground_truth_neighbors_dist, num_ground_truth_neighbors, sizeof(Neighbor), compareNeighbors);
+          
+    
+    // Now check returned neighbors
+    int match_count = 0;
+    for (int i = 0; i < num_neighbors; i++) {
+        uint64_t ret_id = returned_neighbors[i];
+        datasetGetVector(dctx, ret_id, &returned_neighbors_dist[i].id, vector); // get the returned vector
+        returned_neighbors_dist[i].distance = calculateDistance(query_vector, vector, config.search.vector_dim, config.search.metric);
+        // printf("Returned neighbor %d: ID=%lu, Distance=%.6f\n", i, ret_id, returned_neighbors_dist[i].distance);
+        // Compare ret_distance with ground truth distances
+        for (uint32_t j = 0; j < num_ground_truth_neighbors; j++) {
+            if (fabs(returned_neighbors_dist[i].distance - ground_truth_neighbors_dist[j].distance) < 1e-5) {
+                match_count++;
+                break;
+            }
+        }
+        
+    }
+    qsort(returned_neighbors_dist, num_neighbors, sizeof(Neighbor), compareNeighbors);
+    pthread_mutex_lock(&dataset_recall_stats.mutex);
+    printf("Query %ld: Sorted returned neighbors:\n", query_ix);
+    for (uint32_t i = 0; i < num_neighbors; i++) {
+        printf("[%d]:ID=%lu, Distance=%.6f ", i,
+                returned_neighbors_dist[i].id, returned_neighbors_dist[i].distance);
+    }
+    printf("\n");
+    printf("Query %ld: Sorted ground truth neighbors:\n", query_ix);
+    for (uint32_t i = 0; i < num_neighbors*2 && i < num_ground_truth_neighbors; i++) {
+        printf("[%d]:ID=%lu, Distance=%.6f ", i,
+                ground_truth_neighbors_dist[i].id, ground_truth_neighbors_dist[i].distance);
+    }
+    
+    printf("\n");
+    // Calculate recall
+    float recall = (float)match_count / (float)config.search.k;
+    printf("Query %lu: Returned %d/%d correct neighbors, Recall: %.2f%%\n",
+               query_ix, match_count, config.search.k, recall * 100.0);
+    pthread_mutex_unlock(&dataset_recall_stats.mutex);
+    updateRecallStats(recall);
+
+    
+    zfree(vector);
+    zfree(query_vector);
+}
 
 static void printDatasetRecallStats(void) {
     if (!config.use_dataset || dataset_recall_stats.total_queries == 0) {
@@ -872,6 +981,7 @@ static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
         }
         result_vec_ids[num_vecs_ids++] = vector_id;
     }
+
     /* Compare with ground truth if available */
     if (config.use_dataset && num_vecs_ids > 0) {
         printf_results("\n=== Ground Truth Comparison ===\n");
@@ -891,11 +1001,16 @@ static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
                    gt_neighbors[i], result_vec_ids[i], (found >= 0) ? "[MATCH]" : "[MISS]", found, query_index, has_more_query_sources > 0 ? "(multiple query sources)" : "", has_more_query_sources + 1);
         }
         float recall = (float)matches / num_vecs_ids;
-
         printf_results("  Total matches: %d out of %zu, Recall: %.2f%%\n", matches, num_vecs_ids, recall * 100.0f);
+
         if (config.print_search_results) {
             pthread_mutex_unlock(&dataset_recall_stats.mutex);
         }
+        if (recall < 1.0) {
+            // check distances for debugging
+            checkNeighbors(query_idx, result_vec_ids, num_vecs_ids, gt_neighbors, config.dataset_num_neighbors);
+        }
+
 
         updateRecallStats(recall);
     } else if (config.print_search_results) {

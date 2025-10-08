@@ -8,7 +8,6 @@
 
 #include "vector-id-mapping.h"
 #include "cluster-scan.h"
-#include "cluster-utils.h"
 #include "zmalloc.h"
 #include <stdio.h>
 #include <stdlib.h>
