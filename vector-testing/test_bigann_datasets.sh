@@ -7,7 +7,7 @@ set -euo pipefail
 
 # Environment variables
 VALKEY_HOME="${VALKEY_HOME:-/home/ubuntu/valkey}"
-HOST="${HOST:-localhost}"
+HOST="${HOST:-ec-search-zvi-ec-1shard-no-tls-0001-001.ajfdds.0001.euw1devo.cache.amazonaws.com}"
 BINARY_DIR="${VALKEY_HOME}/build-debug"
 BENCHM="${BINARY_DIR}/bin/valkey-benchmark"
 CLI="${BINARY_DIR}/bin/valkey-cli"
@@ -103,6 +103,43 @@ generate_index_name() {
     echo "${index_name}-${vec_str}-${dims}-${k_neighbors}"
 }
 
+# Function to cleanup old indexes
+cleanup_old_indexes() {
+    print_header "Checking index capacity"
+
+    # Get list of current indexes
+    local current_indexes=$($CLI -h "$HOST" --cluster FT._LIST 2>/dev/null | wc -l || echo "0")
+
+    echo "Current indexes: $current_indexes / 10"
+
+    if [ "$current_indexes" -ge "8" ]; then
+        print_warning "Near or at index limit. Need to remove old indexes."
+
+        # Get list of indexes
+        local indexes=$($CLI -h "$HOST" --cluster FT._LIST 2>/dev/null || true)
+
+        if [ -n "$indexes" ]; then
+            echo "Current indexes:"
+            echo "$indexes" | head -10
+
+            read -p "Remove ALL existing indexes? [y/N] " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                for index in $indexes; do
+                    echo "Dropping index: $index"
+                    $CLI -h "$HOST" --cluster FT.DROPINDEX "$index" 2>/dev/null || true
+                done
+                print_success "Cleared all indexes"
+            else
+                print_error "Cannot proceed without clearing indexes"
+                return 1
+            fi
+        fi
+    fi
+
+    echo
+}
+
 # Function to test a dataset
 test_dataset() {
     local dataset=$1
@@ -112,6 +149,9 @@ test_dataset() {
         echo "Run: ./download_bigann_datasets.sh $dataset"
         return 1
     fi
+
+    # Clean up indexes if needed
+    cleanup_old_indexes
 
     IFS=',' read -r index_name prefix dims expected_vectors k_neighbors <<< "${DATASET_CONFIG[$dataset]}"
     local full_index_name=$(generate_index_name "$dataset")
@@ -132,27 +172,35 @@ test_dataset() {
     for ef_search in "${ef_values[@]}"; do
         echo -n "Testing ef_search=$ef_search... "
 
-        # Run benchmark
+        # Run benchmark (following test_multi_dataset.sh format)
+        local binary_file="${BINARY_DIR}/${dataset}.bin"
         local output=$($BENCHM \
-            -h "$HOST" \
-            --threads "$THREADS" \
-            -c "$CONCURRENCY" \
-            -n "$NUM_QUERIES" \
-            --dataset "${dataset}" \
-            --search-index-name "$full_index_name" \
-            --search-ef-runtime "$ef_search" \
-            --search -t FT.SEARCH 2>&1 || true)
+            -h "$HOST" --cluster --rfr no \
+            --dataset "$binary_file" \
+            -t vec-query --search --vector-dim "$dims" \
+            --search-name "$full_index_name" --search-prefix "$prefix" \
+            --ef-search "$ef_search" \
+            -n "$NUM_QUERIES" -c "$CONCURRENCY" --threads "$THREADS" 2>&1 || true)
 
-        # Parse results
-        if echo "$output" | grep -q "avg_recall"; then
-            local avg_recall=$(echo "$output" | grep "avg_recall" | awk '{print $2}')
-            local min_recall=$(echo "$output" | grep "min_recall" | awk '{print $2}')
-            local max_recall=$(echo "$output" | grep "max_recall" | awk '{print $2}')
-            local qps=$(echo "$output" | grep "requests per second" | awk '{print $1}')
-            local latency=$(echo "$output" | grep "avg latency" | awk '{print $3}')
+        # Parse results (following test_multi_dataset.sh format)
+        if echo "$output" | grep -q "Average:"; then
+            local avg_recall=$(echo "$output" | grep "Average:" | awk '{print $2}' | sed 's/%//')
+            local min_recall=$(echo "$output" | grep "Min:" | awk '{print $2}' | sed 's/%//')
+            local max_recall=$(echo "$output" | grep "Max:" | awk '{print $2}' | sed 's/%//')
+            local total_queries=$(echo "$output" | grep "Queries evaluated:" | awk '{print $3}')
+            local qps=$(echo "$output" | grep "throughput summary:" | awk '{print $3}')
+            local latency=$(echo "$output" | grep "avg       min" -A 1 | tail -1 | awk '{print $1}')
 
-            echo "$dataset,$ef_search,$avg_recall,$min_recall,$max_recall,$NUM_QUERIES,$qps,$latency" >> "$results_file"
-            echo -e "${GREEN}✓${NC} Recall: $avg_recall, QPS: $qps"
+            # Use defaults if not found
+            avg_recall=${avg_recall:-"N/A"}
+            min_recall=${min_recall:-"N/A"}
+            max_recall=${max_recall:-"N/A"}
+            total_queries=${total_queries:-"0"}
+            qps=${qps:-"N/A"}
+            latency=${latency:-"N/A"}
+
+            echo "$dataset,$ef_search,$avg_recall,$min_recall,$max_recall,$total_queries,$qps,$latency" >> "$results_file"
+            echo -e "${GREEN}✓${NC} Recall: ${avg_recall}%, QPS: $qps"
         else
             echo -e "${RED}✗${NC} Test failed"
             echo "$output" | tail -5
