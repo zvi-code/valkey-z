@@ -7,7 +7,12 @@ set -euo pipefail
 
 # Environment variables
 VALKEY_HOME="${VALKEY_HOME:-/home/ubuntu/valkey}"
-HOST="${HOST:-ec-search-zvi-ec-1shard-no-tls-0001-001.ajfdds.0001.euw1devo.cache.amazonaws.com}"
+# HOST="${HOST:-ec-search-zvi-ec-1shard-no-tls-0001-001.ajfdds.0001.euw1devo.cache.amazonaws.com}"
+if [ -z "${HOST:-}" ]; then
+    echo "ERROR: HOST environment variable not set"
+    echo "Set HOST to the Valkey/Redis cluster endpoint"
+    exit 1
+fi
 BINARY_DIR="${VALKEY_HOME}/build-debug"
 BENCHM="${BINARY_DIR}/bin/valkey-benchmark"
 CLI="${BINARY_DIR}/bin/valkey-cli"

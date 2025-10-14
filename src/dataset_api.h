@@ -30,6 +30,12 @@ typedef struct {
     uint32_t num_neighbors;
 } dataset_info_t;
 
+typedef struct {
+    uint64_t* ids; // array of vector IDs
+    float* dists; // array of distances
+    size_t count; // number of results
+} dataset_neighbors_t;
+
 /* 4KB-aligned header for cache efficiency */
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -56,8 +62,10 @@ typedef struct dataset_ctx dataset_ctx_t;
 dataset_ctx_t* dataset_init(const char *dataset_name, dataset_info_t *info);
 int datasetGetVector(dataset_ctx_t *ctx, uint64_t index, uint64_t *id_out, float *vec_out);
 int datasetSetQueryVec(dataset_ctx_t *ctx, uint64_t query_index, float *query_vec_out);
-int datasetGetNeighbors(dataset_ctx_t *ctx, uint64_t query_index, uint64_t *neighbors_out);
+dataset_neighbors_t* datasetGetNeighbors(dataset_ctx_t *ctx, uint64_t query_index);
 int dataset_get_info(dataset_ctx_t *ctx, dataset_info_t *info);
 void dataset_destroy(dataset_ctx_t *ctx);
 uint64_t datasetGetQueryIxByNeighbor(dataset_ctx_t *ctx, uint64_t neighbor_index, uint32_t ix);
+float calculateDistance(const float *vec1, const float *vec2, int dim, const char *metric);
+float datasetGetDistanceFromQueryVector(dataset_ctx_t *ctx, uint64_t query_index, uint64_t returned_neighbor_index);
 #endif /* DATASET_API_H */

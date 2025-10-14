@@ -6,7 +6,12 @@
 set -e
 
 # Configuration - EDIT THESE FOR YOUR SETUP
-HOST="ec-search-zvi-ec-1shard-no-tls-0001-001.ajfdds.0001.euw1devo.cache.amazonaws.com"
+# HOST="ec-search-zvi-ec-1shard-no-tls-0001-001.ajfdds.0001.euw1devo.cache.amazonaws.com"
+if [ -z "${HOST:-}" ]; then
+    echo "ERROR: HOST environment variable not set"
+    echo "Set HOST to the Valkey/Redis cluster endpoint"
+    exit 1
+fi
 DATASET_FILE="large_dataset.bin"
 INDEX_NAME="large_scale_25"
 PREFIX="zvec_large_:"
