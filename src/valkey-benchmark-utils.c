@@ -867,10 +867,277 @@ static void printDiffRow(clusterSnapshot *old, clusterSnapshot *new_snap,
     sdsfree(display_name);
 }
 
+int isMemoryDBCluster(int cluster_node_count, clusterNode **cluster_nodes,
+                                        enum valkeyConnectionType ct) {
+    /* check info for : os:Amazon MemoryDB */
+    for (int i = 0; i < cluster_node_count; i++) {
+        clusterNode *node = cluster_nodes[i];
+        valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(ct, node->ip, node->port);
+        if (!node || !ctx) continue;
+        // send command to node
+        valkeyReply *reply = valkeyCommand(node->ctx, "INFO");
+        if (!reply) {
+            printf("Error: No response from node %s while checking index status.\n", node->name);
+            continue;
+        }
 
+        if (strstr(reply->str, "os:Amazon MemoryDB") != NULL) {
+            freeReplyObject(reply);
+            return 1; /* It's a MemoryDB node */
+        }
 
-/* */
-/* Convert FT.INFO RESP array response to line-based format 
+        freeReplyObject(reply);
+    }
+    return 0;
+}
+/* 
+ec-search-zvi-memdb-no-tls-0001-001.ajfdds.0001.memorydb-devo.eu-west-1.amazonaws.com:6379> ft.info gist-960-1M-960-100
+ 1) index_name
+ 2) "gist-960-1M-960-100"
+ 3) creation_timestamp
+ 4) (integer) 1760486768231299
+ 5) key_type
+ 6) HASH
+ 7) key_prefixes
+ 8) 1) "zvec_gist:"
+ 9) fields
+10) 1)  1) identifier
+        2) vector_field
+        3) field_name
+        4) vector_field
+        5) type
+        6) VECTOR
+        7) option
+        8)
+        9) vector_params
+       10)  1) algorithm
+            2) HNSW
+            3) data_type
+            4) FLOAT32
+            5) dimension
+            6) (integer) 960
+            7) distance_metric
+            8) L2
+            9) initial_capacity
+           10) (integer) 1000
+           11) current_capacity
+           12) (integer) 1735134
+           13) maximum_edges
+           14) (integer) 12
+           15) ef_construction
+           16) (integer) 400
+           17) ef_runtime
+           18) (integer) 200
+           19) epsilon
+           20) "0.01"
+11) space_usage
+12) (integer) 3063809792
+13) fulltext_space_usage
+14) (integer) 38524385
+15) vector_space_usage
+16) (integer) 3025285407
+17) num_docs
+18) (integer) 1000000
+19) num_indexed_vectors
+20) (integer) 1000000
+21) current_lag
+22) (integer) 0
+23) index_status
+24) AVAILABLE
+25) index_degradation_percentage
+26) (integer) 41
+ec-search-zvi-memdb-no-tls-0001-001.ajfdds.0001.memorydb-devo.eu-west-1.amazonaws.com:6379>
+*/
+static sds convertMemDBFtInfoToLines(valkeyReply *reply, const char *prefix) {
+    if (!reply) return NULL;
+
+    sds lines = sdsempty();
+    
+    /* Handle non-array types */
+    if (reply->type != VALKEY_REPLY_ARRAY) {
+        if (reply->type == VALKEY_REPLY_STRING || reply->type == VALKEY_REPLY_STATUS) {
+            lines = sdscatprintf(lines, "%s:%s\n", prefix ? prefix : "", reply->str);
+        } else if (reply->type == VALKEY_REPLY_INTEGER) {
+            lines = sdscatprintf(lines, "%s:%lld\n", prefix ? prefix : "", reply->integer);
+        }
+        return lines;
+    }
+    
+    /* Process array elements as key-value pairs */
+    for (size_t i = 0; i < reply->elements; i += 2) {
+        if (i + 1 >= reply->elements) break; /* Ensure we have both key and value */
+        
+        valkeyReply *key_elem = reply->element[i];
+        valkeyReply *val_elem = reply->element[i + 1];
+        
+        if (!key_elem || !val_elem) continue;
+        
+        /* Key should be a string */
+        if (key_elem->type != VALKEY_REPLY_STRING && key_elem->type != VALKEY_REPLY_STATUS) {
+            continue;
+        }
+        
+        char *key_name = key_elem->str;
+        
+        /* Build full key with prefix */
+        sds full_key = prefix ? sdscatprintf(sdsempty(), "%s.%s", prefix, key_name) 
+                              : sdsnew(key_name);
+        
+        /* Handle different value types */
+        if (val_elem->type == VALKEY_REPLY_STRING || val_elem->type == VALKEY_REPLY_STATUS) {
+            /* Simple string value */
+            lines = sdscatprintf(lines, "%s:%s\n", full_key, val_elem->str);
+        } else if (val_elem->type == VALKEY_REPLY_INTEGER) {
+            /* Integer value */
+            lines = sdscatprintf(lines, "%s:%lld\n", full_key, val_elem->integer);
+        } else if (val_elem->type == VALKEY_REPLY_ARRAY) {
+            /* Nested array - check if it's a list or nested key-value pairs */
+            if (val_elem->elements > 0 && val_elem->element[0]) {
+                valkeyReply *first = val_elem->element[0];
+                
+                /* If first element is an array, it's likely a complex structure (like fields) */
+                if (first->type == VALKEY_REPLY_ARRAY) {
+                    /* Process each sub-array with the current key as prefix */
+                    for (size_t j = 0; j < val_elem->elements; j++) {
+                        sds nested_lines = convertMemDBFtInfoToLines(val_elem->element[j], full_key);
+                        if (nested_lines) {
+                            lines = sdscatsds(lines, nested_lines);
+                            sdsfree(nested_lines);
+                        }
+                    }
+                } else if ((first->type == VALKEY_REPLY_STRING || first->type == VALKEY_REPLY_STATUS) &&
+                           val_elem->elements % 2 == 0) {
+                    /* Even number of string elements suggests key-value pairs */
+                    sds nested_lines = convertMemDBFtInfoToLines(val_elem, full_key);
+                    if (nested_lines) {
+                        lines = sdscatsds(lines, nested_lines);
+                        sdsfree(nested_lines);
+                    }
+                } else {
+                    /* It's a simple list - just concat the first value */
+                    if (first->type == VALKEY_REPLY_STRING || first->type == VALKEY_REPLY_STATUS) {
+                        lines = sdscatprintf(lines, "%s:%s\n", full_key, first->str);
+                    } else if (first->type == VALKEY_REPLY_INTEGER) {
+                        lines = sdscatprintf(lines, "%s:%lld\n", full_key, first->integer);
+                    }
+                }
+            }
+        }
+        
+        sdsfree(full_key);
+    }
+    
+    return lines;
+}
+
+void waitForIndexBackfillCompleteMemoryDB(int cluster_node_count, clusterNode **cluster_nodes,
+                                        enum valkeyConnectionType ct, const char *index_name) {
+    if (!index_name) return;
+    
+    size_t total_docs = 0;
+    int backfill_in_progress_nodes = 0;
+    double global_backfill_complete_percent = 0.0;
+    while (1) {
+        // go over all nodes and check FT.INFO
+        // check these metrics:
+        // 23) index_status
+        // 24) AVAILABLE | BACKFILLING
+        // 25) index_degradation_percentage
+        // 26) (integer) 41
+        // if index_status is AVAILABLE on all nodes, and index_degradation_percentage is 0 on all nodes, we are done
+        // if index_status is BACKFILLING on any node, we are not done
+        // if not, continue to next nodes to collect global progress, print global progress and number of nodes still backfilling and number of docs
+        for (int i = 0; i < cluster_node_count; i++) {
+            clusterNode *node = cluster_nodes[i];
+            valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(ct, node->ip, node->port);
+            if (!node || !ctx) continue;
+            // send command to node
+            valkeyReply *reply = valkeyCommand(ctx, "FT.INFO %b", index_name, strlen(index_name));
+            if (!reply) {
+                printf("Error: No response from node %s while checking index status.\n", node->name);
+                continue;
+            }
+            sds info_lines = convertMemDBFtInfoToLines(reply, NULL);
+            freeReplyObject(reply);
+            if (!info_lines) {
+                printf("Error: Unable to parse FT.INFO response from node %s.\n", node->name);
+                continue;
+            }
+            if (strlen(info_lines) == 0) {
+                printf("Error: Empty FT.INFO response from node %s.\n", node->name);
+                sdsfree(info_lines);
+                assert(0);
+            }
+            if (strstr(info_lines, "index_degradation_percentage:") == NULL) {
+                printf("Error: FT.INFO response from node %s does not contain expected fields. GOT:\n%s\n", node->name, info_lines);
+                fflush(stdout);
+                sdsfree(info_lines);
+                assert(0);
+            }
+            // // verify memorydb 
+            // assert(strstr(info_lines, "index_degradation_percentage:") != NULL);
+
+            char *status_str = strstr(info_lines, "index_status:");
+            char *degradation_str = strstr(info_lines, "index_degradation_percentage:");
+            char *num_docs_str = strstr(info_lines, "num_indexed_vectors:");
+            if (!status_str || !degradation_str || !num_docs_str) {
+                printf("Error: Missing expected fields in FT.INFO response from node %s.\n", node->name);
+                sdsfree(info_lines);
+                continue;
+            }
+            char status[64];
+            int degradation = 0;
+            long long node_docs = 0;
+            if (sscanf(status_str, "index_status:%63s", status) != 1) {
+                printf("Error: Unable to parse index_status from node %s.\n", node->name);
+                sdsfree(info_lines);
+                continue;
+            }
+            if (sscanf(degradation_str, "index_degradation_percentage:%d", &degradation) != 1) {
+                printf("Error: Unable to parse index_degradation_percentage from node %s.\n", node->name);
+                sdsfree(info_lines);
+                continue;
+            }
+            if (sscanf(num_docs_str, "num_indexed_vectors:%lld", &node_docs) != 1) {
+                printf("Error: Unable to parse num_indexed_vectors from node %s.\n", node->name);
+                sdsfree(info_lines);
+                continue;
+            }
+            sdsfree(info_lines);
+            // check status
+            if (strcmp(status, "BACKFILLING") == 0 || degradation > 0) {
+                backfill_in_progress_nodes++;
+                global_backfill_complete_percent += (100.0 - (double)degradation);
+                total_docs += node_docs;
+            } else if (strcmp(status, "AVAILABLE") == 0 && degradation == 0) {
+                // node is done
+                continue;
+            } else {
+                printf("Warning: Unexpected index_status '%s' on node %s.\n", status, node->name);
+            }
+        }
+        // print global progress
+        if (backfill_in_progress_nodes > 0) {
+            global_backfill_complete_percent /= (double)cluster_node_count;
+            printf("Global: Index '%s' backfill is %.2f%% complete across %d nodes. Total docs indexed: %ld\n", 
+                   index_name, global_backfill_complete_percent, 
+                   backfill_in_progress_nodes, total_docs);
+        } else {
+            printf("Global: Index '%s' backfill is complete across all nodes. Total docs indexed: %ld\n", 
+                   index_name, total_docs);
+            break;
+        }
+        total_docs = 0;
+        backfill_in_progress_nodes = 0;
+        global_backfill_complete_percent = 0.0;
+        // wait for 5 seconds before next check
+        printf("Waiting for index '%s' backfill to complete...\n", index_name);
+        sleep(5);
+    }
+    printf("Index '%s' backfill process has completed on all nodes.\n", index_name);
+}
+
+/* Convert FT.INFO RESP array response to line-based format
 ec-search-zvi-ec-1shard-no-tls.ajfdds.clustercfg.euw1devo.cache.amazonaws.com:6379> ft.info vindex_4dim
  1) index_name
  2) vindex_4dim
@@ -1034,10 +1301,9 @@ static sds convertFtInfoToLines(valkeyReply *reply, const char *prefix) {
     return lines;
 }
 
-void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_nodes,
+void waitForIndexBackfillCompleteEC(int cluster_node_count, clusterNode **cluster_nodes,
                                         enum valkeyConnectionType ct, const char *index_name) {
     if (!index_name) return;
-    
     size_t total_docs = 0;
     int backfill_in_progress_nodes = 0;
     double global_backfill_complete_percent = 0.0;
@@ -1066,6 +1332,7 @@ void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_
                 printf("Error: Unable to parse FT.INFO response from node %s.\n", node->name);
                 continue;
             }
+
             /* Check for backfill_in_progress line */
             char *line = strstr(info_lines, "backfill_in_progress:");
             int backfill_in_progress = 0;
@@ -1116,6 +1383,51 @@ void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_
     }
     printf("Index '%s' backfill process has completed on all nodes.\n", index_name);
 }
+
+
+void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_nodes,
+                                        enum valkeyConnectionType ct, const char *index_name) {
+    if (!index_name) return;
+    if (isMemoryDBCluster(cluster_node_count, cluster_nodes, ct)) {
+        // Handle MemoryDB specific logic
+        waitForIndexBackfillCompleteMemoryDB(cluster_node_count, cluster_nodes, ct, index_name);
+        return;
+    } else {
+        waitForIndexBackfillCompleteEC(cluster_node_count, cluster_nodes, ct, index_name);
+    }
+}
+/* Create snapshot from current cluster state 
+# search_index_stats
+search_used_memory_bytes:4171347520
+search_used_memory_human:3.88G
+search_number_of_indexes:4
+search_num_fulltext_indexes:0
+search_num_vector_indexes:4
+search_num_hash_indexes:4
+search_num_json_indexes:0
+search_num_available_indexes:4
+search_index_validation_failures:0
+search_total_indexed_keys:2971718
+search_total_indexed_vectors:2971718
+search_total_indexed_hash_keys:2971718
+search_total_indexed_json_documents:0
+search_total_index_size:3533826366
+search_total_fulltext_index_size:112647672
+search_total_vector_index_size:3421178694
+search_max_index_degradation_percentage:41
+search_max_index_lag_ms:0
+
+# search_ingestion
+search_background_indexing_status:NO_ACTIVITY
+
+# search_backfill
+search_num_active_backfills:0
+search_backfills_paused:no
+
+# search_query
+search_num_active_queries:0
+
+*/
 
 /* Create snapshot from current cluster state 
 # Modules
@@ -1254,8 +1566,6 @@ search_vector_externing_num_lru_entries:0
 search_network_bytes_out:0
 search_network_bytes_in:0
 
-    int cluster_node_count;
-    clusterNode **cluster_nodes;
 */
 
 clusterSnapshot* createClusterSnapshot(const char *command, 

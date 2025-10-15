@@ -127,4 +127,6 @@ void freeClusterSnapshot(clusterSnapshot *snapshot);
 valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
 void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_nodes,
                                         enum valkeyConnectionType ct, const char *index_name);
+int isMemoryDBCluster(int cluster_node_count, clusterNode **cluster_nodes,
+                                        enum valkeyConnectionType ct);
 #endif /* __VALKEY_BENCHMARK_UTILS_H */
