@@ -412,7 +412,7 @@ static struct config {
     searchIndex search;
     int print_search_results; /* Print FT.SEARCH results */
     int search_debug;
-    
+    int is_memorydb; /* True if connected to MemoryDB */
     /* Vector generator configuration */
     uint64_t vgen_initial_capacity; /* Initial vector capacity */
     uint32_t vgen_num_centroids;    /* Number of centroids for clustering */
@@ -894,15 +894,72 @@ static sds createVectorTemplate(uint64_t key_idx) {
 }
 
 
+/* Helper function to print reply structure for debugging */
+static void debugPrintReplyStructure(valkeyReply *reply, int depth, int max_depth) {
+    if (!reply || depth > max_depth) return;
+    
+    const char *indent = "                                        "; // 40 spaces
+    int indent_len = depth * 2;
+    if (indent_len > 40) indent_len = 40;
+    
+    const char *type_str = "UNKNOWN";
+    switch (reply->type) {
+        case VALKEY_REPLY_STRING: type_str = "STRING"; break;
+        case VALKEY_REPLY_ARRAY: type_str = "ARRAY"; break;
+        case VALKEY_REPLY_INTEGER: type_str = "INTEGER"; break;
+        case VALKEY_REPLY_NIL: type_str = "NIL"; break;
+        case VALKEY_REPLY_STATUS: type_str = "STATUS"; break;
+        case VALKEY_REPLY_ERROR: type_str = "ERROR"; break;
+        default: break;
+    }
+    
+    fprintf(stderr, "%.*s[%s]", indent_len, indent, type_str);
+    
+    switch (reply->type) {
+        case VALKEY_REPLY_STRING:
+        case VALKEY_REPLY_STATUS:
+        case VALKEY_REPLY_ERROR:
+            fprintf(stderr, " \"%.*s\"%s\n", 
+                    (int)(reply->len > 60 ? 60 : reply->len), 
+                    reply->str,
+                    reply->len > 60 ? "..." : "");
+            break;
+        case VALKEY_REPLY_INTEGER:
+            fprintf(stderr, " %lld\n", reply->integer);
+            break;
+        case VALKEY_REPLY_ARRAY:
+            fprintf(stderr, " (elements: %zu)\n", reply->elements);
+            for (size_t i = 0; i < reply->elements && i < 20; i++) {
+                fprintf(stderr, "%.*s  [%zu]: ", indent_len, indent, i);
+                debugPrintReplyStructure(reply->element[i], depth + 1, max_depth);
+            }
+            if (reply->elements > 20) {
+                fprintf(stderr, "%.*s  ... (%zu more elements)\n", 
+                        indent_len, indent, reply->elements - 20);
+            }
+            break;
+        default:
+            fprintf(stderr, "\n");
+            break;
+    }
+    assert(0);
+}
+
 /* Print FT.SEARCH results in a user-friendly format */
 static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
     if (!reply || reply->type != VALKEY_REPLY_ARRAY) {
-        // printf("Invalid search result format\n");
+        fprintf(stderr, "ERROR: Invalid search result format - reply is %s\n",
+                !reply ? "NULL" : "not an ARRAY");
+        if (reply) {
+            fprintf(stderr, "Reply structure:\n");
+            debugPrintReplyStructure(reply, 0, 3);
+        }
         return;
     }
     
     if (reply->elements < 1) {
-        printf("No search results - reply->elements %ld\n", reply->elements);
+        fprintf(stderr, "ERROR: No search results - reply->elements %zu\n", reply->elements);
+        debugPrintReplyStructure(reply, 0, 3);
         assert(0);
     }
     if (config.print_search_results) {
@@ -958,74 +1015,119 @@ static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
     uint64_t result_vec_ids[total_results];
     uint64_t gt_vec_ids[total_results];
     // size_t max_display = total_results > 100 ? 100 : total_results;
-    float score = -1.0;
     // if (total_results > 100) {
     printf_results("  (Showing first 100 of %zu results)\n", total_results);
     // }
     // size_t end_index = total_results * 2;
-    for (size_t i = 0; i < reply->elements; i++) {
-        valkeyReply *resNeighborKey = reply->element[i + 1];
-        if (!resNeighborKey) {
-            // printf("Invalid key format, resNeighborKey is NULL at index %zu\n", i);
+    
+    /* Parse results based on actual reply structure */
+    size_t result_idx = 1; /* Start after count element */
+    
+    while (result_idx < reply->elements && num_vecs_ids < total_results) {
+        valkeyReply *current = reply->element[result_idx];
+        
+        if (!current) {
+            fprintf(stderr, "WARNING: NULL element at index %zu, skipping\n", result_idx);
+            result_idx++;
             continue;
-            // assert(0);
         }
-        char* vector_key = resNeighborKey->str;        
-        if (config.search.nocontent) {
-            // No content mode: only show keys
-            if (resNeighborKey && (resNeighborKey->type == VALKEY_REPLY_STRING || resNeighborKey->type == VALKEY_REPLY_STATUS)) {
-                printf_results("\nResult %zu: %s\n", i, resNeighborKey->str);
-            } else {
-                printf("Invalid key format in NOCONTENT mode, type: %d\n", resNeighborKey? resNeighborKey->type : -1);
-                assert(0);
+        
+        /* Determine if this is a key or needs further inspection */
+        char *vector_key = NULL;
+        float score = -1.0;
+        
+        if (current->type == VALKEY_REPLY_STRING || current->type == VALKEY_REPLY_STATUS) {
+            /* This is a key */
+            vector_key = current->str;
+            result_idx++;
+            
+            /* Check if next element is a fields array (both NOCONTENT and CONTENT modes in MemoryDB return arrays) */
+            int has_fields_array = 0;
+            if (result_idx < reply->elements) {
+                valkeyReply *next = reply->element[result_idx];
+                if (next && next->type == VALKEY_REPLY_ARRAY) {
+                    has_fields_array = 1;
+                }
             }
-        } else {
-            i++;
-            valkeyReply *resNeighborFields = reply->element[i + 1];
-            if (!resNeighborKey || (resNeighborKey->type != VALKEY_REPLY_STRING && resNeighborKey->type != VALKEY_REPLY_STATUS)) {
-                printf("Invalid key format in CONTENT mode, resNeighborKey type: %d\n", resNeighborKey? resNeighborKey->type : -1);
-                assert(0);
-            }
-            if (!resNeighborFields || resNeighborFields->type != VALKEY_REPLY_ARRAY) {
-                if (!resNeighborFields) {
-                    printf("Invalid key format in CONTENT mode, resNeighborFields is NULL\n");
-                } else if (resNeighborFields->type == VALKEY_REPLY_STRING || resNeighborFields->type == VALKEY_REPLY_STATUS) {
-                    printf("Invalid key format in CONTENT mode, resNeighborFields %s type: %d\n", resNeighborFields->str, resNeighborFields->type);
+            
+            if (has_fields_array) {
+                valkeyReply *fields = reply->element[result_idx];
+                result_idx++;
+                
+                /* Parse fields array to extract score */
+                for (size_t field_idx = 0; field_idx < fields->elements; field_idx += 2) {
+                    if (field_idx + 1 >= fields->elements) break;
+                    
+                    valkeyReply *field_name_reply = fields->element[field_idx];
+                    valkeyReply *field_value_reply = fields->element[field_idx + 1];
+                    
+                    if (!field_name_reply || !field_value_reply) continue;
+                    
+                    if ((field_name_reply->type == VALKEY_REPLY_STRING || 
+                         field_name_reply->type == VALKEY_REPLY_STATUS) &&
+                        strstr(field_name_reply->str, "_score") != NULL) {
+                        
+                        if (field_value_reply->type == VALKEY_REPLY_STRING ||
+                            field_value_reply->type == VALKEY_REPLY_STATUS) {
+                            score = atof(field_value_reply->str);
+                        } else if (field_value_reply->type == VALKEY_REPLY_INTEGER) {
+                            score = (float)field_value_reply->integer;
+                        }
+                        break;
+                    }
+                }
+                
+                if (score >= 0) {
+                    printf_results("\n  Result %zu: %s [distance: %.6f]\n", 
+                                 num_vecs_ids + 1, vector_key, score);
                 } else {
-                    printf("Invalid key format in CONTENT mode, resNeighborFields type: %d\n", resNeighborFields->type);
+                    printf_results("\n  Result %zu: %s\n", num_vecs_ids + 1, vector_key);
                 }
-                assert(0);
+            } else {
+                /* Pure NOCONTENT mode (ElastiCache): just the key, no fields */
+                printf_results("\nResult %zu: %s\n", num_vecs_ids + 1, vector_key);
             }
-            /* Extract score from fields if available */
-            score = -1.0;
-            char* field_name = resNeighborFields->element[0]->str;
-            if (strstr(field_name, "_score") != NULL) {
-                valkeyReply *field_value = resNeighborFields->element[1];
-                if (field_value->type == VALKEY_REPLY_STRING || field_value->type == VALKEY_REPLY_STATUS) {
-                    score = atof(field_value->str);
-                }
-                printf_results("\n  Result %zu: %s [distance: %.6f]\n", (i/2)+1, resNeighborKey->str, score);
-            } 
-            // else {
-            //     printf_results("\n  Result %zu: %s\n", (i/2)+1, resNeighborKey->str);
-            // }
+        } else if (current->type == VALKEY_REPLY_ARRAY) {
+            /* Unexpected array - might be out of sync, try to recover */
+            fprintf(stderr, "WARNING: Unexpected ARRAY at index %zu (expected key), attempting to skip\n", 
+                    result_idx);
+            debugPrintReplyStructure(current, 0, 2);
+            result_idx++;
+            continue;
+        } else {
+            fprintf(stderr, "ERROR: Unexpected element type %d at index %zu (expected STRING/STATUS for key)\n",
+                    current->type, result_idx);
+            fprintf(stderr, "Reply structure:\n");
+            debugPrintReplyStructure(reply, 0, 3);
+            result_idx++;
+            continue;
         }
+        
         /* Extract vector ID using centralized decoding function */
-        char cluster_tag[16];
-        uint64_t vector_id;
-        if (decode_vector_key_fixed(vector_key,
+        if (vector_key) {
+            char cluster_tag[16];
+            uint64_t vector_id;
+            
+            if (decode_vector_key_fixed(vector_key,
                                        NULL, 0,
                                        cluster_tag, sizeof(cluster_tag),
                                        &vector_id) != 0) {
-            fprintf(stderr, "Failed to decode key: %s\n", vector_key);
-            fflush(stderr);
-            assert(0);
+                fprintf(stderr, "WARNING: Failed to decode key: %s, skipping\n", vector_key);
+                continue;
+            }
+            
+            if (num_vecs_ids < total_results) {
+                gt_vec_ids[num_vecs_ids] = query_neighbors->ids[num_vecs_ids];
+                result_vec_ids[num_vecs_ids++] = vector_id;
+            }
         }
-        assert(num_vecs_ids < total_results);
-        gt_vec_ids[num_vecs_ids] = query_neighbors->ids[num_vecs_ids];
-        result_vec_ids[num_vecs_ids++] = vector_id;
     }
-    assert(num_vecs_ids == config.search.k);
+    
+    /* Verify we got the expected number of results */
+    if (num_vecs_ids != config.search.k) {
+        fprintf(stderr, "WARNING: Expected %d results, but parsed %zu\n", 
+                config.search.k, num_vecs_ids);
+    }
     qsort(result_vec_ids, num_vecs_ids, sizeof(uint64_t), uint64_cmp);
     qsort(gt_vec_ids, num_vecs_ids, sizeof(uint64_t), uint64_cmp);
     /* Compare with ground truth if available */
@@ -1327,12 +1429,21 @@ static int createSearchCmdTemplate(char **cmd) {
     sds score_field = sdscatprintf(sdsempty(), "__%s_score", config.search.vector_field);
     
     if (config.search.nocontent) {
-        /* With NOCONTENT, we need RETURN to get the score field */
-        len = valkeyFormatCommand(cmd, 
-            "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b", 
-            index_name, sdslen(index_name), 
-            query, sdslen(query),
-            vector_binary, sdslen(vector_binary));
+        if (!config.is_memorydb) {
+            /* With NOCONTENT, we need RETURN to get the score field */
+            len = valkeyFormatCommand(cmd, 
+                "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b", 
+                index_name, sdslen(index_name), 
+                query, sdslen(query),
+                vector_binary, sdslen(vector_binary));
+        } else {
+            len = valkeyFormatCommand(cmd,
+                "FT.SEARCH %b %b PARAMS 2 query_vector %b RETURN 1 %s",
+                index_name, sdslen(index_name),
+                query, sdslen(query),
+                vector_binary, sdslen(vector_binary),
+                score_field);
+        }
     } else {
         /* Without NOCONTENT, all fields including score are returned by default */
         len = valkeyFormatCommand(cmd,
@@ -4472,7 +4583,7 @@ int main(int argc, char **argv) {
             initRecallStats();
 
             /* Initialize cluster tag mapping */
-            initClusterTagMap(&cluster_tag_map, 1000000);
+            initClusterTagMap(&cluster_tag_map, info.num_vectors * 2); /* initial capacity */
 
 
             /* Override vector dimension from dataset */
@@ -4489,7 +4600,8 @@ int main(int argc, char **argv) {
             printf("✓ Dataset loaded: %lu vectors, %lu queries, %u dims, %u neighbors\n",
                 info.num_vectors, info.num_queries, info.dim, info.num_neighbors);
         }
-        printf("Using search indexes for the benchmark.\n");
+        config.is_memorydb = isMemoryDBCluster(config.cluster_node_count, config.cluster_nodes, config.ct);
+        printf("Using search indexes for the benchmark. %s\n", config.is_memorydb ? "MemoryDB" : "EC\\Valkey");
         createDefaultSearchIndexes();
         waitForIndexBackfillComplete(config.selected_node_count, config.selected_nodes, config.ct, config.search.name);
         // wait for flat indexes

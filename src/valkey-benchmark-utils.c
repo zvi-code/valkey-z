@@ -1928,9 +1928,9 @@ void compareClusterSnapshots(clusterSnapshot *old, clusterSnapshot *new_snap,
     freeTableLayout(&layout);
 }
 
-/* INFO SEARCH fields with temporal tracking */
+/* INFO SEARCH fields with temporal tracking - supports EC CME, EC CMD, and MemoryDB */
 infoFieldType search_info_fields[] = {
-    /* Request rates */
+    /* Request rates - Common to all systems */
     {"search_successful_requests_count", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
     {"search_failure_requests_count", exact_field_matcher, {PARSE_INTEGER, NULL},
@@ -1938,21 +1938,39 @@ infoFieldType search_info_fields[] = {
     {"search_hybrid_requests_count", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
 
-    /* Memory growth */
+    /* Memory growth - Common to all systems */
     {"search_used_memory_bytes", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_MEMORY_MB, DIFF_MEMORY_GROWTH, 1, FROM_PRIMARY_ONLY, 1},
     {"search_index_reclaimable_memory", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_MEMORY_MB, DIFF_MEMORY_GROWTH, 1, FROM_PRIMARY_ONLY, 1},
+    
+    /* EC CMD/CME specific - ingestion */
     {"search_ingest_field_vector", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_PRIMARY_ONLY, 1},
     
-    /* Indexing rates */
+    /* EC CMD/CME specific - indexing rates */
     {"search_total_indexed_documents", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
     {"search_total_active_write_threads", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_MINMAX, DISPLAY_MINMAX, DIFF_NONE, 1, FROM_ALL, 1},
     
-    /* CPU usage */
+    /* MemoryDB specific - indexing stats */
+    {"search_total_indexed_keys", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_total_indexed_vectors", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_total_indexed_hash_keys", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_total_index_size", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_MEMORY_GROWTH, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_total_vector_index_size", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_MEMORY_GROWTH, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_max_index_degradation_percentage", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_MAX, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_max_index_lag_ms", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_MAX, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    
+    /* EC CMD/CME specific - CPU usage */
     {"search_read_cpu_time_sec", exact_field_matcher, {PARSE_FLOAT_FIXED, NULL},
      AGG_SUM, DISPLAY_FLOAT, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
     {"search_write_cpu_time_sec", exact_field_matcher, {PARSE_FLOAT_FIXED, NULL},
@@ -1962,51 +1980,88 @@ infoFieldType search_info_fields[] = {
     {"search_used_write_cpu", exact_field_matcher, {PARSE_FLOAT_FIXED, NULL},
      AGG_AVERAGE, DISPLAY_PERCENTAGE, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
 
-    /* Queue sizes */
+    /* EC CMD/CME specific - Queue sizes */
     {"search_query_queue_size", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_AVERAGE, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_ALL, 1},
     {"search_writer_queue_size", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_AVERAGE, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
 
-    /* Latencies */
+    /* Latencies - Common to EC CMD/CME, may not exist in MemoryDB */
     {"search_hnsw_vector_index_search_latency_usec", exact_field_matcher, {PARSE_PERCENTILE, "p50"},
      AGG_MAX, DISPLAY_LATENCY_USEC, DIFF_NONE, 1, FROM_ALL, 1},
     {"search_hnsw_vector_index_search_latency_usec", exact_field_matcher, {PARSE_PERCENTILE, "p99"},
      AGG_MAX, DISPLAY_LATENCY_USEC, DIFF_NONE, 1, FROM_ALL, 1},
     {"search_hnsw_vector_index_search_latency_usec", exact_field_matcher, {PARSE_PERCENTILE, "p99.9"},
      AGG_MAX, DISPLAY_LATENCY_USEC, DIFF_NONE, 1, FROM_ALL, 1},
-    {"search_coordinator_server_search_index_partition_success_latency_usec", exact_field_matcher, {PARSE_PERCENTILE, "p99"},
+    {"search_flat_vector_index_search_latency_usec", exact_field_matcher, {PARSE_PERCENTILE, "p99"},
      AGG_MAX, DISPLAY_LATENCY_USEC, DIFF_NONE, 1, FROM_ALL, 1},
     
-    /* Error rates */
+    /* EC CME specific - coordinator latencies */
+    {"search_coordinator_server_search_index_partition_success_latency_usec", exact_field_matcher, {PARSE_PERCENTILE, "p99"},
+     AGG_MAX, DISPLAY_LATENCY_USEC, DIFF_NONE, 1, FROM_ALL, 1},
+    {"search_coordinator_client_search_index_partition_success_latency_usec", exact_field_matcher, {PARSE_PERCENTILE, "p99"},
+     AGG_MAX, DISPLAY_LATENCY_USEC, DIFF_NONE, 1, FROM_ALL, 1},
+    
+    /* Error rates - EC CMD/CME specific */
     {"search_hnsw_add_exceptions_count", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
     {"search_bounds_check_errors", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
     
-    /* Counters */
+    /* Counters - EC CMD/CME specific */
     {"search_num_hnsw_edges", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_num_flat_nodes", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_num_vector_indexes", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_num_hnsw_indexes", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_num_flat_indexes", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
     {"search_number_of_indexes", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_num_available_indexes", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
     {"search_vectors_marked_deleted", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
     {"search_num_hnsw_nodes", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_PERCENTAGE_CHANGE, 1, FROM_PRIMARY_ONLY, 1},
     
-    /* Memory stats */
+    /* Status - MemoryDB specific */
+    {"search_background_indexing_status", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1},
+    {"search_num_active_backfills", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_current_backfill_progress_percentage", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_AVERAGE, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"search_num_active_queries", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_ALL, 1},
+    
+    /* Memory stats - Common to EC CMD/CME */
     {"search_vectors_memory_marked_deleted", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
     {"search_vectors_bytes", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
     {"search_interned_strings_memory", exact_field_matcher, {PARSE_INTEGER, NULL},
-     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1}
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    
+    /* Network stats - EC CME specific */
+    {"search_network_bytes_in", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
+    {"search_network_bytes_out", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
+    {"search_coordinator_bytes_in", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_RATE_COUNT, 1, FROM_ALL, 1},
+    {"search_coordinator_bytes_out", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_RATE_COUNT, 1, FROM_ALL, 1}
 };
 
 
 
-/* FT.INFO fields with temporal tracking */
+/* FT.INFO fields with temporal tracking - supports EC and MemoryDB */
 infoFieldType ftinfo_fields[] = {
+    /* EC format fields */
     {"num_docs", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_PRIMARY_ONLY, 1},
     {"hash_indexing_failures", exact_field_matcher, {PARSE_INTEGER, NULL},
@@ -2022,6 +2077,30 @@ infoFieldType ftinfo_fields[] = {
     {"attributes.capacity", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1},
     {"attributes.size", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1},
+    
+    /* MemoryDB format fields */
+    {"index_name", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1},
+    {"num_indexed_vectors", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_RATE_COUNT, 1, FROM_PRIMARY_ONLY, 1},
+    {"space_usage", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_MEMORY_GROWTH, 1, FROM_PRIMARY_ONLY, 1},
+    {"vector_space_usage", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_MEMORY_GROWTH, 1, FROM_PRIMARY_ONLY, 1},
+    {"fulltext_space_usage", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_MEMORY_HUMAN, DIFF_MEMORY_GROWTH, 1, FROM_PRIMARY_ONLY, 1},
+    {"current_lag", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_MAX, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"index_status", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1},
+    {"index_degradation_percentage", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_MAX, DISPLAY_INTEGER, DIFF_NONE, 1, FROM_PRIMARY_ONLY, 1},
+    {"fields.vector_params.dimension", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_MINMAX, DISPLAY_MINMAX, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1},
+    {"fields.vector_params.maximum_edges", exact_field_matcher, {PARSE_INTEGER, NULL},
+     AGG_MINMAX, DISPLAY_MINMAX, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1},
+    {"fields.vector_params.current_capacity", exact_field_matcher, {PARSE_INTEGER, NULL},
      AGG_SUM, DISPLAY_INTEGER, DIFF_NONE, 0, FROM_PRIMARY_ONLY, 1}
 };
 
