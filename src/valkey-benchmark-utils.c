@@ -867,29 +867,78 @@ static void printDiffRow(clusterSnapshot *old, clusterSnapshot *new_snap,
     sdsfree(display_name);
 }
 
-int isMemoryDBCluster(int cluster_node_count, clusterNode **cluster_nodes,
-                                        enum valkeyConnectionType ct) {
+EngineType getEngineType(const char *ip_or_path, int port, enum valkeyConnectionType ct) {
     /* check info for : os:Amazon MemoryDB */
-    for (int i = 0; i < cluster_node_count; i++) {
-        clusterNode *node = cluster_nodes[i];
-        valkeyContext *ctx = node->ctx ? node->ctx : getValkeyContext(ct, node->ip, node->port);
-        if (!node || !ctx) continue;
-        // send command to node
-        valkeyReply *reply = valkeyCommand(node->ctx, "INFO");
-        if (!reply) {
-            printf("Error: No response from node %s while checking index status.\n", node->name);
-            continue;
-        }
-
-        if (strstr(reply->str, "os:Amazon MemoryDB") != NULL) {
-            freeReplyObject(reply);
-            return 1; /* It's a MemoryDB node */
-        }
-
-        freeReplyObject(reply);
+    valkeyContext *ctx = getValkeyContext(ct, ip_or_path, port);
+    if (!ctx) return ENGINE_TYPE_UNKNOWN; /* Error obtaining context */
+    // send command to node
+    valkeyReply *reply = valkeyCommand(ctx, "INFO");
+    if (!reply) {
+        printf("Error: No response from node %s while checking index status.\n", ip_or_path);
+        return ENGINE_TYPE_UNKNOWN;
     }
-    return 0;
+    // get the string value of line starts with os:
+    char *os_line = strstr(reply->str, "os:");
+    if (os_line) {
+        if (strstr(os_line, "Amazon MemoryDB") != NULL) {
+            freeReplyObject(reply);
+            return ENGINE_TYPE_MEMORYDB; /* It's a MemoryDB node */
+        } else if (strstr(os_line, "Amazon ElastiCache") != NULL) {
+            freeReplyObject(reply);
+            return ENGINE_TYPE_ELASTICACHE_VALKEY; /* It's a Redis node */
+        } else {
+            freeReplyObject(reply);
+            return ENGINE_TYPE_OSS_VALKEY; /* Unknown engine */
+        }
+    } 
+    printf("Error: 'os' field not found in INFO output on node %s.\n", ip_or_path);
+    freeReplyObject(reply);
+    valkeyFree(ctx);
+    return ENGINE_TYPE_UNKNOWN; /* 'os' field not found */
 }
+
+/* Check if the server is running in Cluster Mode Enabled (CME) 
+ * Returns: 1 if cluster_enabled:1, 0 if cluster_enabled:0, -1 on error
+ */
+int isClusterModeEnabled(valkeyContext *ctx) {
+    if (!ctx) return -1;
+    
+    valkeyReply *reply = valkeyCommand(ctx, "INFO CLUSTER");
+    if (!reply) {
+        fprintf(stderr, "Error: No response from server while checking cluster mode.\n");
+        return -1;
+    }
+    
+    int cluster_enabled = -1;
+    
+    if (reply->type == VALKEY_REPLY_STRING || reply->type == VALKEY_REPLY_STATUS) {
+        /* Look for cluster_enabled field in INFO output */
+        char *cluster_line = strstr(reply->str, "cluster_enabled:");
+        if (cluster_line) {
+            /* Parse the value after cluster_enabled: */
+            cluster_line += strlen("cluster_enabled:");
+            cluster_enabled = atoi(cluster_line);
+        }
+    }
+    
+    freeReplyObject(reply);
+    
+    if (cluster_enabled == -1) {
+        /* If cluster_enabled field not found, try INFO SERVER */
+        reply = valkeyCommand(ctx, "INFO SERVER");
+        if (reply && (reply->type == VALKEY_REPLY_STRING || reply->type == VALKEY_REPLY_STATUS)) {
+            char *cluster_line = strstr(reply->str, "cluster_enabled:");
+            if (cluster_line) {
+                cluster_line += strlen("cluster_enabled:");
+                cluster_enabled = atoi(cluster_line);
+            }
+        }
+        if (reply) freeReplyObject(reply);
+    }
+    
+    return cluster_enabled;
+}
+
 /* 
 ec-search-zvi-memdb-no-tls-0001-001.ajfdds.0001.memorydb-devo.eu-west-1.amazonaws.com:6379> ft.info gist-960-1M-960-100
  1) index_name
@@ -1385,10 +1434,10 @@ void waitForIndexBackfillCompleteEC(int cluster_node_count, clusterNode **cluste
 }
 
 
-void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_nodes,
+void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count, clusterNode **cluster_nodes,
                                         enum valkeyConnectionType ct, const char *index_name) {
     if (!index_name) return;
-    if (isMemoryDBCluster(cluster_node_count, cluster_nodes, ct)) {
+    if (engine_type == ENGINE_TYPE_MEMORYDB) {
         // Handle MemoryDB specific logic
         waitForIndexBackfillCompleteMemoryDB(cluster_node_count, cluster_nodes, ct, index_name);
         return;

@@ -412,7 +412,8 @@ static struct config {
     searchIndex search;
     int print_search_results; /* Print FT.SEARCH results */
     int search_debug;
-    int is_memorydb; /* True if connected to MemoryDB */
+    EngineType engine_type; /* True if connected to MemoryDB */
+    int is_cluster_mode_enabled; /* 1 if cluster_enabled:1 (CME), 0 if cluster_enabled:0 (CMD), -1 if unknown */
     /* Vector generator configuration */
     uint64_t vgen_initial_capacity; /* Initial vector capacity */
     uint32_t vgen_num_centroids;    /* Number of centroids for clustering */
@@ -1429,7 +1430,7 @@ static int createSearchCmdTemplate(char **cmd) {
     sds score_field = sdscatprintf(sdsempty(), "__%s_score", config.search.vector_field);
     
     if (config.search.nocontent) {
-        if (!config.is_memorydb) {
+        if (config.engine_type != ENGINE_TYPE_MEMORYDB) {
             /* With NOCONTENT, we need RETURN to get the score field */
             len = valkeyFormatCommand(cmd, 
                 "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b", 
@@ -4249,6 +4250,7 @@ int main(int argc, char **argv) {
     char *data, *cmd, *tag;
     int len;
     memset(&config, 0, sizeof(config));
+    config.is_cluster_mode_enabled = -1; /* Unknown until detected */
     client c;
 
     /* Configure libvalkey to use jemalloc allocators.
@@ -4341,7 +4343,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Options --mptcp is only supported by TCP\n");
         assert(0);
     }
+    config.engine_type = getEngineType(config.conn_info.hostip, config.conn_info.hostport, config.ct);
 
+    /* Detect cluster mode (CME vs CMD) */
+    config.is_cluster_mode_enabled = isClusterModeEnabled(config.conn_ctx); /* Unknown by default */
     if (config.cluster_mode) {
         // We only include the slot placeholder {tag} if cluster mode is enabled
         tag = "{tag}";
@@ -4600,14 +4605,35 @@ int main(int argc, char **argv) {
             printf("✓ Dataset loaded: %lu vectors, %lu queries, %u dims, %u neighbors\n",
                 info.num_vectors, info.num_queries, info.dim, info.num_neighbors);
         }
-        config.is_memorydb = isMemoryDBCluster(config.cluster_node_count, config.cluster_nodes, config.ct);
-        printf("Using search indexes for the benchmark. %s\n", config.is_memorydb ? "MemoryDB" : "EC\\Valkey");
+
+
+        if (config.cluster_mode && config.cluster_primary_nodes && config.cluster_primary_node_count > 0) {
+            valkeyContext *ctx = config.cluster_primary_nodes[0]->ctx;
+            if (!ctx) {
+                ctx = getValkeyContext(config.ct, 
+                                      config.cluster_primary_nodes[0]->ip, 
+                                      config.cluster_primary_nodes[0]->port);
+            }
+        } 
+        
+        /* Print cluster mode information */
+        const char *cluster_mode_str = "Unknown";
+        if (config.is_cluster_mode_enabled == 1) {
+            cluster_mode_str = "CME (Cluster Mode Enabled)";
+        } else if (config.is_cluster_mode_enabled == 0) {
+            cluster_mode_str = "CMD (Cluster Mode Disabled)";
+        }
+        
+        printf("Using search indexes for the benchmark. %s - %s\n", 
+               config.engine_type == ENGINE_TYPE_MEMORYDB ? "MemoryDB" : config.engine_type == ENGINE_TYPE_ELASTICACHE_VALKEY ? "EC Valkey" : "OSS",
+               cluster_mode_str);
+        
         createDefaultSearchIndexes();
-        waitForIndexBackfillComplete(config.selected_node_count, config.selected_nodes, config.ct, config.search.name);
+        waitForIndexBackfillComplete(config.engine_type, config.selected_node_count, config.selected_nodes, config.ct, config.search.name);
         // wait for flat indexes
         sds flat_index = sdsnew(config.search.name);
         flat_index = sdscat(flat_index, "_flat");
-        waitForIndexBackfillComplete(config.selected_node_count, config.selected_nodes, config.ct, flat_index);
+        waitForIndexBackfillComplete(config.engine_type, config.selected_node_count, config.selected_nodes, config.ct, flat_index);
         sdsfree(flat_index);
         long long search_memory = 0;
         long long search_reclaimable = 0;

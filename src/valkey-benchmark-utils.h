@@ -5,6 +5,13 @@
 #include "sds.h"
 #include <valkey/valkey.h>
 
+/* Engine types */
+typedef enum {
+    ENGINE_TYPE_UNKNOWN = 0,
+    ENGINE_TYPE_OSS_VALKEY,      /* Open Source Valkey */
+    ENGINE_TYPE_ELASTICACHE_VALKEY,    /* ElastiCache Valkey */
+    ENGINE_TYPE_MEMORYDB     /* Amazon MemoryDB */
+} EngineType;
 /* Forward declarations */
 struct serverConfig;
 
@@ -125,8 +132,9 @@ void* compareInfoSnapshots(int cluster_node_count, clusterNode **cluster_nodes,
                                       clusterSnapshot *old_infoall, clusterSnapshot *new_snap_infoall, clusterSnapshot *old_ftinfo, clusterSnapshot *new_snap_ftinfo, clusterSnapshot *old_infosearch, clusterSnapshot *new_snap_infosearch);
 void freeClusterSnapshot(clusterSnapshot *snapshot);
 valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
-void waitForIndexBackfillComplete(int cluster_node_count, clusterNode **cluster_nodes,
+void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count, clusterNode **cluster_nodes,
                                         enum valkeyConnectionType ct, const char *index_name);
-int isMemoryDBCluster(int cluster_node_count, clusterNode **cluster_nodes,
-                                        enum valkeyConnectionType ct);
+EngineType getEngineType(const char *ip_or_path, int port, enum valkeyConnectionType ct);
+int isClusterModeEnabled(valkeyContext *ctx);
+
 #endif /* __VALKEY_BENCHMARK_UTILS_H */
