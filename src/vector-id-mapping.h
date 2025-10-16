@@ -25,6 +25,7 @@ typedef struct {
     vectorClusterMapping *mappings;
     uint64_t capacity;
     uint64_t count;
+    int is_cluster_mode_enabled;
     pthread_mutex_t mutex;
 } clusterTagMap;
 
@@ -50,7 +51,7 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
  * @return Cluster tag string or NULL if not found
  */
 const char* getClusterTagForVector(clusterTagMap *tag_map, uint64_t vector_id);
-
+int checkVectorExistsInCluster(clusterTagMap *tag_map, uint64_t vector_id);
 /**
  * Build vector ID mappings by scanning cluster for vector keys
  * @param prefix Vector key prefix to scan for
@@ -59,7 +60,7 @@ const char* getClusterTagForVector(clusterTagMap *tag_map, uint64_t vector_id);
  * @param tag_map Output mapping table
  * @return 0 on success, negative error code on failure
  */
-int buildVectorIdMappings(const char *prefix,
+int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
                          struct clusterNode **nodes,
                          int node_count,
                          clusterTagMap *tag_map,

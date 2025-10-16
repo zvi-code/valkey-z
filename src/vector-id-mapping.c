@@ -23,7 +23,7 @@ void initClusterTagMap(clusterTagMap *tag_map, uint64_t initial_capacity) {
 }
 
 void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char *cluster_tag) {
-    if (!tag_map || !cluster_tag) return;
+    if (!tag_map) return;
     /* Expand capacity if needed */
     assert(vector_id < tag_map->capacity);
 
@@ -34,7 +34,14 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
             fflush(stderr);
             assert(0);
         }
-        assert(cluster_tag[0] == '{');
+        if (tag_map->is_cluster_mode_enabled) {
+            assert(cluster_tag[0] == '{');
+        } else {
+            // set dummy {CMD} tag for non-cluster mode
+            memcpy(tag_map->mappings[vector_id].cluster_tag, "{CMD}", 5);
+            tag_map->mappings[vector_id].cluster_tag[5] = '\0';
+        }
+
         /* New entry */
         assert(tag_map->count <= tag_map->capacity);
         tag_map->count++;
@@ -43,10 +50,11 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
                    tag_map->count, tag_map->capacity);
         }
     }
-    
-    /* Add new mapping */
-    memcpy(tag_map->mappings[vector_id].cluster_tag, cluster_tag, 5);
-    tag_map->mappings[vector_id].cluster_tag[5] = '\0';
+    if (tag_map->is_cluster_mode_enabled) {
+        /* Add new mapping */
+        memcpy(tag_map->mappings[vector_id].cluster_tag, cluster_tag, 5);
+        tag_map->mappings[vector_id].cluster_tag[5] = '\0';
+    }
 
 }
 
@@ -90,9 +98,18 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
 const char* getClusterTagForVector(clusterTagMap *tag_map, uint64_t vector_id) {
     if (!tag_map) return NULL;
     if (vector_id >= tag_map->capacity) return NULL;
+    if (!tag_map->is_cluster_mode_enabled) return NULL;
     if (tag_map->mappings[vector_id].cluster_tag[0] == '\0') return NULL;
     assert(tag_map->mappings[vector_id].cluster_tag[0] == '{');
     return tag_map->mappings[vector_id].cluster_tag;
+}
+
+int checkVectorExistsInCluster(clusterTagMap *tag_map, uint64_t vector_id) {
+    if (!tag_map) return 0;
+    if (vector_id >= tag_map->capacity) return 0;
+    if (tag_map->mappings[vector_id].cluster_tag[0] == '\0') return 0;
+    assert(tag_map->mappings[vector_id].cluster_tag[0] == '{');
+    return 1;
 }
 
 void vectorMappingProgressCallback(uint64_t keys_processed, int active_threads, void *user_data) {
@@ -100,7 +117,7 @@ void vectorMappingProgressCallback(uint64_t keys_processed, int active_threads, 
            keys_processed, active_threads);
 }
 
-int buildVectorIdMappings(const char *prefix,
+int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
                          struct clusterNode **nodes,
                          int node_count,
                          clusterTagMap *tag_map,
@@ -114,6 +131,7 @@ int buildVectorIdMappings(const char *prefix,
     snprintf(pattern, sizeof(pattern), "%s*", prefix);
     tag_map->prefix = zstrdup(prefix);
     tag_map->prefix_len = strlen(prefix);
+    tag_map->is_cluster_mode_enabled = is_cluster_mode_enabled;
     /* Configure cluster scan */
     clusterScanConfig scan_config;
     initClusterScanConfig(&scan_config, pattern, nodes, node_count,

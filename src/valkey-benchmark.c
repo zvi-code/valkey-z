@@ -105,6 +105,9 @@ static long long nstime(void) {
 #define DATASET_KEY_PLACEHOLDER_INDEX 14
 #define DATASET_VECTOR_PLACEHOLDER_INDEX 15
 
+#define DATASET_TAG_PLACEHOLDER "___tag_field____"   // 16 bytes like vgen
+#define DATASET_TAG_PLACEHOLDER_INDEX 16
+
 #define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
 #define VECTOR_NUM_RAND_DIM (8/sizeof(float)) // Number of random dimensions for vector generation
 #define VECTOR_PLACEHOLDER_INDEX 11
@@ -139,6 +142,7 @@ static const struct {
     [VGEN_VECTOR_PLACEHOLDER_INDEX] = {VGEN_VECTOR_PLACEHOLDER, 16},
     [DATASET_KEY_PLACEHOLDER_INDEX] = {DATASET_KEY_PLACEHOLDER, 12},
     [DATASET_VECTOR_PLACEHOLDER_INDEX] = {DATASET_VECTOR_PLACEHOLDER, 16},
+    [DATASET_TAG_PLACEHOLDER_INDEX] = {DATASET_TAG_PLACEHOLDER, 16},
 };
 
 
@@ -615,6 +619,10 @@ static int decode_vector_key_fixed(const char *key,
             cluster_tag_out[cluster_tag_len] = '\0';
         }
         read_pos += cluster_tag_len;
+    } else if (cluster_tag_out && cluster_tag_size > 5) {
+        // set to dummy {CMD} tag for non-cluster mode
+        memcpy(cluster_tag_out, "{CMD}", 5);
+        cluster_tag_out[5] = '\0';
     }
    
     assert(!((read_pos - key) >= key_len));
@@ -627,6 +635,109 @@ static int decode_vector_key_fixed(const char *key,
     }
 
     return 0;
+}
+
+/**
+ * Adjust the payload length in a RESP bulk string header for a dummy field sink.
+ * 
+ * This function implements the "dummy field as byte sink" strategy for maintaining
+ * fixed buffer layouts when reducing payload sizes.
+ * 
+ * Strategy: When reducing a vector payload from template size (e.g., 1024→512 bytes),
+ * we use a dummy hash field to absorb the unused bytes:
+ * 
+ * Template:
+ *   HSET key vector_field $0001024\r\n[1024 bytes]\r\n __padding__ $0000000\r\n\r\n
+ * 
+ * After adjustment (512-byte vector):
+ *   HSET key vector_field $0000512\r\n[512 bytes]\r\n __padding__ $0000512\r\n[512 gap]\r\n
+ * 
+ * This keeps all fields at fixed offsets while allowing the server to properly
+ * parse the command. The dummy field value is never used - it just consumes the gap.
+ * 
+ * @param payload_start Pointer to the start of the payload data (after the \r\n following the length)
+ * @param header_len Length of the length field (number of digits after '$')
+ * @param payload_template_len Original/template payload length (total allocated space)
+ * @param new_payload_len New payload length (must be <= payload_template_len)
+ * 
+ * Requirements:
+ * - header_len must be large enough to represent new_payload_len with leading zeros
+ * - The buffer must have space for: $ + header_len + \r\n + payload_template_len + \r\n
+ * - new_payload_len must be <= payload_template_len
+ * - Caller must provide a dummy field immediately after this field to absorb unused bytes
+ */
+static void adjustPayloadLength(char* payload_start, int header_len, int payload_template_len, int new_payload_len) {
+    assert(new_payload_len <= payload_template_len);
+    assert(payload_start != NULL);
+    assert(header_len > 0);
+    
+    /* Calculate RESP header start by counting backwards from payload start
+     * Layout: $<header_len digits>\r\n<payload>
+     * So we go back: header_len + 3 bytes (for $ + \r\n) */
+    char *resp_start = payload_start - (header_len + 3);
+    
+    /* Verify we're at the RESP bulk string marker */
+    assert(*resp_start == '$');
+    
+    /* Verify the \r\n after the header is in place (should be just before payload_start) */
+    assert(resp_start[1 + header_len] == '\r');
+    assert(resp_start[1 + header_len + 1] == '\n');
+    
+    /* Calculate how many bytes we're no longer using */
+    int unused_bytes = payload_template_len - new_payload_len;
+    
+    /* Update the length field with leading zeros to maintain fixed width */
+    char length_str[32];
+    int written = snprintf(length_str, sizeof(length_str), "%0*d", header_len, new_payload_len);
+    assert(written == header_len); /* Ensure we didn't overflow the header length */
+    
+    /* Write the new length after the '$' */
+    memcpy(resp_start + 1, length_str, header_len);
+    
+    /* Place \r\n immediately after the new (reduced) payload */
+    char *new_terminator_pos = payload_start + new_payload_len;
+    new_terminator_pos[0] = '\r';
+    new_terminator_pos[1] = '\n';
+    
+    /* 
+     * Update the dummy field length to consume the gap.
+     * 
+     * The dummy field follows immediately after our terminator.
+     * Its RESP header is at: new_terminator_pos + 2
+     * 
+     * We need to update its length from 0 to unused_bytes - 2 (the 2 bytes are our \r\n).
+     * 
+     * Dummy field layout:
+     *   <our \r\n> __padding__ $<header_len digits>\r\n<gap bytes>\r\n
+     */
+    if (unused_bytes > 2) {
+        /* Find the dummy field's RESP header
+         * Skip: \r\n (2) + field name + space + '$' to get to length digits */
+        char *search_pos = new_terminator_pos + 2;
+        
+        /* Look for the '$' that starts the dummy field's bulk string */
+        while (*search_pos != '$' && search_pos < payload_start + payload_template_len) {
+            search_pos++;
+        }
+        
+        if (*search_pos == '$') {
+            char *dummy_resp_start = search_pos;
+            
+            /* Update the dummy field's length to consume unused bytes minus our \r\n */
+            int dummy_payload_len = unused_bytes - 2;
+            char dummy_length_str[32];
+            int dummy_written = snprintf(dummy_length_str, sizeof(dummy_length_str), 
+                                        "%0*d", header_len, dummy_payload_len);
+            assert(dummy_written == header_len);
+            
+            /* Write the dummy field length */
+            memcpy(dummy_resp_start + 1, dummy_length_str, header_len);
+            
+            /* The dummy field's payload (gap bytes) already exists in the buffer.
+             * The server will read dummy_payload_len bytes and discard them.
+             * No need to modify the gap - it can contain any data. */
+        }
+    }
 }
 
 
@@ -807,7 +918,7 @@ static int vectorKeyProcessor(const char *key, void *user_data, int thread_id) {
     uint64_t vector_id;
     int prefix_len = strlen(config.search.prefix);
     char prefix[256];
-    cluster_tag[5] = '\0';
+    cluster_tag[6] = '\0';
     if (decode_vector_key_fixed(key,
                                prefix, sizeof(prefix),
                                cluster_tag, sizeof(cluster_tag) ,
@@ -949,8 +1060,8 @@ static void debugPrintReplyStructure(valkeyReply *reply, int depth, int max_dept
 /* Print FT.SEARCH results in a user-friendly format */
 static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
     if (!reply || reply->type != VALKEY_REPLY_ARRAY) {
-        fprintf(stderr, "ERROR: Invalid search result format - reply is %s\n",
-                !reply ? "NULL" : "not an ARRAY");
+        fprintf(stderr, "ERROR: Invalid search result format - reply is %s, type is %d\n",
+                !reply ? "NULL" : "not an ARRAY", reply ? reply->type : -1);
         if (reply) {
             fprintf(stderr, "Reply structure:\n");
             debugPrintReplyStructure(reply, 0, 3);
@@ -1329,7 +1440,6 @@ static sds getVectorKey(void) {
 }
 
 
-
 /* Benchmark function for vector operations with cluster awareness */
 static int createVectorInsertCmdTemplate(char **cmd) {
     int len;   
@@ -1433,7 +1543,7 @@ static int createSearchCmdTemplate(char **cmd) {
         if (config.engine_type != ENGINE_TYPE_MEMORYDB) {
             /* With NOCONTENT, we need RETURN to get the score field */
             len = valkeyFormatCommand(cmd, 
-                "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b", 
+                "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b LOCALONLY", 
                 index_name, sdslen(index_name), 
                 query, sdslen(query),
                 vector_binary, sdslen(vector_binary));
@@ -1847,17 +1957,19 @@ static void replacePlaceholderDataset(
     const size_t vec_count, const size_t *vec_indices,
     _Atomic uint64_t *vector_counter,
     const size_t cluster_tag_count, const size_t *cluster_tag_indices,
+    const size_t tag_count, const size_t *tag_indices,
+    _Atomic uint64_t *tag_counter,
     char *cmd)
 {
-    uint64_t dataset_prefill_counter = atomic_load_explicit(&config.dataset_prefill_counter, memory_order_relaxed);
+    uint64_t dataset_prefill_counter = atomic_load(&config.dataset_prefill_counter);
     // if dataset_prefill_counter >= keyspacelen, then dataset is prefilled
     int dataset_prefilled = dataset_prefill_counter >= config.keyspacelen;
     /* Validate placeholder consistency */
     assert((key_count == vec_count) || (vec_count == 0) || (key_count == 0));
-    if (config.cluster_mode) {
-        // dataset is prefilled
-        dataset_prefilled = getClusterTagMapCount(&cluster_tag_map) >= config.keyspacelen;
-    }
+    // if (config.cluster_mode) {
+    // dataset is prefilled
+    dataset_prefilled = getClusterTagMapCount(&cluster_tag_map) >= config.dataset_num_vectors;
+    // }
     /* INSERT/PREFILL: both key and vector replacement */
     if (key_count > 0 && vec_count > 0) {
         for (size_t i = 0; i < key_count; i++) {
@@ -1869,21 +1981,26 @@ static void replacePlaceholderDataset(
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
             const char* cluster_tag = NULL;
             uint64_t dataset_idx = 0;
-            /* Determine dataset index to use */
-            while (!dataset_prefilled && (!config.cluster_mode || getClusterTagForVector(&cluster_tag_map, dataset_idx))) {
-                dataset_idx = atomic_fetch_add(&config.dataset_prefill_counter, 1);
-                if (config.cluster_mode) {
-                    dataset_prefilled = (getClusterTagMapCount(&cluster_tag_map) >= config.keyspacelen);
-                } else {
-                    dataset_prefilled = dataset_idx >= config.keyspacelen - 1;
-                }
-                if (!dataset_prefilled && dataset_idx >= config.keyspacelen) {
-                    printf("Dataset exhausted while trying to avoid duplicate cluster tags. Re-setting prefill.\n");
-                    atomic_store(&config.dataset_prefill_counter, 0);
-                    dataset_idx = atomic_fetch_add(&config.dataset_prefill_counter, 1);
-                }
-            } 
-            
+            if (!dataset_prefilled) {
+                // dataset_idx = atomic_load_explicit(&config.dataset_prefill_counter, memory_order_relaxed);
+                // dataset_idx %= config.dataset_num_vectors; 
+                /* Determine dataset index to use */
+                do {
+                    dataset_idx = atomic_fetch_add_explicit(&config.dataset_prefill_counter, 1, memory_order_relaxed);
+                    dataset_idx %= config.dataset_num_vectors; 
+                    // if (config.cluster_mode) {
+                    //     dataset_prefilled = (getClusterTagMapCount(&cluster_tag_map) >= config.keyspacelen);
+                    // } else {
+                    //     dataset_prefilled = dataset_idx >= config.keyspacelen - 1;
+                    // }
+                    dataset_prefilled = (getClusterTagMapCount(&cluster_tag_map) >= config.dataset_num_vectors);
+                    if (!dataset_prefilled && dataset_idx >= config.dataset_num_vectors) {
+                        printf("Dataset exhausted while trying to avoid duplicate cluster tags (config.dataset_prefill_counter: %lu). Re-setting prefill.\n", 
+                            atomic_load_explicit(&config.dataset_prefill_counter, memory_order_relaxed));
+                        assert(config.dataset_prefill_counter < 2 * config.dataset_num_vectors);
+                    }
+                } while (!dataset_prefilled && getClusterTagForVector(&cluster_tag_map, dataset_idx)); // ensure unique cluster tag mapping
+            }
             if (dataset_prefilled) {
                 /* Random access after prefill */
                 if (config.sequential_replacement) {
@@ -1891,7 +2008,7 @@ static void replacePlaceholderDataset(
                 } else {
                     dataset_idx = random();
                 }
-                dataset_idx %= config.keyspacelen;  
+                dataset_idx %= config.dataset_num_vectors;
                 if (config.cluster_mode) {
                     cluster_tag = getClusterTagForVector(&cluster_tag_map, dataset_idx);
                     if (!cluster_tag) {
@@ -1910,15 +2027,18 @@ static void replacePlaceholderDataset(
                                    // TODO need to handle case of cluster node mismatch
                                    vector_id);
             /* Update cluster tag mapping for new insertions (complements initial cluster scan) */
-            if (config.cluster_mode && !dataset_prefilled && cluster_tag_count > 0 && cluster_tag_indices && i < cluster_tag_count) {
-                char *cluster_tag_pos = cmd + cluster_tag_indices[i];
-                char cluster_tag[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1];  
-
-                /* Extract cluster tag using reusable function */
-                int tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
-                memcpy(cluster_tag, cluster_tag_pos, tag_len);
-                cluster_tag[tag_len] = '\0'; /* Null-terminate */
-                addClusterTagMapping(&cluster_tag_map, vector_id, cluster_tag);
+            if (!dataset_prefilled) {
+                char cluster_tag_buf[PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len + 1];
+                const char *cluster_tag_to_map = NULL;                
+                if (config.cluster_mode) {                    
+                    char *cluster_tag_pos = cmd + cluster_tag_indices[i];
+                    /* Extract cluster tag using reusable function */
+                    int tag_len = PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len;
+                    memcpy(cluster_tag_buf, cluster_tag_pos, tag_len);
+                    cluster_tag_buf[tag_len] = '\0'; /* Null-terminate */
+                    cluster_tag_to_map = cluster_tag_buf;
+                } 
+                addClusterTagMapping(&cluster_tag_map, vector_id, cluster_tag_to_map);
             }
 
             static int debug_count = 0;
@@ -1929,13 +2049,14 @@ static void replacePlaceholderDataset(
             }
         }
     }
-    static __thread uint64_t next_query_idx = 0;
-    if (next_query_idx == 0) {
-        next_query_idx = thread_id + (1 << 10) - 1;
-        next_query_idx *= 2654435761;
-    }
+
     /* SEARCH: only vector replacement */
     if (vec_count > 0 && key_count == 0) {
+        static __thread uint64_t next_query_idx = 0;
+        if (next_query_idx == 0) {
+            next_query_idx = thread_id + (1 << 10) - 1;
+            next_query_idx *= 2654435761;
+        }
         for (size_t i = 0; i < vec_count; i++) {
             float *vec_write_pos = (float *)(cmd + vec_indices[i]);
             uint64_t query_idx = next_query_idx % c->dataset_query_capacity;
@@ -1970,15 +2091,18 @@ static void replacePlaceholderDataset(
                     vector_id = random();
                 }
                 vector_id %= config.keyspacelen;  
-                if (config.cluster_mode) {
-                    cluster_tag = getClusterTagForVector(&cluster_tag_map, vector_id);
-                    if (cluster_tag == NULL && getClusterTagMapCount(&cluster_tag_map) == 0) {
-                        // if we have some tags, but not for this vector, we need to retry
-                        break;
-                    }
+                // if (config.cluster_mode) {
+                cluster_tag = getClusterTagForVector(&cluster_tag_map, vector_id);
+                if (cluster_tag == NULL && getClusterTagMapCount(&cluster_tag_map) > 0) {
+                    // if we have some tags, but not for this vector, we need to retry
+                    continue;
+                } else if (getClusterTagMapCount(&cluster_tag_map) == 0) {
+                    // if we have some tags, but not for this vector, we need to retry
+                    break;
                 }
-            } while (!config.cluster_mode && !cluster_tag);
-            if (config.cluster_mode && !cluster_tag) {
+                // }
+            } while (!cluster_tag);
+            if (!cluster_tag) {
                 printf("No cluster tag found for vector ID %lu during DELETE\n", vector_id);
                 assert(0);
             }
@@ -2045,7 +2169,7 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
                 placeholders.indices[DATASET_VECTOR_PLACEHOLDER_INDEX],
                 &seq_key[DATASET_VECTOR_PLACEHOLDER_INDEX],
                 placeholders.count[CLUSTER_PLACEHOLDER_INDEX],
-                placeholders.indices[CLUSTER_PLACEHOLDER_INDEX],
+                placeholders.indices[CLUSTER_PLACEHOLDER_INDEX],                
                 cmd
             );
         }
@@ -2266,7 +2390,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                         assert(0);
                     }
                 }
-                if (c->prefix_pending <= 0) {
+                if (c->prefix_pending <= 0 && c->dataset_query_head != c->dataset_query_tail) {
                     uint64_t query_idx = c->dataset_query_indices[
                         (c->dataset_query_head++) % c->dataset_query_capacity
                     ];
@@ -4344,9 +4468,10 @@ int main(int argc, char **argv) {
         assert(0);
     }
     config.engine_type = getEngineType(config.conn_info.hostip, config.conn_info.hostport, config.ct);
-
+    valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
     /* Detect cluster mode (CME vs CMD) */
-    config.is_cluster_mode_enabled = isClusterModeEnabled(config.conn_ctx); /* Unknown by default */
+    config.is_cluster_mode_enabled = isClusterModeEnabled(ctx); /* Unknown by default */
+    valkeyFree(ctx);
     if (config.cluster_mode) {
         // We only include the slot placeholder {tag} if cluster mode is enabled
         tag = "{tag}";
@@ -4671,18 +4796,17 @@ int main(int argc, char **argv) {
         if (config.use_dataset) {
             /* Build vector ID mappings by scanning cluster for pre-existing vectors */
             /* Note: New vectors inserted during benchmark will update the mapping in real-time */
-            if (config.cluster_mode) {
-                printf("Building vector ID to cluster tag mappings from existing cluster data...\n");
-                int scan_result = buildVectorIdMappings(config.search.prefix,
-                                                    config.cluster_nodes,
-                                                    config.cluster_node_count,
-                                                    &cluster_tag_map, vectorKeyProcessor);
-                if (scan_result != 0) {
-                    fprintf(stderr, "WARNING: Failed to build vector ID mappings, validation may be limited\n");
-                } else {
-                    printf("Initial mapping built. New insertions will update mapping in real-time.\n");
-                }
-            }
+            printf("Building vector ID to cluster tag mappings from existing cluster data...\n");
+            int scan_result = buildVectorIdMappings(config.is_cluster_mode_enabled,
+                                                config.search.prefix,
+                                                config.cluster_nodes,
+                                                config.cluster_node_count,
+                                                &cluster_tag_map, vectorKeyProcessor);
+            if (scan_result != 0) {
+                fprintf(stderr, "WARNING: Failed to build vector ID mappings, validation may be limited\n");
+            } else {
+                printf("Initial mapping built. New insertions will update mapping in real-time.\n");
+            }        
         }
     }
     
@@ -4764,13 +4888,11 @@ int main(int argc, char **argv) {
                 /* Set the ground truth dataset size before ingestion */
                 if (config.is_vector_generator) {
                     vgen_set_ground_truth_size(config.requests);
-                } else if (config.use_dataset && config.cluster_mode) {
+                } else if (config.use_dataset/* && config.cluster_mode*/) {
                     config.requests = config.dataset_num_vectors - getClusterTagMapCount(&cluster_tag_map);
-                } 
-                if (config.use_dataset) {
-                    // For dataset mode, the ground truth size is the number of vectors in the dataset
                     config.keyspacelen = (int)config.dataset_num_vectors;
-                }
+                } 
+
                 /* Ingest ground truth vectors from reserved range */
                 len = createVectorInsertCmdTemplate(&cmd);
                 benchmark("VEC-GROUND-TRUTH", cmd, len);
