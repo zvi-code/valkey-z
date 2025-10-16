@@ -528,7 +528,7 @@ static int shouldSkipZeroRow(fieldSnapshot *field, infoFieldType *field_type,
 static int shouldSkipZeroDeltaRow(fieldSnapshot *old_field, fieldSnapshot *new_field,
                                   infoFieldType *field_type, int num_nodes, 
                                   int is_debug, int is_memory_diff) {
-    if (is_debug || !old_field->valid || !new_field->valid) return 0;
+    if (!old_field->valid || new_field->valid) return 1;
     
     long long delta = new_field->value - old_field->value;
     
@@ -2204,15 +2204,15 @@ void getFullInfo(const char *index_name,
     snprintf(cmd, sizeof(cmd), "FT.INFO %s", index_name);
     int ftinfo_num_fields = sizeof(ftinfo_fields) / sizeof(ftinfo_fields[0]);
     clusterSnapshot* ftinfo_snapshot = createClusterSnapshot(cmd, ftinfo_num_fields, ftinfo_fields, 
-                                                              cluster_node_count, cluster_nodes, ct, 1);
+                                                              cluster_node_count, cluster_nodes, ct, 0);
 
     int search_num_fields = sizeof(search_info_fields) / sizeof(search_info_fields[0]);
     clusterSnapshot* search_info_snapshot = createClusterSnapshot("INFO SEARCH", search_num_fields, search_info_fields, 
-                                                                   cluster_node_count, cluster_nodes, ct, 1);
+                                                                   cluster_node_count, cluster_nodes, ct, 0);
 
     int info_num_fields = sizeof(info_fields) / sizeof(info_fields[0]);
     clusterSnapshot* info_snapshot = createClusterSnapshot("INFO ALL", info_num_fields, info_fields, 
-                                                            cluster_node_count, cluster_nodes, ct, 1);
+                                                            cluster_node_count, cluster_nodes, ct, 0);
 
     freeClusterSnapshot(ftinfo_snapshot);
     freeClusterSnapshot(search_info_snapshot);

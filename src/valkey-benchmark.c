@@ -264,6 +264,7 @@ typedef struct searchIndex {
     sds algorithm;          /* Index algorithm type (e.g., HNSW, FLAT) */
     sds prefix;             /* Index key prefix */
     int nocontent;           /* Use NOCONTENT option for FT.SEARCH */
+    int localonly;          /* Use LOCAL option for FT.SEARCH */
     sds vector_field;       /* Vector field name */
     int vector_dim;         /* Vector dimension */    
     sds tag_field;          /* Tag field name if exists*/
@@ -1139,11 +1140,28 @@ static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
     if (config.search.nocontent) {
         total_results = reply->elements - 1; // Each element is a key
     }
-    uint64_t result_vec_ids[total_results];
-    uint64_t gt_vec_ids[total_results];
+    
+    /* Debug: Check if we're getting the expected number of results */
+    if (config.search_debug) {
+        printf_results("DEBUG: config.search.k=%d, reply->elements=%zu, calculated total_results=%zu, nocontent=%d\n",
+                      config.search.k, reply->elements, total_results, config.search.nocontent);
+    }
+    
+    /* Use config.search.k as the expected size, but cap at actual results */
+    size_t expected_results = (size_t)config.search.k;
+    if (total_results < expected_results) {
+        if (config.search_debug) {
+            printf_results("WARNING: Expected k=%d results but reply contains only %zu results\n",
+                          config.search.k, total_results);
+        }
+        expected_results = total_results;
+    }
+    
+    uint64_t result_vec_ids[expected_results];
+    uint64_t gt_vec_ids[expected_results];
     // size_t max_display = total_results > 100 ? 100 : total_results;
     // if (total_results > 100) {
-    printf_results("  (Showing first 100 of %zu results)\n", total_results);
+    printf_results("  (Showing first 100 of %zu results, expecting k=%d)\n", total_results, config.search.k);
     // }
     // size_t end_index = total_results * 2;
     
@@ -1251,9 +1269,9 @@ static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
     }
     
     /* Verify we got the expected number of results */
-    if (num_vecs_ids != config.search.k) {
-        fprintf(stderr, "WARNING: Expected %d results, but parsed %zu\n", 
-                config.search.k, num_vecs_ids);
+    if (num_vecs_ids != (size_t)config.search.k && num_vecs_ids != total_results) {
+        fprintf(stderr, "WARNING: Expected k=%d results, parsed %zu vectors, total_results=%zu\n", 
+                config.search.k, num_vecs_ids, total_results);
     }
     qsort(result_vec_ids, num_vecs_ids, sizeof(uint64_t), uint64_cmp);
     qsort(gt_vec_ids, num_vecs_ids, sizeof(uint64_t), uint64_cmp);
@@ -1576,35 +1594,45 @@ static int createSearchCmdTemplate(char **cmd) {
     /* Build FT.SEARCH command 
      * Scores are automatically included in results as __<vector_field>_score field 
      * Results are returned ordered by distance (closest first) by default */
-    sds score_field = sdscatprintf(sdsempty(), "__%s_score", config.search.vector_field);
-    
+    sds to_return;
     if (config.search.nocontent) {
-        if (config.engine_type != ENGINE_TYPE_MEMORYDB) {
-            /* With NOCONTENT, we need RETURN to get the score field */
-            len = valkeyFormatCommand(cmd, 
-                "FT.SEARCH %b %b NOCONTENT PARAMS 2 query_vector %b LOCALONLY", 
-                index_name, sdslen(index_name), 
-                query, sdslen(query),
-                vector_binary, sdslen(vector_binary));
-        } else {
-            len = valkeyFormatCommand(cmd,
-                "FT.SEARCH %b %b PARAMS 2 query_vector %b RETURN 1 %s",
-                index_name, sdslen(index_name),
-                query, sdslen(query),
-                vector_binary, sdslen(vector_binary),
-                score_field);
-        }
+        to_return = sdscatprintf(sdsempty(), " RETURN 1 __%s_score", config.search.vector_field);
     } else {
-        /* Without NOCONTENT, all fields including score are returned by default */
-        len = valkeyFormatCommand(cmd,
-            "FT.SEARCH %b %b RETURN 1 %s PARAMS 2 query_vector %b",
-            index_name, sdslen(index_name),
-            query, sdslen(query),
-            score_field,
-            vector_binary, sdslen(vector_binary));
+        to_return = sdscatprintf(sdsempty(), " RETURN 2 __%s_score %s", config.search.vector_field, config.search.vector_field);
     }
+    /* Important: FT.SEARCH has a default LIMIT of 10, so we must specify LIMIT explicitly
+     * to get k results. The LIMIT clause comes before PARAMS. */
+    // if (config.search.nocontent) {
+    //     if (config.engine_type != ENGINE_TYPE_MEMORYDB) {
+    //         /* With NOCONTENT, we need RETURN to get the score field */
+    //         len = valkeyFormatCommand(cmd, 
+    //             "FT.SEARCH %b %b LIMIT 0 %d NOCONTENT PARAMS 2 query_vector %b %s RETURN 1 %s", 
+    //             index_name, sdslen(index_name), 
+    //             query, sdslen(query),
+    //             config.search.k,  /* Specify k as the limit */
+    //             vector_binary, sdslen(vector_binary), config.search.localonly ? "LOCALONLY" : "", score_field);
+    //     } else {
+    //         len = valkeyFormatCommand(cmd,
+    //             "FT.SEARCH %b %b LIMIT 0 %d PARAMS 2 query_vector %b RETURN 1 %s",
+    //             index_name, sdslen(index_name),
+    //             query, sdslen(query),
+    //             config.search.k,  /* Specify k as the limit */
+    //             vector_binary, sdslen(vector_binary),
+    //             score_field);
+    //     }
+    // } else {
+    /* Without NOCONTENT, all fields including score are returned by default */
+    len = valkeyFormatCommand(cmd,
+        "FT.SEARCH %b %b LIMIT 0 %d%s%s PARAMS 2 query_vector %b",
+        index_name, sdslen(index_name),
+        query, sdslen(query),
+        config.search.k,  /* Specify k as the limit */
+        config.search.localonly ? " LOCALONLY" : "",
+        to_return,
+        vector_binary, sdslen(vector_binary));
+    // }
     
-    sdsfree(score_field);
+    sdsfree(to_return);
     
     sdsfree(query);
     sdsfree(vector_binary);
@@ -3802,6 +3830,7 @@ void setDefaultSearchConfig(void) {
     config.search.metric = sdsnew("L2");
     config.search.algorithm = sdsnew("hnsw"); // Default algorithm
     config.search.nocontent = 0; // exclude content by default
+    config.search.localonly = 0; // Default LOCALONLY option
 }
 /* Returns number of consumed options. */
 int parseOptions(int argc, char **argv) {
@@ -3953,6 +3982,8 @@ int parseOptions(int argc, char **argv) {
             config.use_search = 1;
         } else if (!strcmp(argv[i], "--nocontent")) {
             config.search.nocontent = 1;
+        } else if (!strcmp(argv[i], "--localonly")) {
+            config.search.localonly = 1;
         } else if (!strcmp(argv[i], "--use_vgen")) {
             config.is_vector_generator = 1;
         } else if (!strcmp(argv[i], "--vgen-capacity")) {
