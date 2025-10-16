@@ -9,6 +9,7 @@
 #include "vector-id-mapping.h"
 #include "cluster-scan.h"
 #include "zmalloc.h"
+#include "progress-bar.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,7 @@ void initClusterTagMap(clusterTagMap *tag_map, uint64_t initial_capacity) {
     memset(tag_map, 0, sizeof(clusterTagMap));
     tag_map->capacity = initial_capacity;
     tag_map->mappings = zcalloc(tag_map->capacity * sizeof(vectorClusterMapping));
+    tag_map->progress_bar = NULL;
     pthread_mutex_init(&tag_map->mutex, NULL);
 }
 
@@ -45,9 +47,10 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
         /* New entry */
         assert(tag_map->count <= tag_map->capacity);
         tag_map->count++;
-        if (tag_map->count % 10000 == 0) {
-            printf("[VECTOR-MAPPING] Added %lu mappings, current capacity %lu\n",
-                   tag_map->count, tag_map->capacity);
+        
+        /* Update progress bar if available */
+        if (tag_map->progress_bar) {
+            updateProgressBar(tag_map->progress_bar, tag_map->count);
         }
     }
     if (tag_map->is_cluster_mode_enabled) {
@@ -113,8 +116,10 @@ int checkVectorExistsInCluster(clusterTagMap *tag_map, uint64_t vector_id) {
 }
 
 void vectorMappingProgressCallback(uint64_t keys_processed, int active_threads, void *user_data) {
-    printf("[VECTOR-MAPPING] Processed %lu keys, %d threads active\n",
-           keys_processed, active_threads);
+    /* Progress is now handled by the progress bar in addClusterTagMapping */
+    (void)keys_processed;
+    (void)active_threads;
+    (void)user_data;
 }
 
 int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
@@ -132,6 +137,12 @@ int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
     tag_map->prefix = zstrdup(prefix);
     tag_map->prefix_len = strlen(prefix);
     tag_map->is_cluster_mode_enabled = is_cluster_mode_enabled;
+    
+    /* Initialize progress bar */
+    progressBar progress;
+    tag_map->progress_bar = &progress;
+    initProgressBar(&progress, tag_map->capacity, "Building vector ID mappings");
+    
     /* Configure cluster scan */
     clusterScanConfig scan_config;
     initClusterScanConfig(&scan_config, pattern, nodes, node_count,
@@ -143,9 +154,12 @@ int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
 
     /* Execute the scan */
     clusterScanResults results;
-    printf("[VECTOR-MAPPING] Starting cluster scan for pattern '%s'\n", pattern);
 
     int scan_result = executeClusterScan(&scan_config, &results);
+    
+    /* Finish progress bar */
+    finishProgressBar(&progress);
+    tag_map->progress_bar = NULL;
 
     if (scan_result == 0) {
         printf("[VECTOR-MAPPING] Successfully built %lu vector ID mappings\n", tag_map->count);

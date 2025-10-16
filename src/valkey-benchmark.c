@@ -1590,15 +1590,19 @@ static int createSearchCmdTemplate(char **cmd) {
                 config.search.vector_field);
         }
     }
-    
+    printf("ZZZZZ\nBUILDING QUERY: %s\n", query);
+    fflush(stdout);
     /* Build FT.SEARCH command 
      * Scores are automatically included in results as __<vector_field>_score field 
      * Results are returned ordered by distance (closest first) by default */
     sds to_return;
+    sds to_return2;
     if (config.search.nocontent) {
         to_return = sdscatprintf(sdsempty(), " RETURN 1 __%s_score", config.search.vector_field);
+        to_return2 = sdscatprintf(sdsempty(), " RETURN 2 __%s_score %s", config.search.vector_field, config.search.vector_field);
     } else {
         to_return = sdscatprintf(sdsempty(), " RETURN 2 __%s_score %s", config.search.vector_field, config.search.vector_field);
+        to_return2 = sdscatprintf(sdsempty(), " RETURN 1 __%s_score", config.search.vector_field);
     }
     /* Important: FT.SEARCH has a default LIMIT of 10, so we must specify LIMIT explicitly
      * to get k results. The LIMIT clause comes before PARAMS. */
@@ -1623,17 +1627,46 @@ static int createSearchCmdTemplate(char **cmd) {
     // } else {
     /* Without NOCONTENT, all fields including score are returned by default */
     len = valkeyFormatCommand(cmd,
-        "FT.SEARCH %b %b LIMIT 0 %d%s%s PARAMS 2 query_vector %b",
+        "FT.SEARCH %b %b%s%s LIMIT 0 %d PARAMS 2 query_vector %b",
         index_name, sdslen(index_name),
         query, sdslen(query),
-        config.search.k,  /* Specify k as the limit */
-        config.search.localonly ? " LOCALONLY" : "",
+        config.search.localonly ? " LOCALONLY" : "",        
         to_return,
+        config.search.k,  /* Specify k as the limit */
         vector_binary, sdslen(vector_binary));
+    static int first_time = 1;
+    if (first_time) {
+        printf("Debug: FT.SEARCH command length %d too_return:%s\n", len, to_return);
+        printf("Debug: FT.SEARCH command template to_return:\n%s\n", *cmd);
+        fflush(stdout);
+        first_time = 0;
+    }        
+    len = valkeyFormatCommand(cmd,
+        "FT.SEARCH %b %b%s%s LIMIT 0 %d PARAMS 2 query_vector %b",
+        index_name, sdslen(index_name),
+        query, sdslen(query),
+        config.search.localonly ? " LOCALONLY" : "",        
+        to_return2,
+        config.search.k,  /* Specify k as the limit */
+        vector_binary, sdslen(vector_binary));        
     // }
-    
+    // len = valkeyFormatCommand(cmd,
+    //     "FT.SEARCH %b %b%s LIMIT 0 %d PARAMS 2 query_vector %b",
+    //     index_name, sdslen(index_name),
+    //     query, sdslen(query),
+    //     config.search.localonly ? " LOCALONLY" : "",
+    //     to_return,
+    //     config.search.k,  /* Specify k as the limit */
+    //     vector_binary, sdslen(vector_binary));
+    static int first_time2 = 1;
+    if (first_time2) {
+        printf("Debug: FT.SEARCH command length %d to_return:%s\n", len, to_return2);
+        printf("Debug: FT.SEARCH command template to_return2:\n%s\n", *cmd);
+        fflush(stdout);
+        first_time2 = 0;
+    }
     sdsfree(to_return);
-    
+    sdsfree(to_return2);
     sdsfree(query);
     sdsfree(vector_binary);
     sdsfree(index_name);
@@ -5022,6 +5055,9 @@ int main(int argc, char **argv) {
                 }
                 /* Use custom vector benchmark function */
                 len = createSearchCmdTemplate(&cmd);
+                printf("running vec-query with keyspacelen=%d\n", config.keyspacelen);
+                fflush(stdout);
+                printf("query cmd template: %s\n", cmd);
                 benchmark("VEC-QUERY", cmd, len);
                 zfree(cmd);
                 config.keyspacelen = keyspacelen_before; /* restore original keyspacelen */

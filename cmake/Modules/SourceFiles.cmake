@@ -160,6 +160,7 @@ set(VALKEY_BENCHMARK_SRCS
     ${CMAKE_SOURCE_DIR}/src/dataset_api.c
     ${CMAKE_SOURCE_DIR}/src/cluster-scan.c
     ${CMAKE_SOURCE_DIR}/src/vector-id-mapping.c
+    ${CMAKE_SOURCE_DIR}/src/progress-bar.c
     ${CMAKE_SOURCE_DIR}/utils/vgenerator/vector_generator.c
     ${CMAKE_SOURCE_DIR}/src/adlist.c
     ${CMAKE_SOURCE_DIR}/src/dict.c

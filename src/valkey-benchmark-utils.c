@@ -507,7 +507,7 @@ static const char *BOX_HORIZONTAL_THIN = "─";
 
 static int shouldSkipZeroRow(fieldSnapshot *field, infoFieldType *field_type, 
                              int num_nodes, int is_debug) {
-    if (is_debug || !field->valid) return 0;
+    if (!is_debug && !field->valid) return 1;
     
     /* Check aggregate value */
     int all_zero = (field->value == 0);
@@ -528,7 +528,7 @@ static int shouldSkipZeroRow(fieldSnapshot *field, infoFieldType *field_type,
 static int shouldSkipZeroDeltaRow(fieldSnapshot *old_field, fieldSnapshot *new_field,
                                   infoFieldType *field_type, int num_nodes, 
                                   int is_debug, int is_memory_diff) {
-    if (!old_field->valid || new_field->valid) return 1;
+    if (!is_debug && (!old_field->valid || !new_field->valid)) return 1;
     
     long long delta = new_field->value - old_field->value;
     

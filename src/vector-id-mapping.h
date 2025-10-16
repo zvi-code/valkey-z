@@ -4,6 +4,9 @@
 #include "cluster-scan.h"
 #include <stdint.h>
 
+/* Forward declaration to avoid circular dependency */
+struct progressBar;
+
 /**
  * Vector ID to Cluster Tag Mapping Module
  *
@@ -27,6 +30,7 @@ typedef struct {
     uint64_t count;
     int is_cluster_mode_enabled;
     pthread_mutex_t mutex;
+    struct progressBar *progress_bar;  /* Progress bar for visual feedback */
 } clusterTagMap;
 
 /**
