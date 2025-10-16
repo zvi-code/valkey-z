@@ -116,7 +116,7 @@ static long long nstime(void) {
 #define CLUSTER_PLACEHOLDER_INDEX 10
 
 
-#define PLACEHOLDER_NUM_OF 16
+#define PLACEHOLDER_NUM_OF 17
 #define PLACEHOLDER_NORMAL_NUM_OF 10  // Number of normal placeholders excluding vector and cluster placeholders
 
 
@@ -267,6 +267,7 @@ typedef struct searchIndex {
     sds vector_field;       /* Vector field name */
     int vector_dim;         /* Vector dimension */    
     sds tag_field;          /* Tag field name if exists*/
+    int payload_tag_len;    /* Maximum tag field payload size (for fixed-size templates) */
     sds numeric_field;      /* Numeric field name if exists */
     int ef_construction;    /* EF Construction for vector search */
     int m;                  /* HNSW M parameter */
@@ -638,38 +639,52 @@ static int decode_vector_key_fixed(const char *key,
 }
 
 /**
- * Adjust the payload length in a RESP bulk string header for a dummy field sink.
+ * Replace tag field with new tag value and adjust RESP lengths using dummy padding field.
  * 
- * This function implements the "dummy field as byte sink" strategy for maintaining
- * fixed buffer layouts when reducing payload sizes.
+ * This function implements the "dummy field as byte sink" strategy for tag fields,
+ * handling tag generation, data copy, and RESP protocol adjustments in one place.
  * 
- * Strategy: When reducing a vector payload from template size (e.g., 1024→512 bytes),
- * we use a dummy hash field to absorb the unused bytes:
+ * Strategy: When setting a tag smaller than the template size (e.g., "red" in 1024-byte slot),
+ * we dynamically CREATE a __padding__ field in the remaining space to absorb unused bytes:
  * 
- * Template:
- *   HSET key vector_field $0001024\r\n[1024 bytes]\r\n __padding__ $0000000\r\n\r\n
+ * Template (before):
+ *   <HSET key tag_field>$1024\r\n[1024 bytes]\r\n
  * 
- * After adjustment (512-byte vector):
- *   HSET key vector_field $0000512\r\n[512 bytes]\r\n __padding__ $0000512\r\n[512 gap]\r\n
+ * After adjustment (3-byte tag "red"):
+ *   - Padding total length = 1024 - 3 = 1021
+ *   - Padding payload = 1021 - 2(\r\n) - len("__padding__"=11) - 4(length encoding) - 1(space) = 1003
+ *   Result: <HSET key tag_field>$0003\r\nred\r\n __padding__ $1003\r\n[1003 gap]\r\n
  * 
- * This keeps all fields at fixed offsets while allowing the server to properly
- * parse the command. The dummy field value is never used - it just consumes the gap.
+ * This keeps total buffer size fixed while allowing the server to properly parse the command.
+ * The dummy field value is never used - it just consumes the gap bytes.
  * 
- * @param payload_start Pointer to the start of the payload data (after the \r\n following the length)
- * @param header_len Length of the length field (number of digits after '$')
- * @param payload_template_len Original/template payload length (total allocated space)
- * @param new_payload_len New payload length (must be <= payload_template_len)
+ * @param payload_start Pointer to the start of the tag payload data (after \r\n following the length)
+ * @param header_len Length of the length field (number of digits after '$') - always 4 for padding
+ * @param payload_template_len Original/template payload length (total allocated space for tag)
+ * @param tag_data The tag string to copy (can be NULL for empty tag)
+ * @param tag_len Length of the tag data (0 for empty tag)
  * 
  * Requirements:
- * - header_len must be large enough to represent new_payload_len with leading zeros
+ * - header_len must be large enough to represent tag_len with leading zeros
  * - The buffer must have space for: $ + header_len + \r\n + payload_template_len + \r\n
- * - new_payload_len must be <= payload_template_len
- * - Caller must provide a dummy field immediately after this field to absorb unused bytes
+ * - tag_len must be <= payload_template_len
+ * - Function creates __padding__ field dynamically in remaining space
  */
-static void adjustPayloadLength(char* payload_start, int header_len, int payload_template_len, int new_payload_len) {
-    assert(new_payload_len <= payload_template_len);
+static void replaceTagFieldWithPadding(char* payload_start, int header_len, 
+                                       int payload_template_len, 
+                                       const char* tag_data, int tag_len) {
+    assert(tag_len <= payload_template_len);
     assert(payload_start != NULL);
     assert(header_len > 0);
+    
+    /* Verify tag_len can be represented with header_len digits */
+    int tag_len_digits = tag_len > 0 ? snprintf(NULL, 0, "%d", tag_len) : 1;
+    assert(tag_len_digits <= header_len);
+    
+    /* Copy tag data to payload area */
+    if (tag_len > 0 && tag_data != NULL) {
+        memcpy(payload_start, tag_data, tag_len);
+    }
     
     /* Calculate RESP header start by counting backwards from payload start
      * Layout: $<header_len digits>\r\n<payload>
@@ -684,59 +699,59 @@ static void adjustPayloadLength(char* payload_start, int header_len, int payload
     assert(resp_start[1 + header_len + 1] == '\n');
     
     /* Calculate how many bytes we're no longer using */
-    int unused_bytes = payload_template_len - new_payload_len;
+    int unused_bytes = payload_template_len - tag_len;
     
-    /* Update the length field with leading zeros to maintain fixed width */
+    /* Update the tag field length with leading zeros to maintain fixed width */
     char length_str[32];
-    int written = snprintf(length_str, sizeof(length_str), "%0*d", header_len, new_payload_len);
+    int written = snprintf(length_str, sizeof(length_str), "%0*d", header_len, tag_len);
     assert(written == header_len); /* Ensure we didn't overflow the header length */
     
     /* Write the new length after the '$' */
     memcpy(resp_start + 1, length_str, header_len);
     
-    /* Place \r\n immediately after the new (reduced) payload */
-    char *new_terminator_pos = payload_start + new_payload_len;
-    new_terminator_pos[0] = '\r';
-    new_terminator_pos[1] = '\n';
+    /* Place \r\n immediately after the tag data */
+    char *tag_terminator_pos = payload_start + tag_len;
+    tag_terminator_pos[0] = '\r';
+    tag_terminator_pos[1] = '\n';
     
     /* 
-     * Update the dummy field length to consume the gap.
+     * CREATE the __padding__ field dynamically in the remaining space.
      * 
-     * The dummy field follows immediately after our terminator.
-     * Its RESP header is at: new_terminator_pos + 2
+     * Layout after tag field:
+     *   \r\n __padding__ $XXXX\r\n[gap bytes]\r\n
      * 
-     * We need to update its length from 0 to unused_bytes - 2 (the 2 bytes are our \r\n).
+     * Calculation (using 4-byte length encoding for padding):
+     *   - unused_bytes = payload_template_len - tag_len (includes space for \r\n after tag)
+     *   - Subtract: 2 (\r\n) + 1 (space) + 11 ("__padding__") + 1 ($) + 4 (length) + 2 (\r\n)
+     *   - Padding payload = unused_bytes - 21
      * 
-     * Dummy field layout:
-     *   <our \r\n> __padding__ $<header_len digits>\r\n<gap bytes>\r\n
+     * Example: tag="red" (3 bytes), template=1024
+     *   - unused = 1024 - 3 = 1021
+     *   - padding_payload = 1021 - 2 - 1 - 11 - 1 - 4 - 2 = 1000
+     * 
+     * Wait, recalculating per user's example:
+     *   - padding total = 1024 - 3 = 1021
+     *   - padding payload = 1021 - 2(\r\n) - 11(__padding__) - 4(len) - 1(space) = 1003
+     *   - So overhead = 1021 - 1003 = 18 (the final \r\n is part of gap bytes)
      */
-    if (unused_bytes > 2) {
-        /* Find the dummy field's RESP header
-         * Skip: \r\n (2) + field name + space + '$' to get to length digits */
-        char *search_pos = new_terminator_pos + 2;
+    const int PADDING_OVERHEAD = 18; /* space + "__padding__" + $ + 4-digit-len + \r\n before payload */
+    
+    if (unused_bytes > PADDING_OVERHEAD) {
+        char *padding_start = tag_terminator_pos + 2; /* After \r\n */
         
-        /* Look for the '$' that starts the dummy field's bulk string */
-        while (*search_pos != '$' && search_pos < payload_start + payload_template_len) {
-            search_pos++;
-        }
+        /* Write: " __padding__ $XXXX\r\n" */
+        int padding_payload_len = unused_bytes - PADDING_OVERHEAD;
         
-        if (*search_pos == '$') {
-            char *dummy_resp_start = search_pos;
-            
-            /* Update the dummy field's length to consume unused bytes minus our \r\n */
-            int dummy_payload_len = unused_bytes - 2;
-            char dummy_length_str[32];
-            int dummy_written = snprintf(dummy_length_str, sizeof(dummy_length_str), 
-                                        "%0*d", header_len, dummy_payload_len);
-            assert(dummy_written == header_len);
-            
-            /* Write the dummy field length */
-            memcpy(dummy_resp_start + 1, dummy_length_str, header_len);
-            
-            /* The dummy field's payload (gap bytes) already exists in the buffer.
-             * The server will read dummy_payload_len bytes and discard them.
-             * No need to modify the gap - it can contain any data. */
-        }
+        int padding_header_written = snprintf(padding_start, unused_bytes,
+                                             " __padding__ $%04d\r\n", 
+                                             padding_payload_len);
+        
+        /* Verify we wrote exactly what we expected (space + __padding__ + space + $ + 4 digits + \r\n = 19 chars) */
+        assert(padding_header_written == 19);
+        
+        /* The gap bytes (padding payload) already exist in the buffer.
+         * The server will read padding_payload_len bytes and discard them.
+         * The final \r\n is already part of the gap bytes. */
     }
 }
 
@@ -1439,6 +1454,30 @@ static sds getVectorKey(void) {
     return key;
 }
 
+// build tag that is of length config.search.payload_tag_len and starts with PLACEHOLDERS[DATASET_TAG_PLACEHOLDER_INDEX].name
+static sds createTagTemplate(void) {
+    if (!config.search.tag_field || !config.search.curr_conf.tag_dists) {
+        return NULL;
+    }
+    // create a string of len config.search.payload_tag_len that has repeating 'SHOULD-REPLACE' pattern
+    sds tag = sdsnewlen("", config.search.payload_tag_len);
+    snprintf(tag, config.search.payload_tag_len, "%s", PLACEHOLDERS[DATASET_TAG_PLACEHOLDER_INDEX].name);
+    char* pattern = "SHOULD-REPLACE";
+// repeat pattern to fill the rest of the tag by append string
+    size_t pattern_len = strlen(pattern);
+    size_t current_len = sdslen(tag);
+    while (current_len + pattern_len < config.search.payload_tag_len) {
+        tag = sdscat(tag, pattern);
+        current_len = sdslen(tag);
+    }
+    // append part of pattern to fill the rest
+    if (current_len < config.search.payload_tag_len) {
+        strncat(tag, pattern, config.search.payload_tag_len - current_len);
+    }
+    tag[config.search.payload_tag_len] = '\0'; // null terminate
+    assert(sdslen(tag) == config.search.payload_tag_len);
+    return tag;
+}
 
 /* Benchmark function for vector operations with cluster awareness */
 static int createVectorInsertCmdTemplate(char **cmd) {
@@ -1453,7 +1492,7 @@ static int createVectorInsertCmdTemplate(char **cmd) {
     
     /* Build HSET command */
     if (config.search.tag_field && config.search.curr_conf.tag_dists) {
-        sds selected_tag = selectTagByDistribution();
+        sds selected_tag = createTagTemplate();
         len = valkeyFormatCommand(cmd, 
             "HSET %b %s %b %s %s", 
             key, sdslen(key), 
@@ -1961,18 +2000,21 @@ static void replacePlaceholderDataset(
     _Atomic uint64_t *tag_counter,
     char *cmd)
 {
-    uint64_t dataset_prefill_counter = atomic_load(&config.dataset_prefill_counter);
-    // if dataset_prefill_counter >= keyspacelen, then dataset is prefilled
-    int dataset_prefilled = dataset_prefill_counter >= config.keyspacelen;
-    /* Validate placeholder consistency */
-    assert((key_count == vec_count) || (vec_count == 0) || (key_count == 0));
-    // if (config.cluster_mode) {
-    // dataset is prefilled
-    dataset_prefilled = getClusterTagMapCount(&cluster_tag_map) >= config.dataset_num_vectors;
+
     // }
     /* INSERT/PREFILL: both key and vector replacement */
     if (key_count > 0 && vec_count > 0) {
+        uint64_t dataset_prefill_counter = atomic_load(&config.dataset_prefill_counter);
+        // if dataset_prefill_counter >= keyspacelen, then dataset is prefilled
+        int dataset_prefilled = dataset_prefill_counter >= config.keyspacelen;
+        /* Validate placeholder consistency */
+        assert((key_count == vec_count) || (vec_count == 0) || (key_count == 0));
+        // if (config.cluster_mode) {
+        // dataset is prefilled
+        dataset_prefilled = getClusterTagMapCount(&cluster_tag_map) >= config.dataset_num_vectors;        
         for (size_t i = 0; i < key_count; i++) {
+            assert(key_count == tag_count || tag_count == 0);
+            assert(key_count == cluster_tag_count || cluster_tag_count == 0);
             uint64_t vector_id;
             char *key_write_pos = cmd + key_indices[i];
             int cluster_tag_len = config.cluster_mode ? PLACEHOLDERS[CLUSTER_PLACEHOLDER_INDEX].len : 0;
@@ -2040,7 +2082,25 @@ static void replacePlaceholderDataset(
                 } 
                 addClusterTagMapping(&cluster_tag_map, vector_id, cluster_tag_to_map);
             }
-
+            /* Handle tag field replacement with padding if configured */
+            if (tag_count > 0 && i < tag_count && config.search.tag_field && config.search.payload_tag_len > 0) {
+                char *tag_payload_start = cmd + tag_indices[i];
+                
+                /* Generate actual tag value */
+                sds selected_tag = selectTagByDistribution();
+                int actual_tag_len = selected_tag ? sdslen(selected_tag) : 0;
+                
+                /* Calculate RESP header length - number of digits needed for payload_tag_len */
+                int header_len = snprintf(NULL, 0, "%d", config.search.payload_tag_len);
+                
+                /* Replace tag field and adjust RESP lengths with padding */
+                replaceTagFieldWithPadding(tag_payload_start, header_len, 
+                                          config.search.payload_tag_len, 
+                                          selected_tag, actual_tag_len);
+                
+                if (selected_tag) sdsfree(selected_tag);
+            }
+            /* Debug output for first few inserts */
             static int debug_count = 0;
             if (debug_count < 5) {
                 printf("DEBUG INSERT: dataset_idx=%lu, vector_id=%lu, key_str='%s', vec_size=%u bytes\n",
@@ -2169,7 +2229,10 @@ static void replacePlaceholders(client c, char *cmd_data, int cmd_count) {
                 placeholders.indices[DATASET_VECTOR_PLACEHOLDER_INDEX],
                 &seq_key[DATASET_VECTOR_PLACEHOLDER_INDEX],
                 placeholders.count[CLUSTER_PLACEHOLDER_INDEX],
-                placeholders.indices[CLUSTER_PLACEHOLDER_INDEX],                
+                placeholders.indices[CLUSTER_PLACEHOLDER_INDEX],
+                placeholders.count[DATASET_TAG_PLACEHOLDER_INDEX],
+                placeholders.indices[DATASET_TAG_PLACEHOLDER_INDEX],
+                &seq_key[DATASET_TAG_PLACEHOLDER_INDEX],
                 cmd
             );
         }
@@ -3730,6 +3793,7 @@ void setDefaultSearchConfig(void) {
     config.search.ef_search = 200; // Default EF Search
     config.search.m = 12; // Default HNSW M parameter
     config.search.tag_field = NULL; // No tag field by default
+    config.search.payload_tag_len = 1024; // Default max tag length
     config.search.numeric_field = NULL; // No numeric field by default
     config.search.k = 10; // Default K for KNN queries
     config.search.curr_conf.tag_dists = NULL;
@@ -4470,7 +4534,7 @@ int main(int argc, char **argv) {
     config.engine_type = getEngineType(config.conn_info.hostip, config.conn_info.hostport, config.ct);
     valkeyContext *ctx = getValkeyContext(config.ct, config.conn_info.hostip, config.conn_info.hostport);
     /* Detect cluster mode (CME vs CMD) */
-    config.is_cluster_mode_enabled = isClusterModeEnabled(ctx); /* Unknown by default */
+    config.is_cluster_mode_enabled = isClusterModeEnabled(ctx) > 0; /* Unknown by default */
     valkeyFree(ctx);
     if (config.cluster_mode) {
         // We only include the slot placeholder {tag} if cluster mode is enabled
