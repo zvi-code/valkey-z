@@ -286,8 +286,10 @@ int executeClusterScan(clusterScanConfig *config, clusterScanResults *results) {
         return SCAN_ERROR_THREAD;
     }
 
-    printf("[SCAN] Started %d worker threads scanning pattern '%s'\n",
-           threads_created, config->match_pattern);
+    if (!config->silent_mode) {
+        printf("[SCAN] Started %d worker threads scanning pattern '%s'\n",
+               threads_created, config->match_pattern);
+    }
 
     /* Progress monitoring loop */
     uint64_t last_reported_keys = 0;
@@ -328,9 +330,11 @@ int executeClusterScan(clusterScanConfig *config, clusterScanResults *results) {
             (double)total_keys_processed * 1000.0 / total_time : 0.0;
     }
 
-    printf("[SCAN] Completed: %lu keys processed in %lu ms (%.1f keys/sec)\n",
-           total_keys_processed, total_time,
-           total_time > 0 ? (double)total_keys_processed * 1000.0 / total_time : 0.0);
+    if (!config->silent_mode) {
+        printf("[SCAN] Completed: %lu keys processed in %lu ms (%.1f keys/sec)\n",
+               total_keys_processed, total_time,
+               total_time > 0 ? (double)total_keys_processed * 1000.0 / total_time : 0.0);
+    }
 
     zfree(workers);
     pthread_mutex_destroy(&progress_mutex);

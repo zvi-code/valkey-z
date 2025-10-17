@@ -88,6 +88,9 @@ static long long nstime(void) {
 
 #define CLIENT_GET_EVENTLOOP(c) (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
 
+
+#define QUERY_VECTOR "query_vector"
+
 /* Vector generation placeholders 
  KEY - The key placeholder will follow with 4 bytes total key length. 
     This will be used if need to replace the entire key.
@@ -108,6 +111,12 @@ static long long nstime(void) {
 #define DATASET_TAG_PLACEHOLDER "___tag_field____"   // 16 bytes like vgen
 #define DATASET_TAG_PLACEHOLDER_INDEX 16
 
+#define DATASET_NUMERIC_TIME_PLACEHOLDER "__time__"   // 8 bytes 
+#define DATASET_NUMERIC_TIME_PLACEHOLDER_INDEX 17
+
+#define DATASET_NUMERIC_SCORE_PLACEHOLDER "__score__"   // 8 bytes 
+#define DATASET_NUMERIC_SCORE_PLACEHOLDER_INDEX 18
+
 #define VECTOR_PLACEHOLDER "__v_rd__"  // Exactly 8 characters for 2 floats
 #define VECTOR_NUM_RAND_DIM (8/sizeof(float)) // Number of random dimensions for vector generation
 #define VECTOR_PLACEHOLDER_INDEX 11
@@ -116,7 +125,7 @@ static long long nstime(void) {
 #define CLUSTER_PLACEHOLDER_INDEX 10
 
 
-#define PLACEHOLDER_NUM_OF 17
+#define PLACEHOLDER_NUM_OF 19
 #define PLACEHOLDER_NORMAL_NUM_OF 10  // Number of normal placeholders excluding vector and cluster placeholders
 
 
@@ -143,6 +152,8 @@ static const struct {
     [DATASET_KEY_PLACEHOLDER_INDEX] = {DATASET_KEY_PLACEHOLDER, 12},
     [DATASET_VECTOR_PLACEHOLDER_INDEX] = {DATASET_VECTOR_PLACEHOLDER, 16},
     [DATASET_TAG_PLACEHOLDER_INDEX] = {DATASET_TAG_PLACEHOLDER, 16},
+    [DATASET_NUMERIC_TIME_PLACEHOLDER_INDEX] = {DATASET_NUMERIC_TIME_PLACEHOLDER, 8},
+    [DATASET_NUMERIC_SCORE_PLACEHOLDER_INDEX] = {DATASET_NUMERIC_SCORE_PLACEHOLDER, 8},
 };
 
 
@@ -330,6 +341,7 @@ typedef struct _client {
     int dataset_query_capacity;       /* Capacity of dataset query index queue */
     uint64_t paused : 1;
     uint64_t reuse : 1;
+    int running_queries;
 } *client;
 
 
@@ -1314,12 +1326,12 @@ static void processQueryResults(valkeyReply *reply, uint64_t query_idx) {
         }
         updateRecallStats(recall);
         // perform the extended checkNeighbors for 10% of the responses randomly
-        // static __thread int num_results = 0;
-        // if (num_results % 10 == 0) {
-        recall = checkNeighbors(query_idx, result_vec_ids, num_vecs_ids, query_neighbors);
-        updateRecallStatsExt(recall);
-        // }
-        // num_results++;
+        static __thread int num_results = 0;
+        if (num_results % 10000 == 0) {
+            recall = checkNeighbors(query_idx, result_vec_ids, num_vecs_ids, query_neighbors);
+            updateRecallStatsExt(recall);
+        }
+        num_results++;
     } else if (config.print_search_results) {
         pthread_mutex_unlock(&recall_stats_mutex);
     }
@@ -1446,7 +1458,7 @@ static void initBaseVector(int dim) {
     }
 }
 
-static sds getVectorKey(void) {
+static sds getSearchKeyTemplate(void) {
     int ph_index = 0;
     size_t key_len = strlen(config.search.prefix) + 1; // +1 for ':'
     if (config.cluster_mode) {
@@ -1474,59 +1486,63 @@ static sds getVectorKey(void) {
 
 // build tag that is of length config.search.payload_tag_len and starts with PLACEHOLDERS[DATASET_TAG_PLACEHOLDER_INDEX].name
 static sds createTagTemplate(void) {
-    if (!config.search.tag_field || !config.search.curr_conf.tag_dists) {
-        return NULL;
-    }
     // create a string of len config.search.payload_tag_len that has repeating 'SHOULD-REPLACE' pattern
     sds tag = sdsnewlen("", config.search.payload_tag_len);
     snprintf(tag, config.search.payload_tag_len, "%s", PLACEHOLDERS[DATASET_TAG_PLACEHOLDER_INDEX].name);
-    char* pattern = "SHOULD-REPLACE";
-// repeat pattern to fill the rest of the tag by append string
-    size_t pattern_len = strlen(pattern);
-    size_t current_len = sdslen(tag);
-    while (current_len + pattern_len < config.search.payload_tag_len) {
-        tag = sdscat(tag, pattern);
-        current_len = sdslen(tag);
-    }
-    // append part of pattern to fill the rest
-    if (current_len < config.search.payload_tag_len) {
-        strncat(tag, pattern, config.search.payload_tag_len - current_len);
-    }
+    memset(tag + strlen(PLACEHOLDERS[DATASET_TAG_PLACEHOLDER_INDEX].name), 'Z', config.search.payload_tag_len - strlen(PLACEHOLDERS[DATASET_TAG_PLACEHOLDER_INDEX].name) - 1);
     tag[config.search.payload_tag_len] = '\0'; // null terminate
     assert(sdslen(tag) == config.search.payload_tag_len);
     return tag;
 }
 
-/* Benchmark function for vector operations with cluster awareness */
-static int createVectorInsertCmdTemplate(char **cmd) {
-    int len;   
+void setArg(const char **argv, size_t *argvlen, int *argc, const char* value, int value_len) {
+    argv[(*argc)] = value;
+    argvlen[(*argc)++] = value_len;
+}
+/* Benchmark function for vector operations with cluster awareness 
+ * Supports multiple tag and numeric fields dynamically */
+static int createSearchHsetTemplate(char **cmd) {
     /* Generate key with appropriate cluster tag */    
-    sds key = getVectorKey();
+    sds key = getSearchKeyTemplate();
     /* Validation checks */
     assert(config.search.vector_dim > 0 && config.use_search && config.search.vector_dim > VECTOR_NUM_RAND_DIM);        
     /* Build vector data: fixed part + placeholder */
     sds vector_binary = createVectorTemplate(0x736f6d6575736572); // "someusername" as base
 
+    /* Build HSET command using argv approach 
+     * Max fields: command + key + vector_field + vector_data + tag_field + tag_data + numeric_field + numeric_data
+     * Allow room for multiple tag/numeric fields: 2 + 2 + (2*5) = 14 max args */
+    const char *argv[20];
+    size_t argvlen[20];
+    int argc = 0;
     
-    /* Build HSET command */
+    /* Command and key */
+    setArg(argv, argvlen, &argc, "HSET", 4);
+    setArg(argv, argvlen, &argc, key, sdslen(key));
+    
+    /* Vector field (always present) */
+    setArg(argv, argvlen, &argc, config.search.vector_field, strlen(config.search.vector_field));
+    setArg(argv, argvlen, &argc, vector_binary, sdslen(vector_binary));    
+    /* Tag field (optional) - can be extended to support multiple tag fields
+     * Future: could loop through an array of tag fields */
+    sds selected_tag = NULL;
     if (config.search.tag_field && config.search.curr_conf.tag_dists) {
-        sds selected_tag = createTagTemplate();
-        len = valkeyFormatCommand(cmd, 
-            "HSET %b %s %b %s %s", 
-            key, sdslen(key), 
-            config.search.vector_field,
-            vector_binary, sdslen(vector_binary),
-            config.search.tag_field, 
-            selected_tag ? selected_tag : "");
-        if (selected_tag) sdsfree(selected_tag);
-    } else {
-        len = valkeyFormatCommand(cmd, 
-            "HSET %b %s %b", 
-            key, sdslen(key), 
-            config.search.vector_field,
-            vector_binary, sdslen(vector_binary));
+        selected_tag = createTagTemplate();
+        setArg(argv, argvlen, &argc, config.search.tag_field, strlen(config.search.tag_field));
+        setArg(argv, argvlen, &argc, selected_tag, sdslen(selected_tag));
+        sdsfree(selected_tag);
     }
     
+    /* Numeric field (optional) - can be extended to support multiple numeric fields
+     * Future: could loop through an array of numeric fields */
+    if (config.search.numeric_field) {
+        setArg(argv, argvlen, &argc, config.search.numeric_field, strlen(config.search.numeric_field));
+        setArg(argv, argvlen, &argc, PLACEHOLDERS[DATASET_NUMERIC_SCORE_PLACEHOLDER_INDEX].name, PLACEHOLDERS[DATASET_NUMERIC_SCORE_PLACEHOLDER_INDEX].len);
+    }
+    
+    int len = valkeyFormatCommandArgv(cmd, argc, argv, argvlen);
+    
+    /* Cleanup allocated strings */
     sdsfree(key);
     sdsfree(vector_binary);
     return len;
@@ -1534,7 +1550,6 @@ static int createVectorInsertCmdTemplate(char **cmd) {
 
 /* Benchmark function for vector operations with cluster awareness */
 static int createSearchCmdTemplate(char **cmd) {
-    int len;
     sds index_name = sdsdup(config.search.name);
     // Check if algorithm is flat or hnsw [case insensitive], if it is flat, append '_flat' to index name. otherwise use index name as is
     if (strcasecmp(config.search.algorithm, "flat") == 0) {
@@ -1558,115 +1573,75 @@ static int createSearchCmdTemplate(char **cmd) {
     /* Build KNN query */
     sds query;
     int is_hnsw = (strcasecmp(config.search.algorithm, "hnsw") == 0);
+    sds filter;
+    if (config.search.curr_conf.tag_filter) {
+        filter = sdscatprintf(sdsempty(), "@%s:{%s}", 
+            config.search.tag_field, 
+            config.search.curr_conf.tag_filter);
+    } else {
+        filter = sdscatprintf(sdsempty(), "*");
+    } 
+    if (is_hnsw) {
+        query = sdscatprintf(sdsempty(), 
+            "%s=>[KNN %d @%s $%s EF_RUNTIME %d]", 
+            filter,
+            config.search.k, 
+            config.search.vector_field, 
+            QUERY_VECTOR,
+            config.search.ef_search);
+    } else {
+        query = sdscatprintf(sdsempty(), 
+            "%s=>[KNN %d @%s $%s]", 
+            filter,
+            config.search.k, 
+            config.search.vector_field,
+            QUERY_VECTOR);
+    }   
+
+    /* Build FT.SEARCH command using argv approach */
+    sds score_field = sdscatprintf(sdsempty(), "__%s_score", config.search.vector_field);
+    sds k_str = sdscatprintf(sdsempty(), "%d", config.search.k);
     
-    if (config.search.curr_conf.tag_filter && config.search.tag_field) {
-        if (is_hnsw) {
-            query = sdscatprintf(sdsempty(), 
-                "@%s:{%s}=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
-                config.search.tag_field, 
-                config.search.curr_conf.tag_filter,
-                config.search.k, 
-                config.search.vector_field, 
-                config.search.ef_search);
-        } else {
-            query = sdscatprintf(sdsempty(), 
-                "@%s:{%s}=>[KNN %d @%s $query_vector]", 
-                config.search.tag_field, 
-                config.search.curr_conf.tag_filter,
-                config.search.k, 
-                config.search.vector_field);
-        }
-    } else {
-        if (is_hnsw) {
-            query = sdscatprintf(sdsempty(), 
-                "*=>[KNN %d @%s $query_vector EF_RUNTIME %d]", 
-                config.search.k, 
-                config.search.vector_field, 
-                config.search.ef_search);
-        } else {
-            query = sdscatprintf(sdsempty(), 
-                "*=>[KNN %d @%s $query_vector]", 
-                config.search.k, 
-                config.search.vector_field);
-        }
+    const char *argv[20];  /* Max arguments we might need */
+    size_t argvlen[20];
+    int argc = 0;
+    
+    /* Command name */
+    setArg(argv, argvlen, &argc, "FT.SEARCH", 9);
+    
+    /* Index name */
+    setArg(argv, argvlen, &argc, index_name, sdslen(index_name));    
+    
+    /* Query */
+    setArg(argv, argvlen, &argc, query, sdslen(query));
+    
+    /* LIMIT 0 k */
+    setArg(argv, argvlen, &argc, "LIMIT", 5);
+    setArg(argv, argvlen, &argc, "0", 1);
+    setArg(argv, argvlen, &argc, k_str, sdslen(k_str));
+    
+    /* RETURN n score_field [vector_field] */
+    setArg(argv, argvlen, &argc, "RETURN", 6);
+    setArg(argv, argvlen, &argc, config.search.nocontent ? "1" : "2", 1);
+    setArg(argv, argvlen, &argc, score_field, sdslen(score_field));
+    if (!config.search.nocontent) {
+        setArg(argv, argvlen, &argc, config.search.vector_field, strlen(config.search.vector_field));
     }
-    printf("ZZZZZ\nBUILDING QUERY: %s\n", query);
-    fflush(stdout);
-    /* Build FT.SEARCH command 
-     * Scores are automatically included in results as __<vector_field>_score field 
-     * Results are returned ordered by distance (closest first) by default */
-    sds to_return;
-    sds to_return2;
-    if (config.search.nocontent) {
-        to_return = sdscatprintf(sdsempty(), " RETURN 1 __%s_score", config.search.vector_field);
-        to_return2 = sdscatprintf(sdsempty(), " RETURN 2 __%s_score %s", config.search.vector_field, config.search.vector_field);
-    } else {
-        to_return = sdscatprintf(sdsempty(), " RETURN 2 __%s_score %s", config.search.vector_field, config.search.vector_field);
-        to_return2 = sdscatprintf(sdsempty(), " RETURN 1 __%s_score", config.search.vector_field);
+    /* LOCALONLY if needed */
+    if (config.search.localonly) {
+        setArg(argv, argvlen, &argc, "LOCALONLY", 9);
     }
-    /* Important: FT.SEARCH has a default LIMIT of 10, so we must specify LIMIT explicitly
-     * to get k results. The LIMIT clause comes before PARAMS. */
-    // if (config.search.nocontent) {
-    //     if (config.engine_type != ENGINE_TYPE_MEMORYDB) {
-    //         /* With NOCONTENT, we need RETURN to get the score field */
-    //         len = valkeyFormatCommand(cmd, 
-    //             "FT.SEARCH %b %b LIMIT 0 %d NOCONTENT PARAMS 2 query_vector %b %s RETURN 1 %s", 
-    //             index_name, sdslen(index_name), 
-    //             query, sdslen(query),
-    //             config.search.k,  /* Specify k as the limit */
-    //             vector_binary, sdslen(vector_binary), config.search.localonly ? "LOCALONLY" : "", score_field);
-    //     } else {
-    //         len = valkeyFormatCommand(cmd,
-    //             "FT.SEARCH %b %b LIMIT 0 %d PARAMS 2 query_vector %b RETURN 1 %s",
-    //             index_name, sdslen(index_name),
-    //             query, sdslen(query),
-    //             config.search.k,  /* Specify k as the limit */
-    //             vector_binary, sdslen(vector_binary),
-    //             score_field);
-    //     }
-    // } else {
-    /* Without NOCONTENT, all fields including score are returned by default */
-    len = valkeyFormatCommand(cmd,
-        "FT.SEARCH %b %b%s%s LIMIT 0 %d PARAMS 2 query_vector %b",
-        index_name, sdslen(index_name),
-        query, sdslen(query),
-        config.search.localonly ? " LOCALONLY" : "",        
-        to_return,
-        config.search.k,  /* Specify k as the limit */
-        vector_binary, sdslen(vector_binary));
-    static int first_time = 1;
-    if (first_time) {
-        printf("Debug: FT.SEARCH command length %d too_return:%s\n", len, to_return);
-        printf("Debug: FT.SEARCH command template to_return:\n%s\n", *cmd);
-        fflush(stdout);
-        first_time = 0;
-    }        
-    len = valkeyFormatCommand(cmd,
-        "FT.SEARCH %b %b%s%s LIMIT 0 %d PARAMS 2 query_vector %b",
-        index_name, sdslen(index_name),
-        query, sdslen(query),
-        config.search.localonly ? " LOCALONLY" : "",        
-        to_return2,
-        config.search.k,  /* Specify k as the limit */
-        vector_binary, sdslen(vector_binary));        
-    // }
-    // len = valkeyFormatCommand(cmd,
-    //     "FT.SEARCH %b %b%s LIMIT 0 %d PARAMS 2 query_vector %b",
-    //     index_name, sdslen(index_name),
-    //     query, sdslen(query),
-    //     config.search.localonly ? " LOCALONLY" : "",
-    //     to_return,
-    //     config.search.k,  /* Specify k as the limit */
-    //     vector_binary, sdslen(vector_binary));
-    static int first_time2 = 1;
-    if (first_time2) {
-        printf("Debug: FT.SEARCH command length %d to_return:%s\n", len, to_return2);
-        printf("Debug: FT.SEARCH command template to_return2:\n%s\n", *cmd);
-        fflush(stdout);
-        first_time2 = 0;
-    }
-    sdsfree(to_return);
-    sdsfree(to_return2);
+    
+    /* PARAMS 2 query_vector <vector> */
+    setArg(argv, argvlen, &argc, "PARAMS", 6);
+    setArg(argv, argvlen, &argc, "2", 1);
+    setArg(argv, argvlen, &argc, QUERY_VECTOR, 12);
+    setArg(argv, argvlen, &argc, vector_binary, sdslen(vector_binary));
+    
+    int len = valkeyFormatCommandArgv(cmd, argc, argv, argvlen);
+    
+    sdsfree(k_str);
+    sdsfree(score_field);
     sdsfree(query);
     sdsfree(vector_binary);
     sdsfree(index_name);
@@ -2173,6 +2148,7 @@ static void replacePlaceholderDataset(
 
     /* SEARCH: only vector replacement */
     if (vec_count > 0 && key_count == 0) {
+        c->running_queries++;
         static __thread uint64_t next_query_idx = 0;
         if (next_query_idx == 0) {
             next_query_idx = thread_id + (1 << 10) - 1;
@@ -2374,6 +2350,9 @@ static void resetClient(client c) {
     /* Reset query index queue for dataset */
     c->dataset_query_head = 0;
     c->dataset_query_tail = 0;
+
+    c->running_queries = 0;
+    c->latency = -1;
 }
 
 /* Acquires the specified number of tokens from the token bucket or calculates the wait time if tokens are not available.
@@ -2514,7 +2493,8 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                         assert(0);
                     }
                 }
-                if (c->prefix_pending <= 0 && c->dataset_query_head != c->dataset_query_tail) {
+                if (c->prefix_pending <= 0 && c->running_queries > 0) {
+                    assert(c->dataset_query_head != c->dataset_query_tail);
                     uint64_t query_idx = c->dataset_query_indices[
                         (c->dataset_query_head++) % c->dataset_query_capacity
                     ];
@@ -2525,7 +2505,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                         uint64_t query_idx = c->vgen_query_indices[(c->vgen_query_head++) % c->vgen_query_capacity];
                         vgen_compute_recall(query_idx, reply);
                     }
-
+                    c->running_queries--;
                 }
                 freeReplyObject(reply);
                 /* This is an OK for prefix commands such as auth and select.*/
@@ -3872,7 +3852,8 @@ int parseOptions(int argc, char **argv) {
     int exit_status = 1;
     char *tls_usage;
     char *rdma_usage;
-
+    char *search_usage;
+    char *search_examples;
     for (i = 1; i < argc; i++) {
         lastarg = (i == (argc - 1));
 
@@ -4200,9 +4181,92 @@ usage:
 #endif
         "";
 
+    search_examples = 
+        " Search index tests:\n"
+        "   $ valkey-benchmark --search  --search-name grocery_products --vector-dim 768 "
+        "--tag-field \"category\" --search-tags 'fruits:100,vegetables:100,dairy:100,meat:52.2,fruitsppo:99,fruitsppod:99' -t vec-insert -n 100 -r 1000\n"
+        " Query and filter vector data:\n"
+        "   $ valkey-benchmark --search  --search-name grocery_products     --vector-dim 768     --tag-field \"category\"\n"
+         "--search-tags 'fruits:5.7,vegetables:0.3,dairy:10.1,meat:52.2,fruitsppo:99,fruitsppod:99' --tag-filter 'fruits*'\n"
+         "   -t vec-query  --search-print-results   -n 1 -r 10000000\n\n"
+        " Vector insert with tag and numeric fields:\n"
+        "   $ valkey-benchmark --search --search-name products --vector-dim 768 \\\n"
+        "       --tag-field category --numeric-field price \\\n"
+        "       --search-tags 'electronics:40,clothing:30,food:30' \\\n"
+        "       -t vec-insert -n 10000\n\n"
+        " Vector Generator with Recall Tracking:\n"
+        "   The vector generator (--use_vgen) provides deterministic vector generation\n"
+        "   with ground truth tracking for measuring search recall accuracy.\n\n"
+        "   Step 1 - Ingest ground truth vectors (REQUIRED before queries):\n"
+        "   $ valkey-benchmark --cluster -h <host> --use_vgen --vgen-seed 42 \\\n"
+        "       --vgen-capacity 100 --vgen-centroids 5 --vgen-radius 0.5 \\\n"
+        "       --search --vector-dim 1024 --search-name my_index --search-prefix vec: \\\n"
+        "       -t vec-ground-truth -n 10000 -c 1 --rfr 'no'\n\n"
+        "   Step 2 - Run queries and measure recall:\n"
+        "   $ valkey-benchmark --cluster -h <host> --use_vgen --vgen-seed 42 \\\n"
+        "       --vgen-capacity 100 --vgen-centroids 5 --vgen-radius 0.5 \\\n"
+        "       --search --vector-dim 1024 --search-name my_index --search-prefix vec: \\\n"
+        "       -t vec-query -n 1000 -c 10 --threads 5 --rfr 'no'\n\n"
+        "   Important: Use --rfr 'no' for write operations (vec-ground-truth, vec-insert)\n"
+        "              to send writes only to primary nodes. Replicas don't accept writes.\n\n"
+        "  $ valkey-benchmark -h zvi-1shard-no-tls-0001-001.adsscafsdf.euw1devo.zzz.www.com --cluster --rfr 'no' --use_vgen \\\n"
+        "      --vgen-capacity 50000 --vgen-centroids 100 --vgen-radius 1.331 --vgen-sparsity 0.423 --vgen-seed 53427 \\\n"
+        "      -t vec-ground-truth,vec-insert --search --vector-dim 256 --search-name new_256 --search-prefix vec_gen_256: -n 100000 -r 1000000 -c 1\n"
+        "  $ valkey-benchmark -h zvi--1shard-no-tls-0001-001.adsscafsdf.euw1devo.zzz.www.com --cluster --rfr 'no' --use_vgen \\\n"
+        "      --vgen-capacity 50000 --vgen-centroids 100 --vgen-radius 1.331 --vgen-sparsity 0.423 --vgen-seed 53427 \\\n"
+        "      -t vec-query --search --vector-dim 256 --search-name new_256 --search-prefix vec_gen_256: -n 10 -r 1000000 -c 1 --search-print-results\n";
 
+    search_usage = 
+         " --search           Enable search indexes for vec-insert, vec-query, vec-del, and\n"
+        "                    vec-scan-q-verify tests. Creates a vector index when starting benchmarks.\n"
+        "                    Available vector tests:\n"
+        "                    - vec-insert: Insert vectors into the index\n"
+        "                    - vec-query: Query vectors using KNN search\n"
+        "                    - vec-del: Delete vectors from the index\n"
+        "                    - vec-scan-q-verify: Query with vectors and verify self-recall\n"
+        "                      (Currently uses same approach as vec-query with recall tracking)\n"
+        " --search-print-results Print the search results returned by FT.SEARCH queries.\n"
+        " --ef-search <value> Set the EF_RUNTIME parameter for KNN queries. (default 200)\n"
+        " --vector-dim <dim> Set the dimension of the vector index. Dim must be > 16. (default 128)\n"
+        " --ef-construction <value> Set the EF_CONSTRUCTION parameter for KNN queries. (default 200)\n"
+        " --m <value>        Set the HNSW M parameter for KNN queries. (default 16)\n"
+        " --search-alg <name> Set the search algorithm to use for KNN queries. (default 'hnsw')\n"
+        "                    Supported algorithms: 'hnsw', 'flat'.\n"
+        " --metric <name>    Set the metric for KNN queries. (default 'L2')\n"
+        "                    Supported metrics: 'L2', 'IP', 'COSINE'\n"
+        " --k <value>       Set the number of nearest neighbors to return in KNN queries. (default 10)\n"
+        " --search-name <name> Set the name of the search index to use for vec-query and vec-del tests.\n"
+        "                    If not set, the default index name 'test_vector_index' is used.\n"
+        " --search-prefix <prefix>\n"
+        "                    Set the prefix for vector keys. (default 'vec:')\n"
+        " --vector-field <name>\n"
+        "                    Set the name for vector values. (default 'vector_field')\n"
+        " --tag-field <name> Set the tag field name for the index.\n"
+        "                    For multiple tag fields (future): use comma-separated names.\n"
+        " --numeric-field <name>\n"
+        "                    Set the numeric field name for the index.\n"
+        "                    For multiple numeric fields (future): use comma-separated names.\n"
+        " --tag-filter <pattern>\n"
+        "                    Set tag filter pattern for vec-query operations (e.g., 'category_*').\n"
+        " --search-tags <distribution>\n"
+        "                    Comma-separated tag:percentage pairs for vec-insert operations.\n"
+        "                    Example: 'fruits:8.5,vegetables:7.2,dairy:32.1,meat:52.2'\n"
+        " --use_vgen         Enable vector generator for deterministic vector generation.\n"
+        "                    Provides ground truth tracking and recall metrics for vec-query tests.\n"
+        " --vgen-capacity <num>\n"
+        "                    Initial capacity for vector generator (default: based on -n value).\n"
+        " --vgen-centroids <num>\n"
+        "                    Number of centroids for vector clustering (default 5).\n"
+        " --vgen-radius <value>\n"
+        "                    Cluster radius for vector generation (default 0.5).\n"
+        " --vgen-sparsity <value>\n"
+        "                    Sparsity ratio for vectors, 0.0-1.0 (default 0.0).\n"
+        " --vgen-seed <num>  Seed for deterministic vector generation (default: random).\n"
+        " --dataset <name>   Use dataset for vector workloads.\n"
+        " --dataset-path <path> Explicit path to dataset binary file.\n"
+        " --vgen-precompute  Precompute ground truths before queries (warm-up phase).\n";
     printf(
-        "%s%s%s%s%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
+        "%s%s%s%s%s%s%s%s%s", /* Split to avoid strings longer than 4095 (-Woverlength-strings). */
         "Usage: valkey-benchmark [OPTIONS] [--] [COMMAND ARGS...]\n\n"
         "Simulates sending commands using multiple clients. The utility provides a\n"
         "default set of tests. You can run a subset of the tests using the -t option or\n"
@@ -4294,51 +4358,8 @@ usage:
         "                    loaded when running the 'function_load' test. (default 10).\n"
         " --num-keys-in-fcall <num>\n"
         "                    Sets the number of keys passed to FCALL command when running\n"
-        "                    the 'fcall' test. (default 1)\n"
-        " --search           Enable search indexes for vec-insert, vec-query, vec-del, and\n"
-        "                    vec-scan-q-verify tests. Creates a vector index when starting benchmarks.\n"
-        "                    Available vector tests:\n"
-        "                    - vec-insert: Insert vectors into the index\n"
-        "                    - vec-query: Query vectors using KNN search\n"
-        "                    - vec-del: Delete vectors from the index\n"
-        "                    - vec-scan-q-verify: Query with vectors and verify self-recall\n"
-        "                      (Currently uses same approach as vec-query with recall tracking)\n"
-        " --search-print-results Print the search results returned by FT.SEARCH queries.\n"
-        " --ef-search <value> Set the EF_RUNTIME parameter for KNN queries. (default 200)\n"
-        " --vector-dim <dim> Set the dimension of the vector index. Dim must be > 16. (default 128)\n"
-        " --ef-construction <value> Set the EF_CONSTRUCTION parameter for KNN queries. (default 200)\n"
-        " --m <value>        Set the HNSW M parameter for KNN queries. (default 16)\n"
-        " --search-alg <name> Set the search algorithm to use for KNN queries. (default 'hnsw')\n"
-        "                    Supported algorithms: 'hnsw', 'flat'.\n"
-        " --metric <name>    Set the metric for KNN queries. (default 'L2')\n"
-        "                    Supported metrics: 'L2', 'IP', 'COSINE'\n"
-        " --k <value>       Set the number of nearest neighbors to return in KNN queries. (default 10)\n"
-        " --search-name <name> Set the name of the search index to use for vec-query and vec-del tests.\n"
-        "                    If not set, the default index name 'test_vector_index' is used.\n"
-        " --search-prefix <prefix>\n"
-        "                    Set the prefix for vector keys. (default 'vec:')\n"
-        " --vector-field <name>\n"
-        "                    Set the name for vector values. (default 'vector_field')\n"
-        " --tag-field <name> Set the tag field name for the index.\n"
-        " --tag-filter <pattern>\n"
-        "                    Set tag filter pattern for vec-query operations (e.g., 'category_*').\n"
-        " --search-tags <distribution>\n"
-        "                    Comma-separated tag:percentage pairs for vec-insert operations.\n"
-        "                    Example: 'fruits:8.5,vegetables:7.2,dairy:32.1,meat:52.2'\n"
-        " --use_vgen         Enable vector generator for deterministic vector generation.\n"
-        "                    Provides ground truth tracking and recall metrics for vec-query tests.\n"
-        " --vgen-capacity <num>\n"
-        "                    Initial capacity for vector generator (default: based on -n value).\n"
-        " --vgen-centroids <num>\n"
-        "                    Number of centroids for vector clustering (default 5).\n"
-        " --vgen-radius <value>\n"
-        "                    Cluster radius for vector generation (default 0.5).\n"
-        " --vgen-sparsity <value>\n"
-        "                    Sparsity ratio for vectors, 0.0-1.0 (default 0.0).\n"
-        " --vgen-seed <num>  Seed for deterministic vector generation (default: random).\n"
-        " --dataset <name>   Use dataset for vector workloads.\n"
-        " --dataset-path <path> Explicit path to dataset binary file.\n",
-        " --vgen-precompute  Precompute ground truths before queries (warm-up phase).\n",
+        "                    the 'fcall' test. (default 1)\n",
+        search_usage,
         tls_usage,
         rdma_usage,        
         " --mptcp            Enable an MPTCP connection.\n"
@@ -4359,37 +4380,8 @@ usage:
         "   $ valkey-benchmark -r 10000 -n 10000 lpush mylist __rand_int__\n\n"
         " Benchmark a specific transaction:\n"
         "   $ valkey-benchmark -- multi ';' set key:__rand_int__ __data__ ';' \\\n"
-        "                         incr counter ';' exec\n\n"
-        " Search index tests:\n"
-        "   $ valkey-benchmark --search  --search-name grocery_products --vector-dim 768 "
-        "--tag-field \"category\" --search-tags 'fruits:100,vegetables:100,dairy:100,meat:52.2,fruitsppo:99,fruitsppod:99' -t vec-insert -n 100 -r 1000\n"
-        " Query and filter vector data:\n"
-        "   $ valkey-benchmark --search  --search-name grocery_products     --vector-dim 768     --tag-field \"category\"\n"
-         "--search-tags 'fruits:5.7,vegetables:0.3,dairy:10.1,meat:52.2,fruitsppo:99,fruitsppod:99' --tag-filter 'fruits*'\n"
-         "   -t vec-query  --search-print-results   -n 1 -r 10000000\n\n"
-        " Vector Generator with Recall Tracking:\n"
-        "   The vector generator (--use_vgen) provides deterministic vector generation\n"
-        "   with ground truth tracking for measuring search recall accuracy.\n\n"
-        "   Step 1 - Ingest ground truth vectors (REQUIRED before queries):\n"
-        "   $ valkey-benchmark --cluster -h <host> --use_vgen --vgen-seed 42 \\\n"
-        "       --vgen-capacity 100 --vgen-centroids 5 --vgen-radius 0.5 \\\n"
-        "       --search --vector-dim 1024 --search-name my_index --search-prefix vec: \\\n"
-        "       -t vec-ground-truth -n 10000 -c 1 --rfr 'no'\n\n"
-        "   Step 2 - Run queries and measure recall:\n"
-        "   $ valkey-benchmark --cluster -h <host> --use_vgen --vgen-seed 42 \\\n"
-        "       --vgen-capacity 100 --vgen-centroids 5 --vgen-radius 0.5 \\\n"
-        "       --search --vector-dim 1024 --search-name my_index --search-prefix vec: \\\n"
-        "       -t vec-query -n 1000 -c 10 --threads 5 --rfr 'no'\n\n"
-        "   The output will include recall statistics:\n"
-        "     ====== Recall Statistics ======\n"
-        "       Total queries: 1000\n"
-        "       Average recall: 75.50%%\n"
-        "       Min recall: 30.00%%\n"
-        "       Max recall: 100.00%%\n\n"
-        "   Important: Use --rfr 'no' for write operations (vec-ground-truth, vec-insert)\n"
-        "              to send writes only to primary nodes. Replicas don't accept writes.\n\n"
-        "  $ valkey-benchmark -h zvi-1shard-no-tls-0001-001.adsscafsdf.euw1devo.zzz.www.com --cluster --rfr 'no' --use_vgen --vgen-capacity 50000 --vgen-centroids 100 --vgen-radius 1.331 --vgen-sparsity 0.423 --vgen-seed 53427 -t vec-ground-truth,vec-insert --search --vector-dim 256 --search-name new_256 --search-prefix vec_gen_256: -n 100000 -r 1000000 -c 1"
-        "  $ valkey-benchmark -h zvi--1shard-no-tls-0001-001.adsscafsdf.euw1devo.zzz.www.com --cluster --rfr 'no' --use_vgen --vgen-capacity 50000 --vgen-centroids 100 --vgen-radius 1.331 --vgen-sparsity 0.423 --vgen-seed 53427 -t vec-query --search --vector-dim 256 --search-name new_256 --search-prefix vec_gen_256: -n 10 -r 1000000 -c 1 --search-print-results"
+        "                         incr counter ';' exec\n\n",
+        search_examples,
         " For more information, see the Valkey documentation at https://valkey.io.\n");
     exit(exit_status);
 }
@@ -5022,7 +5014,7 @@ int main(int argc, char **argv) {
                 } 
 
                 /* Ingest ground truth vectors from reserved range */
-                len = createVectorInsertCmdTemplate(&cmd);
+                len = createSearchHsetTemplate(&cmd);
                 benchmark("VEC-GROUND-TRUTH", cmd, len);
                 zfree(cmd);
                 config.sequential_replacement = prev_sequential_replacement; /* restore original setting */
@@ -5032,7 +5024,7 @@ int main(int argc, char **argv) {
             
             if (test_is_selected("vec-insert")) {
                 /* Use custom vector benchmark function */
-                len = createVectorInsertCmdTemplate(&cmd);
+                len = createSearchHsetTemplate(&cmd);
                 benchmark("VEC-INSERT", cmd, len);
                 zfree(cmd);
             }
@@ -5055,16 +5047,13 @@ int main(int argc, char **argv) {
                 }
                 /* Use custom vector benchmark function */
                 len = createSearchCmdTemplate(&cmd);
-                printf("running vec-query with keyspacelen=%d\n", config.keyspacelen);
-                fflush(stdout);
-                printf("query cmd template: %s\n", cmd);
                 benchmark("VEC-QUERY", cmd, len);
                 zfree(cmd);
                 config.keyspacelen = keyspacelen_before; /* restore original keyspacelen */
             }
 
             if (test_is_selected("vec-del")) {
-                sds key = getVectorKey();
+                sds key = getSearchKeyTemplate();
                 len = valkeyFormatCommand(&cmd, "DEL %s", key);
                 benchmark("VEC-DEL", cmd, len);
                 sdsfree(key);
@@ -5075,14 +5064,14 @@ int main(int argc, char **argv) {
                 /* This test retrieves a vector from a known key and searches for it.
                  * We create a command sequence:
                  * 1. HGET <key> <vector_field> - Get the vector
-                 * 2. FT.SEARCH <index> "*=>[KNN 10 @vector_field $query_vector]" ... - Search
+                 * 2. FT.SEARCH <index> "*=>[KNN 10 @vector_field $QUERY_VECTOR]" ... - Search
                  * 
                  * For benchmarking, we use a simplified approach where we generate
                  * the query vector ourselves and verify self-search works.
                  * This is similar to vec-query but we ensure the queried vector exists. */
                 
                 /* Build a command that will query for vectors and verify they find themselves */
-                sds key = getVectorKey();
+                sds key = getSearchKeyTemplate();
                 
                 /* Build a simple FT.SEARCH command (same as vec-query for now) */
                 len = createSearchCmdTemplate(&cmd);

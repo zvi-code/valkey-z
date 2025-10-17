@@ -636,7 +636,7 @@ static const struct {
 **File**: `valkey-benchmark.c`
 
 ```c
-static sds getVectorKey(void) {
+static sds getSearchKeyTemplate(void) {
     sds key;
     
     /* Dataset mode - use placeholder */

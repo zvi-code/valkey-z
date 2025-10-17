@@ -28,6 +28,7 @@ typedef struct {
     vectorClusterMapping *mappings;
     uint64_t capacity;
     uint64_t count;
+    uint64_t keys_scanned;  /* Number of keys scanned (for progress tracking) */
     int is_cluster_mode_enabled;
     pthread_mutex_t mutex;
     struct progressBar *progress_bar;  /* Progress bar for visual feedback */

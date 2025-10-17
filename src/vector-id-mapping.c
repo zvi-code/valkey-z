@@ -15,6 +15,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <assert.h>
+#include <unistd.h>
 
 void initClusterTagMap(clusterTagMap *tag_map, uint64_t initial_capacity) {
     memset(tag_map, 0, sizeof(clusterTagMap));
@@ -28,6 +29,14 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
     if (!tag_map) return;
     /* Expand capacity if needed */
     assert(vector_id < tag_map->capacity);
+
+    /* Always increment keys_scanned for progress tracking */
+    tag_map->keys_scanned++;
+    
+    /* Update progress bar based on keys scanned */
+    if (tag_map->progress_bar) {
+        updateProgressBar(tag_map->progress_bar, tag_map->keys_scanned);
+    }
 
     if (tag_map->mappings[vector_id].cluster_tag[0] == '\0') {
         if (tag_map->count > tag_map->capacity) {
@@ -47,11 +56,6 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
         /* New entry */
         assert(tag_map->count <= tag_map->capacity);
         tag_map->count++;
-        
-        /* Update progress bar if available */
-        if (tag_map->progress_bar) {
-            updateProgressBar(tag_map->progress_bar, tag_map->count);
-        }
     }
     if (tag_map->is_cluster_mode_enabled) {
         /* Add new mapping */
@@ -148,6 +152,9 @@ int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
     initClusterScanConfig(&scan_config, pattern, nodes, node_count,
                          key_processor, tag_map);
 
+    /* Enable silent mode to avoid interfering with progress bar */
+    scan_config.silent_mode = 1;
+
     /* Set performance parameters for vector scanning */
     setClusterScanPerformance(&scan_config, 1000, node_count, 50000);
     setClusterScanProgressCallback(&scan_config, vectorMappingProgressCallback);
@@ -157,9 +164,23 @@ int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
 
     int scan_result = executeClusterScan(&scan_config, &results);
     
-    /* Finish progress bar */
+    /* Update progress bar to show actual total scanned */
+    if (progress.enabled) {
+        pthread_mutex_lock(&progress.mutex);
+        progress.total = results.total_keys_processed;
+        progress.current = results.total_keys_processed;
+        pthread_mutex_unlock(&progress.mutex);
+    }
+    
+    /* Finish progress bar - will show 100% with actual totals */
     finishProgressBar(&progress);
     tag_map->progress_bar = NULL;
+    
+    /* Ensure all output is flushed and terminal is in clean state */
+    fflush(stdout);
+    fflush(stderr);
+    /* Small delay to ensure terminal processes the output */
+    usleep(10000); /* 10ms = 10,000 microseconds */
 
     if (scan_result == 0) {
         printf("[VECTOR-MAPPING] Successfully built %lu vector ID mappings\n", tag_map->count);

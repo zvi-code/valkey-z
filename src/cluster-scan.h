@@ -80,6 +80,7 @@ typedef struct {
     int node_count;                /* Number of nodes */
     int scan_batch_size;           /* SCAN batch size (default: 1000) */
     int max_concurrent_workers;    /* Max parallel workers (default: node_count) */
+    int silent_mode;               /* Suppress [SCAN] output messages (for progress bars) */
 
     /* Callback functions */
     keyProcessorCallback key_processor;     /* Process each discovered key */
