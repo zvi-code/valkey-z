@@ -1404,7 +1404,7 @@ void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count
     progressBar progress;
     initProgressBar(&progress, 100, "Backfill");
     
-    /* Force initial display at 0% */
+    /* Force initial display at 0% - this shows immediately */
     forceUpdateProgressBar(&progress, 0);
 
     do {
