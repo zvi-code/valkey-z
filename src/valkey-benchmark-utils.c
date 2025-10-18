@@ -1369,11 +1369,15 @@ int getNodeProgressMemoryDB(clusterNode *node, enum valkeyConnectionType ct, con
         if (strcmp(status, "BACKFILLING") == 0) {
             in_progress = 1;
             int res = sscanf(search_current_backfill_progress_percentage_str, "search_current_backfill_progress_percentage:%d", progress_percent);
-            assert(res != 1);
+            if (res != 1) {
+                printf("Error: Unable to parse search_current_backfill_progress_percentage from node %s.\nsearch_current_backfill_progress_percentage_str: %s\n=======\n Info lines: %s\n", node->name, search_current_backfill_progress_percentage_str, search_info_lines);
+                sdsfree(info_lines);
+                assert(0);
+            }
         } 
-    } 
-    assert(strcmp(status, "AVAILABLE") == 0);
-
+    } else {
+        assert(strcmp(status, "AVAILABLE") == 0);
+    }
     sdsfree(info_lines);
     sdsfree(search_info_lines);
         
@@ -1395,7 +1399,8 @@ void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count
     }
     printf(" backfill to complete on all nodes...\n");
     fflush(stdout);
-    
+    // wait for 2 seconds before checking progress
+    sleep(2);
     long long int total_docs = 0;
     int backfill_in_progress_nodes = 0;
     int global_backfill_complete_percent = 0;
