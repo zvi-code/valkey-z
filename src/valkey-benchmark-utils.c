@@ -1320,42 +1320,72 @@ int getNodeProgressMemoryDB(clusterNode *node, enum valkeyConnectionType ct, con
     // fflush(stdout);
     // sleep(1); // give some time for the user to read the message
     if (strlen(info_lines) == 0) {
-        printf("Error: Empty FT.INFO response from node %s.\n", node->name);
+        fprintf(stderr, "Error: Empty FT.INFO response from node %s.\n", node->name);
+        fflush(stderr);
         sdsfree(info_lines);
         assert(0);
     }
     if (strstr(info_lines, "index_degradation_percentage:") == NULL) {
-        printf("Error: FT.INFO response from node %s does not contain expected fields. GOT:\n%s\n", node->name, info_lines);
-        fflush(stdout);
+        fprintf(stderr, "Error: FT.INFO response from node %s does not contain expected fields. GOT:\n%s\n", node->name, info_lines);
+        fflush(stderr);
         sdsfree(info_lines);
+        assert(0);
+    }
+    char *search_current_backfill_num_str = strstr(search_info_lines, "search_num_active_backfills:");
+    if (!search_current_backfill_num_str) {
+        fprintf(stderr, "Error: Missing search_num_active_backfills in INFO SEARCH response from node %s.\n%s\n", node->name, search_info_lines);
+        fflush(stderr);
+        sdsfree(info_lines);
+        sdsfree(search_info_lines);
         assert(0);
     }
     // // verify memorydb 
     // assert(strstr(info_lines, "index_degradation_percentage:") != NULL);
     char *search_current_backfill_progress_percentage_str = strstr(search_info_lines, "search_current_backfill_progress_percentage:");
-    assert(search_current_backfill_progress_percentage_str != NULL);
+    if (!search_current_backfill_progress_percentage_str) {
+        int active_backfills = 0;
+        int res = sscanf(search_current_backfill_num_str, "search_num_active_backfills:%d", &active_backfills);
+        if (res != 1) {
+            fprintf(stderr, "Error: Unable to parse search_num_active_backfills from node %s.\nsearch_num_active_backfills: %s\n=======\n Info lines: %s\n", node->name, search_current_backfill_num_str, search_info_lines);
+            fflush(stderr);
+            sdsfree(info_lines);
+            assert(0);
+        }
+        if (active_backfills > 0) {
+            fprintf(stderr, "Error: Missing search_current_backfill_progress_percentage in INFO SEARCH response from node %s.\n%s\n", node->name, search_info_lines);
+            fflush(stderr);
+            sdsfree(info_lines);
+            sdsfree(search_info_lines);
+            assert(0);
+        }
+    }
+    // assert(search_current_backfill_progress_percentage_str != NULL);
     char *status_str = strstr(info_lines, "index_status:");
     char *degradation_str = strstr(info_lines, "index_degradation_percentage:");
     char *num_docs_str = strstr(info_lines, "num_indexed_vectors:");
     if (!status_str || !degradation_str || !num_docs_str) {
-        printf("Error: Missing expected fields in FT.INFO response from node %s.\n", node->name);
+        fprintf(stderr, "Error: Missing expected fields in FT.INFO response from node %s.\n", node->name);
+        fflush(stderr);
         sdsfree(info_lines);
         assert(0);
     }
     char status[64];
     int degradation = 0;
     if (sscanf(status_str, "index_status:%63s", status) != 1) {
-        printf("Error: Unable to parse index_status from node %s.\n", node->name);
+        fprintf(stderr, "Error: Unable to parse index_status from node %s.\n", node->name);
+        fflush(stderr);
         sdsfree(info_lines);
         assert(0);
     }
     if (sscanf(degradation_str, "index_degradation_percentage:%d", &degradation) != 1) {
-        printf("Error: Unable to parse index_degradation_percentage from node %s.\n", node->name);
+        fprintf(stderr, "Error: Unable to parse index_degradation_percentage from node %s.\n", node->name);
+        fflush(stderr);
         sdsfree(info_lines);
         assert(0);
     }
     if (sscanf(num_docs_str, "num_indexed_vectors:%lld", node_docs) != 1) {
-        printf("Error: Unable to parse num_indexed_vectors from node %s.\n", node->name);
+        fprintf(stderr, "Error: Unable to parse num_indexed_vectors from node %s.\n", node->name);
+        fflush(stderr);
         sdsfree(info_lines);
         assert(0);
     }
@@ -1370,7 +1400,8 @@ int getNodeProgressMemoryDB(clusterNode *node, enum valkeyConnectionType ct, con
             in_progress = 1;
             int res = sscanf(search_current_backfill_progress_percentage_str, "search_current_backfill_progress_percentage:%d", progress_percent);
             if (res != 1) {
-                printf("Error: Unable to parse search_current_backfill_progress_percentage from node %s.\nsearch_current_backfill_progress_percentage_str: %s\n=======\n Info lines: %s\n", node->name, search_current_backfill_progress_percentage_str, search_info_lines);
+                fprintf(stderr, "Error: Unable to parse search_current_backfill_progress_percentage from node %s.\nsearch_current_backfill_progress_percentage_str: %s\n=======\n Info lines: %s\n", node->name, search_current_backfill_progress_percentage_str, search_info_lines);
+                fflush(stderr);
                 sdsfree(info_lines);
                 assert(0);
             }
@@ -1382,6 +1413,15 @@ int getNodeProgressMemoryDB(clusterNode *node, enum valkeyConnectionType ct, con
     sdsfree(search_info_lines);
         
     return in_progress;
+// error:
+//     /* Move to next line but keep the progress bar visible */
+//     printf("\n");
+//     fflush(stdout);
+    
+//     /* Reset ANSI attributes for subsequent output */
+//     printf("\033[0m");
+//     fflush(stdout);
+
 }
 
 void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count, clusterNode **cluster_nodes,
@@ -1405,12 +1445,12 @@ void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count
     int backfill_in_progress_nodes = 0;
     int global_backfill_complete_percent = 0;
     
-    /* Initialize progress bar with 100 as total (percentage) */
+    /* Initialize progress bar with 100 as total (percentage), and track total_docs as secondary metric */
     progressBar progress;
-    initProgressBar(&progress, 100, "Backfill");
+    initProgressBar(&progress, 100, 0, "Backfill");  /* 0 for rate_total means we'll set it dynamically */
     
     /* Force initial display at 0% - this shows immediately */
-    forceUpdateProgressBar(&progress, 0);
+    forceUpdateProgressBar(&progress, 0, 0);
 
     do {
         total_docs = 0;
@@ -1448,13 +1488,20 @@ void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count
         }
 
         // Update progress bar - force update to ensure it shows even if percentage didn't change
+        // Show percentage progress and total documents as secondary metric
         global_backfill_complete_percent /= cluster_node_count * num_indexes;
-        forceUpdateProgressBar(&progress, (uint64_t)global_backfill_complete_percent);
+        
+        /* Enable secondary rate metric display after first iteration */
+        if (progress.rate_total == 0 && total_docs > 0) {
+            progress.rate_total = 1; /* Non-zero enables display */
+        }
+        
+        forceUpdateProgressBar(&progress, (uint64_t)global_backfill_complete_percent, (uint64_t)total_docs);
         
         // wait for 1 second before next check
         sleep(1);
     } while (backfill_in_progress_nodes > 0);
-    forceUpdateProgressBar(&progress, 100);
+    forceUpdateProgressBar(&progress, 100, (uint64_t)total_docs);
     finishProgressBar(&progress);
     printf("%d Index%s backfill process has completed on all nodes. Total docs indexed: %lld\n", 
            num_indexes, num_indexes > 1 ? "es" : "", total_docs);

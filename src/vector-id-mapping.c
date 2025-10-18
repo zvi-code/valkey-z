@@ -35,7 +35,7 @@ void addClusterTagMapping(clusterTagMap *tag_map, uint64_t vector_id, const char
     
     /* Update progress bar based on keys scanned */
     if (tag_map->progress_bar) {
-        updateProgressBar(tag_map->progress_bar, tag_map->keys_scanned);
+        updateProgressBar(tag_map->progress_bar, tag_map->keys_scanned, 0);
     }
 
     if (tag_map->mappings[vector_id].cluster_tag[0] == '\0') {
@@ -145,7 +145,7 @@ int buildVectorIdMappings(int is_cluster_mode_enabled, const char *prefix,
     /* Initialize progress bar */
     progressBar progress;
     tag_map->progress_bar = &progress;
-    initProgressBar(&progress, tag_map->capacity, "Building vector ID mappings");
+    initProgressBar(&progress, tag_map->capacity, 0, "Building vector ID mappings");
     
     /* Configure cluster scan */
     clusterScanConfig scan_config;
