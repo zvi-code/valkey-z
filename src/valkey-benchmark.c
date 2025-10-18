@@ -4872,13 +4872,13 @@ int main(int argc, char **argv) {
         printf("Using search indexes for the benchmark. %s - %s\n", 
                config.engine_type == ENGINE_TYPE_MEMORYDB ? "MemoryDB" : config.engine_type == ENGINE_TYPE_ELASTICACHE_VALKEY ? "EC Valkey" : "OSS",
                cluster_mode_str);
-        
-        createDefaultSearchIndexes();
-        waitForIndexBackfillComplete(config.engine_type, config.selected_node_count, config.selected_nodes, config.ct, config.search.name);
-        // wait for flat indexes
         sds flat_index = sdsnew(config.search.name);
-        flat_index = sdscat(flat_index, "_flat");
-        waitForIndexBackfillComplete(config.engine_type, config.selected_node_count, config.selected_nodes, config.ct, flat_index);
+        flat_index = sdscat(flat_index, "_flat");               
+        const char* index_names[2] = {config.search.name, flat_index};
+        createDefaultSearchIndexes();
+        sleep(2); /* wait a bit before checking index status */
+        waitForIndexBackfillComplete(config.engine_type, config.selected_node_count, config.selected_nodes, config.ct, index_names, 2);
+        // wait for flat indexes
         sdsfree(flat_index);
         long long search_memory = 0;
         long long search_reclaimable = 0;

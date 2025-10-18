@@ -133,7 +133,7 @@ void* compareInfoSnapshots(int cluster_node_count, clusterNode **cluster_nodes,
 void freeClusterSnapshot(clusterSnapshot *snapshot);
 valkeyContext *getValkeyContext(enum valkeyConnectionType ct, const char *ip_or_path, int port);
 void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count, clusterNode **cluster_nodes,
-                                        enum valkeyConnectionType ct, const char *index_name);
+                                        enum valkeyConnectionType ct, const char **index_names, int num_indexes);
 EngineType getEngineType(const char *ip_or_path, int port, enum valkeyConnectionType ct);
 int isClusterModeEnabled(valkeyContext *ctx);
 
