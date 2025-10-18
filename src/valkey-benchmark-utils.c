@@ -1383,7 +1383,9 @@ int getNodeProgressMemoryDB(clusterNode *node, enum valkeyConnectionType ct, con
 void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count, clusterNode **cluster_nodes,
                                         enum valkeyConnectionType ct, const char **index_names, int num_indexes) {
     if (!index_names) return;
-    printf("%s: Waiting for indexs: ", engine_type == ENGINE_TYPE_MEMORYDB ? "MemoryDB" : "ValkeySearch");
+    printf("%s: Waiting for index%s: ", 
+           engine_type == ENGINE_TYPE_MEMORYDB ? "MemoryDB" : "ValkeySearch",
+           num_indexes > 1 ? "es" : "");
     for (int i = 0; i < num_indexes; i++) {
         if (i == 0) {
             printf("'%s'", index_names[i]);
@@ -1392,18 +1394,23 @@ void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count
         }
     }
     printf(" backfill to complete on all nodes...\n");
+    fflush(stdout);
+    
     long long int total_docs = 0;
     int backfill_in_progress_nodes = 0;
     int global_backfill_complete_percent = 0;
     
     /* Initialize progress bar with 100 as total (percentage) */
     progressBar progress;
-    initProgressBar(&progress, 100, "Waiting for index backfill");
+    initProgressBar(&progress, 100, "Backfill");
+    
+    /* Force initial display at 0% */
+    forceUpdateProgressBar(&progress, 0);
 
     do {
         total_docs = 0;
         backfill_in_progress_nodes = 0;
-        global_backfill_complete_percent = 0.0;
+        global_backfill_complete_percent = 0;
         // go over all nodes and check FT.INFO
         // check these metrics:
         // 23) index_status
@@ -1435,16 +1442,17 @@ void waitForIndexBackfillComplete(EngineType engine_type, int cluster_node_count
 
         }
 
-        // Update progress bar
+        // Update progress bar - force update to ensure it shows even if percentage didn't change
         global_backfill_complete_percent /= cluster_node_count * num_indexes;
-        updateProgressBar(&progress, (uint64_t)global_backfill_complete_percent);
+        forceUpdateProgressBar(&progress, (uint64_t)global_backfill_complete_percent);
+        
         // wait for 1 second before next check
         sleep(1);
     } while (backfill_in_progress_nodes > 0);
-    updateProgressBar(&progress, 100);
+    forceUpdateProgressBar(&progress, 100);
     finishProgressBar(&progress);
-    printf("%d Indexes backfill process has completed on all nodes. Total docs indexed: %ld\n", 
-           num_indexes, total_docs);
+    printf("%d Index%s backfill process has completed on all nodes. Total docs indexed: %lld\n", 
+           num_indexes, num_indexes > 1 ? "es" : "", total_docs);
 }
 
 /* Create snapshot from current cluster state 
