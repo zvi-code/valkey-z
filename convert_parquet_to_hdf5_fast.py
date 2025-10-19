@@ -108,58 +108,64 @@ def convert_parquet_to_hdf5_fast(dataset_dir, output_file, dataset_name):
     print(f"  Created dataset 'train': shape={train_dset.shape}, chunks={train_dset.chunks}")
     print()
     
-    # === PHASE 3: Stream training vectors ===
-    print("PHASE 3: Streaming training vectors...")
-    print(f"  Progress format: [file/total] filename | batch progress | throughput")
+    # === PHASE 3: Load and un-shuffle training vectors ===
+    print("PHASE 3: Loading training vectors (un-shuffling by ID)...")
+    print(f"  Note: Training vectors are shuffled in parquet files")
+    print(f"  Loading all vectors into memory to sort by ID...")
     print()
     
-    offset = 0
     phase3_start = time.time()
+    
+    # Load ALL training vectors with their IDs
+    all_vectors = []
+    all_ids = []
     
     for file_idx, train_file in enumerate(train_files, 1):
         file_start = time.time()
         
-        # Open parquet file
-        parquet_file = pq.ParquetFile(train_file)
-        total_rows = parquet_file.metadata.num_rows
-        
         print(f"  [{file_idx:2d}/{len(train_files)}] {train_file.name}")
-        print(f"         Rows: {total_rows:,}")
         
-        # Process in batches
-        batch_num = 0
-        rows_processed = 0
+        # Read the entire file (we need IDs and vectors together)
+        table = pq.read_table(train_file, columns=['id', vec_col])
         
-        for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE, columns=[vec_col]):
-            batch_start = time.time()
-            
-            # Convert PyArrow batch to numpy DIRECTLY (zero-copy when possible)
-            vectors = batch[vec_col].to_numpy(zero_copy_only=False)
-            # Stack list of arrays into 2D array
-            vectors = np.vstack(vectors).astype(np.float32)
-            num_vecs = len(vectors)
-            
-            # Write to HDF5
-            train_dset[offset:offset + num_vecs] = vectors
-            offset += num_vecs
-            rows_processed += num_vecs
-            batch_num += 1
-            
-            batch_time = time.time() - batch_start
-            vecs_per_sec = num_vecs / batch_time if batch_time > 0 else 0
-            
-            # Progress every 10 batches or last batch
-            if batch_num % 10 == 0 or rows_processed >= total_rows:
-                pct = rows_processed * 100.0 / total_rows
-                print(f"         Batch {batch_num:3d}: {rows_processed:8,}/{total_rows:8,} ({pct:5.1f}%) | {vecs_per_sec:7,.0f} vec/s | {offset:10,} total")
-            
-            # Free memory immediately
-            del vectors
+        # Get IDs and vectors
+        ids = table['id'].to_numpy()
+        vectors = table[vec_col].to_numpy(zero_copy_only=False)
+        vectors = np.vstack(vectors).astype(np.float32)
+        
+        all_ids.append(ids)
+        all_vectors.append(vectors)
         
         file_time = time.time() - file_start
-        file_vecs_per_sec = total_rows / file_time if file_time > 0 else 0
-        print(f"         ✓ Completed in {file_time:.1f}s ({file_vecs_per_sec:,.0f} vec/s avg)")
-        print()
+        print(f"         ✓ Loaded {len(ids):,} vectors in {file_time:.1f}s")
+        
+        del table
+    
+    # Concatenate all files
+    print(f"\n  Concatenating {len(train_files)} files...")
+    all_ids = np.concatenate(all_ids)
+    all_vectors = np.vstack(all_vectors)
+    
+    # Sort by ID to restore original order
+    print(f"  Sorting {len(all_ids):,} vectors by ID...")
+    sort_indices = np.argsort(all_ids)
+    sorted_vectors = all_vectors[sort_indices]
+    sorted_ids = all_ids[sort_indices]
+    
+    # Verify IDs are now sequential
+    expected_ids = np.arange(len(sorted_ids))
+    if not np.array_equal(sorted_ids, expected_ids):
+        print(f"  WARNING: IDs are not sequential after sorting!")
+        print(f"    Expected: 0 to {len(sorted_ids)-1}")
+        print(f"    Got: {sorted_ids[0]} to {sorted_ids[-1]}")
+    else:
+        print(f"  ✓ IDs verified: 0 to {len(sorted_ids)-1} (sequential)")
+    
+    # Write to HDF5
+    print(f"  Writing {len(sorted_vectors):,} vectors to HDF5...")
+    train_dset[:] = sorted_vectors
+    
+    del all_ids, all_vectors, sort_indices, sorted_vectors, sorted_ids
     
     phase3_time = time.time() - phase3_start
     phase3_vecs_per_sec = total_vectors / phase3_time if phase3_time > 0 else 0
