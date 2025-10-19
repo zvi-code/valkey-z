@@ -14,8 +14,9 @@
 6. [Downloading Datasets](#downloading-datasets)
 7. [Converting Datasets](#converting-datasets)
 8. [Using Datasets with Valkey](#using-datasets-with-valkey)
-9. [Troubleshooting](#troubleshooting)
-10. [Dataset Reference](#dataset-reference)
+9. [**CRITICAL: ID Shuffling Bug Fix**](#critical-id-shuffling-bug-fix)
+10. [Troubleshooting](#troubleshooting)
+11. [Dataset Reference](#dataset-reference)
 
 ---
 
@@ -586,6 +587,227 @@ ef_search,recall@100,avg_latency_ms,p50_ms,p95_ms,p99_ms,qps
 250,0.9756,18.67,17.1,27.8,35.2,53.5
 500,0.9912,35.42,33.4,51.2,67.8,28.2
 ```
+
+---
+
+## CRITICAL: ID Shuffling Bug Fix
+
+### Background
+
+**Issue Discovered**: October 19, 2025
+
+VectorDB-bench datasets store training vectors in **shuffled order** in parquet files with an `id` column indicating the original vector ID. The ground truth `neighbors_id` references these **original IDs**, not row indices.
+
+**The Bug**: The initial version of `convert_parquet_to_hdf5_fast.py` ignored the `id` column and stored vectors by row index, causing a complete mismatch between vector IDs and their actual data. This resulted in:
+- ❌ **Incorrect recall measurements** (ground truth pointed to wrong vectors)
+- ❌ **Invalid benchmark results** (comparing against mismatched neighbors)
+- ❌ **Database corruption** (wrong vectors inserted at each ID)
+
+### How the Bug Was Discovered
+
+During benchmarking, recall@100 results were **better than the ground truth**, which is impossible. Investigation revealed:
+
+1. **Query 503** ground truth said closest neighbor was vector ID **16696** with distance **0.212**
+2. **Computing distance directly** showed vector ID **97737** had distance **0.074** (3x closer!)
+3. **Vector ID 97737 wasn't even in the ground truth** top 1000 neighbors
+
+This led to discovering that:
+- In the **shuffled parquet**: Vector ID 16696 is at **row index 97737**
+- Our conversion was storing vectors by row index, losing the ID mapping
+- Ground truth neighbor "ID 16696" was pointing to the wrong vector
+
+### The Fix
+
+**File**: `convert_parquet_to_hdf5_fast.py`
+
+**Changed**: Phase 3 conversion logic
+
+**Before (WRONG)**:
+```python
+# Streamed vectors in shuffled order, ignoring IDs
+for batch in parquet_file.iter_batches(columns=['emb']):
+    vectors = batch['emb'].to_numpy()
+    train_dset[offset:offset + len(vectors)] = vectors
+```
+
+**After (CORRECT)**:
+```python
+# Load vectors with their IDs, then sort by ID to restore original order
+table = pq.read_table(train_file, columns=['id', 'emb'])
+ids = table['id'].to_numpy()
+vectors = table['emb'].to_numpy()
+
+# Sort by ID to restore sequential order
+sort_indices = np.argsort(ids)
+sorted_vectors = vectors[sort_indices]
+
+# Now vector at index 0 has ID 0, index 16696 has ID 16696, etc.
+train_dset[:] = sorted_vectors
+```
+
+### Verification
+
+After the fix, distances are correct:
+
+```python
+# Query 503 ground truth neighbors (after fix):
+Rank  1: Vector ID  16696, distance = 0.074447  ✓ (was 0.212477)
+Rank  2: Vector ID  92575, distance = 0.084238  ✓ (was 0.276911)
+Rank  3: Vector ID  27903, distance = 0.084536  ✓ (was 0.287371)
+```
+
+All distances are now in the expected **0.07-0.11** range for top neighbors.
+
+### Required Actions After Update
+
+If you converted datasets **before October 19, 2025**, you **MUST reconvert ALL datasets**:
+
+#### Step 1: Update Conversion Script
+
+```bash
+cd /home/ubuntu/valkey
+git pull  # Get the fixed version
+```
+
+Or manually update `convert_parquet_to_hdf5_fast.py` with the fix above.
+
+#### Step 2: Reconvert HDF5 Files
+
+```bash
+cd /home/ubuntu/valkey
+
+# Small dataset (100K) - ~30 seconds
+rm -f /mnt/data/datasets/cohere-small-100k.hdf5
+/mnt/data/vectordb-bench-env/bin/python3 -u convert_parquet_to_hdf5_fast.py \
+    /mnt/data/datasets/cohere/cohere_small_100k \
+    /mnt/data/datasets/cohere-small-100k.hdf5 \
+    --name cohere-small-100k
+
+# Medium dataset (1M) - ~1-2 minutes
+rm -f /mnt/data/datasets/cohere-medium-1m.hdf5
+/mnt/data/vectordb-bench-env/bin/python3 -u convert_parquet_to_hdf5_fast.py \
+    /mnt/data/datasets/cohere/cohere_medium_1m \
+    /mnt/data/datasets/cohere-medium-1m.hdf5 \
+    --name cohere-medium-1m
+
+# Large dataset (10M) - ~5-7 minutes
+rm -f /mnt/data/datasets/cohere-large-10m.hdf5
+/mnt/data/vectordb-bench-env/bin/python3 -u convert_parquet_to_hdf5_fast.py \
+    /mnt/data/datasets/cohere/cohere_large_10m \
+    /mnt/data/datasets/cohere-large-10m.hdf5 \
+    --name cohere-large-10m
+
+# OpenAI 5M - ~6-8 minutes
+rm -f /mnt/data/datasets/openai-large-5m.hdf5
+/mnt/data/vectordb-bench-env/bin/python3 -u convert_parquet_to_hdf5_fast.py \
+    /mnt/data/datasets/openai_large_5m \
+    /mnt/data/datasets/openai-large-5m.hdf5 \
+    --name openai-large-5m
+```
+
+#### Step 3: Recreate Binary Files
+
+Binary files will be **automatically overwritten** (no need to delete):
+
+```bash
+cd /home/ubuntu/valkey
+
+# Cohere Small 100K
+python3 utils/datasets/prepare_binary.py \
+    /mnt/data/datasets/cohere-small-100k.hdf5 \
+    /mnt/data/build-datasets/cohere-small-100k.bin \
+    --name cohere-small-100k \
+    --metric COSINE \
+    --max-neighbors 100
+
+# Cohere Medium 1M
+python3 utils/datasets/prepare_binary.py \
+    /mnt/data/datasets/cohere-medium-1m.hdf5 \
+    /mnt/data/build-datasets/cohere-medium-1m.bin \
+    --name cohere-medium-1m \
+    --metric COSINE \
+    --max-neighbors 100
+
+# Cohere Large 10M
+python3 utils/datasets/prepare_binary.py \
+    /mnt/data/datasets/cohere-large-10m.hdf5 \
+    /mnt/data/build-datasets/cohere-large-10m.bin \
+    --name cohere-large-10m \
+    --metric COSINE \
+    --max-neighbors 100
+
+# OpenAI Large 5M
+python3 utils/datasets/prepare_binary.py \
+    /mnt/data/datasets/openai-large-5m.hdf5 \
+    /mnt/data/build-datasets/openai-large-5m.bin \
+    --name openai-large-5m \
+    --metric COSINE \
+    --max-neighbors 100
+```
+
+**Note**: Symlinks in `build-debug/` automatically point to the new files.
+
+#### Step 4: Flush Database and Re-insert
+
+The database contains **wrong vectors** from the buggy conversion. You MUST:
+
+1. **Drop all indexes** (test_multi_dataset.sh does this automatically)
+2. **Re-run benchmarks** to insert correct vectors
+
+```bash
+# The script will automatically:
+# 1. Drop old indexes (FT.DROPINDEX)
+# 2. Insert vectors from corrected binary files
+# 3. Run fresh benchmarks with valid ground truth
+
+export HOST=your-valkey-endpoint.amazonaws.com
+cd /home/ubuntu/valkey/vector-testing
+./test_multi_dataset.sh --dataset cohere-small-100k --ef-search 150,250,500
+```
+
+### Validation
+
+Verify the fix worked by checking ground truth distances:
+
+```python
+import h5py
+import numpy as np
+
+with h5py.File('/mnt/data/datasets/cohere-small-100k.hdf5', 'r') as f:
+    vectors = f['train'][:]
+    queries = f['test'][:]
+    neighbors = f['neighbors'][:]
+    
+    # Pick any query
+    query_idx = 503
+    query = queries[query_idx]
+    
+    # Check first neighbor distance
+    neighbor_id = neighbors[query_idx, 0]
+    neighbor_vec = vectors[neighbor_id]
+    
+    # Calculate cosine distance
+    cos_sim = np.dot(query, neighbor_vec) / (np.linalg.norm(query) * np.linalg.norm(neighbor_vec))
+    cos_dist = 1 - cos_sim
+    
+    print(f"First neighbor distance: {cos_dist:.6f}")
+    # Should be < 0.15 for COHERE datasets
+    # If > 0.20, the bug still exists!
+```
+
+### Impact Assessment
+
+**Before Fix**:
+- ❌ All benchmark results were **invalid**
+- ❌ Recall measurements were **meaningless**
+- ❌ Database had **wrong vectors** at each ID
+- ❌ Ground truth comparisons were **completely broken**
+
+**After Fix**:
+- ✅ Vectors stored in **correct ID order**
+- ✅ Ground truth neighbors **correctly mapped**
+- ✅ Recall measurements are **valid**
+- ✅ Benchmark results are **trustworthy**
 
 ---
 
